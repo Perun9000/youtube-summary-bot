@@ -36,6 +36,7 @@ class SummaryJob:
     message: Message
     url: str
     enqueued_at: float
+    title_hint: str | None = None
 
 
 @dataclass
@@ -200,6 +201,8 @@ async def _enqueue_summary_job(message: Message, url: str, services: Services) -
             services.summary_queue.qsize(),
             url,
         )
+
+    asyncio.create_task(_prefetch_job_title(job, services))
 
     if position == 1:
         await _set_service_status(
@@ -383,20 +386,72 @@ def _forget_service_status(services: Services, chat_id: int) -> None:
 
 
 async def _render_service_status(text: str, services: Services, job: SummaryJob | None) -> str:
-    queue_line = await _queue_line(services, job)
-    if not queue_line:
+    queue_block = await _queue_block(services, job)
+    if not queue_block:
         return text
-    return f"{text}\n\n{queue_line}"
+    return f"{text}\n\n{queue_block}"
 
 
-async def _queue_line(services: Services, job: SummaryJob | None) -> str:
+async def _queue_block(services: Services, job: SummaryJob | None) -> str:
     if job is None:
         return ""
     async with services.summary_queue_lock:
         total = services.summary_next_sequence
+        pending_jobs = list(services.summary_queue._queue)
     if total <= 1:
         return ""
-    return f"очередь: {job.sequence}/{total}"
+
+    lines = [f"очередь: {job.sequence}/{total}"]
+    for queued_job in pending_jobs:
+        lines.append(f"- {_job_label(queued_job)}")
+    return "\n".join(lines)
+
+
+async def _prefetch_job_title(job: SummaryJob, services: Services) -> None:
+    try:
+        metadata = await asyncio.to_thread(services.youtube.fetch_metadata, job.url)
+    except Exception as exc:
+        logger.warning("queue.job.title_prefetch_failed sequence=%s url=%s error=%s", job.sequence, job.url, exc)
+        return
+
+    title = metadata.title.strip()
+    if not title:
+        return
+
+    job.title_hint = title
+    logger.info("queue.job.title_prefetch_done sequence=%s title=%r", job.sequence, title)
+    await _refresh_active_service_status(services)
+
+
+async def _refresh_active_service_status(services: Services) -> None:
+    async with services.summary_queue_lock:
+        active_job = services.summary_active_job
+    if active_job is None:
+        return
+
+    chat_id = active_job.message.chat.id
+    text = services.summary_status_base_texts.get(chat_id)
+    if not text:
+        return
+
+    await _set_service_status(
+        services=services,
+        source_message=active_job.message,
+        text=text,
+        job=active_job,
+        parse_mode=services.summary_status_parse_modes.get(chat_id),
+        disable_web_page_preview=services.summary_status_disable_previews.get(chat_id, False),
+    )
+
+
+def _job_label(job: SummaryJob) -> str:
+    if job.title_hint:
+        return job.title_hint
+    try:
+        video_id = extract_video_id(job.url)
+    except Exception:
+        return job.url
+    return f"YouTube video {video_id}"
 
 
 async def _delete_message_safely(message: Message) -> None:
@@ -660,10 +715,26 @@ async def _run_with_telegram_status(
 
 
 def _format_elapsed(seconds: int) -> str:
-    minutes, secs = divmod(max(0, seconds), 60)
+    total_seconds = max(0, seconds)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours} {_format_russian_hours(hours)} {minutes} мин"
     if minutes:
         return f"{minutes} мин {secs:02d} сек"
     return f"{secs} сек"
+
+
+def _format_russian_hours(hours: int) -> str:
+    last_two = hours % 100
+    last = hours % 10
+    if 11 <= last_two <= 14:
+        return "часов"
+    if last == 1:
+        return "час"
+    if 2 <= last <= 4:
+        return "часа"
+    return "часов"
 
 
 def _format_telegram_summary(
