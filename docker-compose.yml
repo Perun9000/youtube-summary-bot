@@ -1,0 +1,10 @@
+services:
+  bot:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

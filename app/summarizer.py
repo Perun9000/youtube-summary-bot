@@ -1,0 +1,814 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import json
+import logging
+import re
+import time
+
+from app.models import Chapter, Summary
+from app.llm_client import GenerationUsage, LLMClient
+
+
+logger = logging.getLogger(__name__)
+SYNTHESIS_PARTIALS_MAX_CHARS = 8000
+SYNTHESIS_RETRY_PARTIALS_MAX_CHARS = 4500
+MID_SYNTHESIS_MAX_CHARS = 10000
+DEFAULT_HIERARCHY_THRESHOLD = 6
+DEFAULT_GROUP_SIZE = 5
+
+
+SUMMARY_SYSTEM_PROMPT = """
+Ты аналитический ассистент, который делает структурированное резюме YouTube-ролика по транскрипции.
+Отвечай на русском языке, даже если транскрипция на другом языке.
+Не пересказывай транскрипт дословно: выделяй смысл, структуру, аргументы, примеры и выводы.
+Не выдумывай факты. Если место неясное, формулируй осторожно.
+Если есть практические шаги, выделяй их явно.
+Если есть спорные утверждения, формулируй их как позицию автора.
+
+Правила по названиям брендов, устройств, продуктов, компаний и технологий — соблюдай строго:
+- ВСЕ иностранные названия брендов, моделей устройств, продуктов, сервисов, компаний, чипов, стандартов и технологий пиши ЛАТИНИЦЕЙ в их оригинальном написании.
+- Если в транскрипции такое название записано кириллицей — это ошибка распознавания речи (Whisper, автосубтитры), её нужно исправить и восстановить корректное латинское написание.
+- Примеры того, как делать НЕЛЬЗЯ → как НУЖНО: "Айфон" → "iPhone"; "Самсунг Гэлакси" → "Samsung Galaxy"; "Гугл Пиксел" → "Google Pixel"; "Оппо Файнд X9 Ультра" → "Oppo Find X9 Ultra"; "Снэпдрэгон" → "Snapdragon"; "Квалком" → "Qualcomm"; "Эпл" → "Apple"; "Вай-Фай" → "Wi-Fi"; "Блютус/Блютуз" → "Bluetooth"; "ОЛЕД/АМОЛЕД" → "OLED/AMOLED"; "ЮСБ-Си" → "USB-C"; "Фейс Айди" → "Face ID"; "А18 Про" → "A18 Pro"; "Тайп-Си" → "Type-C"; "ЭйАй" → "AI".
+- Исключение — оригинально русскоязычные бренды (например, Яндекс, Сбер, ВКонтакте, Озон) пиши кириллицей, как принято в русском.
+- Если точное латинское написание модели из контекста неясно, но очевидно, что речь о иностранном продукте — пиши бренд латиницей, а номер/суффикс модели так, как слышно в транскрипции, но без кириллической транслитерации.
+
+Правила по остальной терминологии — соблюдай строго:
+- Категорически запрещены транслитерации английских слов русскими буквами. Примеры того, как делать НЕЛЬЗЯ: "нумбность", "регреты", "митинг" (в смысле встреча), "флоу", "эдженда", "мув", "пойнт", "чарджить", "коммитить", "чарт", "хайлайт".
+- Перед тем как записать слово русскими буквами — проверь, не является ли оно транслитерацией с английского. Если да, выбери один из двух вариантов ниже.
+- Если у термина есть устоявшийся русский перевод — используй его. Обязательные соответствия: "regrets" → "сожаления" или "сомнения"; "numbness" → "онемение"; "meeting" → "встреча"; "agenda" → "повестка"; "move" → "ход, шаг"; "point" → "тезис, довод, мысль"; "chart" → "график"; "highlight" → "ключевой момент"; "commit" (to) → "брать на себя обязательство".
+- Если устоявшегося русского аналога нет или перевод искажает смысл — оставляй оригинальный английский термин латиницей и в скобках давай короткое пояснение на русском. Примеры того, как делать НУЖНО: "burnout (профессиональное выгорание)", "flow (состояние потока, полной концентрации)", "product-market fit (соответствие продукта запросу рынка)".
+- Никогда не изобретай новые русские слова по звучанию английского.
+""".strip()
+
+
+SUMMARY_JSON_PROMPT = """
+Сделай summary по транскрипции YouTube-ролика.
+
+Важно по структуре:
+- Организуй summary по смысловым ключевым тезисам ролика, а НЕ по времени.
+- Категорически запрещено делить ролик поминутно, по таймкодам, по главам плеера или в хронологическом порядке transcript.
+- Один тезис = одна законченная идея автора, даже если она собрана из разных мест ролика.
+- Количество ключевых тезисов и подробных глав определи сам по содержанию ролика.
+- Главный критерий — полнота: не выбрасывай важные идеи, аргументы, примеры, цифры, имена, кейсы, нюансы и выводы ради короткого формата.
+
+Верни только JSON без markdown-обёртки и без комментариев.
+Схема:
+{{
+  "overview": "Содержательный обзор. Начни с ГЛАВНОЙ ИДЕИ или КЛЮЧЕВОГО ВЫВОДА ролика одной чёткой формулировкой по сути. Затем дай нужный контекст: о чём ролик, какой фокус, зачем смотреть. Запрещено начинать с мета-описаний вида 'Ролик обсуждает...', 'Автор рассказывает о...', 'В видео говорится, что...', 'Видео посвящено...'. Сразу содержательный тезис.",
+  "key_points": ["Краткий самостоятельный тезис для Telegram. Верни столько тезисов, сколько нужно для полного покрытия ключевых идей, без воды и повторов."],
+  "chapters": [
+    {{
+      "title": "Короткий содержательный заголовок ключевого тезиса (не таймкод, не 'Часть 1', не 'Введение')",
+      "notes": "Полное раскрытие тезиса. Включи саму идею, аргумент или обоснование автора, конкретные примеры, цифры, имена, цитаты или кейсы из ролика, а также нюансы, ограничения, контраргументы и практические выводы, если они есть. Количество предложений определи по содержанию. Пиши связным абзацем, не списком."
+    }}
+  ]
+}}
+
+URL: {url}
+Название: {title}
+
+Транскрипция с таймкодами:
+{transcript}
+""".strip()
+
+
+CHUNK_PROMPT = """
+Сожми этот фрагмент транскрипции YouTube-ролика в структурированный конспект на русском языке.
+Сохрани важные факты, аргументы, примеры, цифры, имена, цитаты и выводы, которые потом можно объединить в ключевые тезисы всего ролика.
+Не копируй текст дословно.
+Категорически запрещено делить фрагмент поминутно, по таймкодам или пересказывать его по порядку transcript. Группируй по смысловым идеям.
+Никаких транслитераций английских слов русскими буквами (не "нумбность", "флоу", "митинг"): либо нормальный русский термин, либо английский оригинал + пояснение в скобках.
+
+URL: {url}
+Название: {title}
+Фрагмент {index} из {total}:
+{chunk}
+""".strip()
+
+
+SYNTHESIS_PROMPT = """
+Ниже частичные конспекты длинного YouTube-ролика. Собери из них финальное summary.
+
+Важно по структуре:
+- Не пересказывай фрагменты по очереди. Собери из них сквозные смысловые тезисы ролика.
+- Категорически запрещено делить ролик поминутно, по таймкодам или в хронологическом порядке transcript.
+- Один тезис = одна законченная идея автора, даже если она собрана из разных фрагментов.
+- Количество ключевых тезисов и подробных глав определи сам по содержанию ролика.
+- Главный критерий — полнота: не выбрасывай важные идеи, аргументы, примеры, цифры, имена, кейсы, нюансы и выводы ради короткого формата.
+
+Верни только JSON без markdown-обёртки и без комментариев.
+JSON должен быть валидным: закрывай все кавычки, не оставляй trailing comma, не обрывай строки.
+Схема:
+{{
+  "overview": "Содержательный обзор. Начни с ГЛАВНОЙ ИДЕИ или КЛЮЧЕВОГО ВЫВОДА ролика одной чёткой формулировкой по сути. Затем дай нужный контекст: о чём ролик, какой фокус, зачем смотреть. Запрещено начинать с мета-описаний вида 'Ролик обсуждает...', 'Автор рассказывает о...', 'В видео говорится, что...', 'Видео посвящено...'. Сразу содержательный тезис.",
+  "key_points": ["Краткий самостоятельный тезис для Telegram. Верни столько тезисов, сколько нужно для полного покрытия ключевых идей, без воды и повторов."],
+  "chapters": [
+    {{
+      "title": "Короткий содержательный заголовок ключевого тезиса (не таймкод, не 'Фрагмент 1', не 'Введение')",
+      "notes": "Полное раскрытие тезиса. Включи саму идею, аргумент или обоснование автора, конкретные примеры, цифры, имена, цитаты или кейсы из ролика, а также нюансы, ограничения, контраргументы и практические выводы, если они есть. Количество предложений определи по содержанию. Пиши связным абзацем, не списком."
+    }}
+  ]
+}}
+
+URL: {url}
+Название: {title}
+
+Частичные конспекты:
+{partials}
+""".strip()
+
+
+COMPACT_SUMMARY_PROMPT = """
+Ниже материал по YouTube-ролику. Сделай компактное финальное summary на русском.
+
+Цель: вернуть полностью валидный JSON и сохранить полноту summary.
+
+Правила:
+- Не пересказывай материал по порядку, собери сквозные смысловые тезисы.
+- Не дели ролик по таймкодам или фрагментам.
+- Пиши содержательно, без воды и без транслитераций английских слов русскими буквами.
+- Количество ключевых тезисов, глав и предложений в главах определи сам по содержанию.
+- Если нужно экономить место, сокращай формулировки, а не выбрасывай важные идеи.
+- Верни только JSON без markdown-обёртки и без комментариев.
+- JSON должен быть валидным и завершённым.
+
+Схема:
+{{
+  "overview": "Главная идея ролика и короткий контекст.",
+  "key_points": ["Краткий самостоятельный тезис. Столько пунктов, сколько нужно для полноты."],
+  "chapters": [
+    {{
+      "title": "Содержательный заголовок тезиса",
+      "notes": "Раскрытие тезиса с аргументами, примерами, нюансами и выводами. Длину определи по содержанию."
+    }}
+  ]
+}}
+
+URL: {url}
+Название: {title}
+
+Материал:
+{source}
+""".strip()
+
+
+MID_SYNTHESIS_PROMPT = """
+Ниже идут подряд несколько частичных конспектов одного длинного YouTube-ролика (группа {group_index} из {group_total}).
+Твоя задача — сделать укрупнённый конспект этой группы. Это промежуточный шаг: поверх укрупнённых конспектов всех групп будет финальная сборка саммари, поэтому здесь важно не потерять факты.
+
+Что делать:
+- Объедини совпадающие и повторяющиеся идеи в один тезис.
+- Сохрани ключевые аргументы, примеры, цифры, имена, цитаты, кейсы, практические выводы из всех фрагментов группы.
+- Структурируй по смысловым идеям, а не по порядку фрагментов. Никакого поминутного деления и никаких таймкодов.
+- Не делай финального summary в формате JSON — это нужно позже. Здесь верни связный русский текст конспекта.
+- Никаких транслитераций английских слов русскими буквами: либо нормальный русский термин, либо английский оригинал + пояснение в скобках.
+
+Формат ответа — связный русский текст на несколько абзацев. Можно выделять тезисы отдельными абзацами, но без markdown-заголовков и без JSON.
+
+URL: {url}
+Название: {title}
+
+Частичные конспекты группы:
+{partials}
+""".strip()
+
+
+@dataclass
+class SummaryProgress:
+    total_steps: int = 0
+    completed_steps: int = 0
+    current_step: str = "подготовка"
+    _step_started: float | None = None
+    _completed_durations: list[float] = field(default_factory=list)
+
+    def configure(self, total_steps: int) -> None:
+        self.total_steps = max(1, total_steps)
+        self.completed_steps = 0
+        self.current_step = "подготовка"
+        self._step_started = None
+        self._completed_durations.clear()
+
+    def start_step(self, label: str) -> None:
+        self.current_step = label
+        self._step_started = time.monotonic()
+
+    def complete_step(self) -> None:
+        if self._step_started is not None:
+            self._completed_durations.append(max(0.0, time.monotonic() - self._step_started))
+        self.completed_steps = min(self.total_steps, self.completed_steps + 1)
+        self._step_started = None
+
+    def status_text(self) -> str:
+        if self.total_steps <= 0:
+            return ""
+        return f"Прогресс: ~{self.percent()}%"
+
+    def percent(self) -> int:
+        if self.total_steps <= 0:
+            return 0
+        if self.completed_steps >= self.total_steps:
+            return 100
+
+        current_fraction = self._current_step_fraction()
+        raw_percent = ((self.completed_steps + current_fraction) / self.total_steps) * 100
+        return max(0, min(99, int(round(raw_percent))))
+
+    def estimated_remaining_seconds(self) -> float | None:
+        if self.total_steps <= 0 or not self._completed_durations:
+            return None
+
+        avg_step_sec = sum(self._completed_durations) / len(self._completed_durations)
+        current_fraction = self._current_step_fraction()
+        remaining_steps = max(0.0, self.total_steps - self.completed_steps - current_fraction)
+        return remaining_steps * avg_step_sec
+
+    def _current_step_fraction(self) -> float:
+        if self._step_started is None:
+            return 0.0
+
+        elapsed = max(0.0, time.monotonic() - self._step_started)
+        if self._completed_durations:
+            expected_step_sec = max(1.0, sum(self._completed_durations) / len(self._completed_durations))
+        else:
+            expected_step_sec = 240.0
+        return min(0.9, elapsed / expected_step_sec)
+
+
+class SummaryParseError(ValueError):
+    pass
+
+
+class Summarizer:
+    def __init__(
+        self,
+        llm: LLMClient,
+        hierarchy_threshold: int = DEFAULT_HIERARCHY_THRESHOLD,
+        group_size: int = DEFAULT_GROUP_SIZE,
+    ) -> None:
+        self._llm = llm
+        self._hierarchy_threshold = max(2, hierarchy_threshold)
+        self._group_size = max(2, group_size)
+
+    async def summarize(
+        self,
+        url: str,
+        title: str,
+        chunks: list[str],
+        progress: SummaryProgress | None = None,
+        usage: GenerationUsage | None = None,
+    ) -> Summary:
+        started = time.monotonic()
+        logger.info("summary.start title=%r chunks=%s", title, len(chunks))
+        if len(chunks) == 1:
+            if progress:
+                progress.configure(1)
+                progress.start_step("финальное summary")
+            logger.info("summary.single_chunk.start chars=%s", len(chunks[0]))
+            raw = await self._llm.generate(
+                SUMMARY_JSON_PROMPT.format(url=url, title=title, transcript=chunks[0]),
+                system=SUMMARY_SYSTEM_PROMPT,
+                usage=usage,
+            )
+            try:
+                summary = self._parse_summary(raw)
+            except SummaryParseError as exc:
+                logger.warning("summary.parse_json.failed mode=single raw_chars=%s error=%s", len(raw), exc)
+                if progress:
+                    progress.start_step("компактный повтор")
+                retry_raw = await self._llm.generate(
+                    COMPACT_SUMMARY_PROMPT.format(
+                        url=url,
+                        title=title,
+                        source=_truncate_text(chunks[0], SYNTHESIS_RETRY_PARTIALS_MAX_CHARS),
+                    ),
+                    system=SUMMARY_SYSTEM_PROMPT,
+                    usage=usage,
+                )
+                if retry_raw.strip():
+                    raw = retry_raw
+                try:
+                    summary = self._parse_summary(raw)
+                except SummaryParseError as retry_exc:
+                    logger.warning(
+                        "summary.parse_json.fallback mode=single raw_chars=%s error=%s",
+                        len(raw),
+                        retry_exc,
+                    )
+                    summary = _fallback_summary_from_raw(raw)
+            if progress:
+                progress.complete_step()
+            logger.info(
+                "summary.done mode=single duration_sec=%.1f key_points=%s chapters=%s raw_chars=%s",
+                time.monotonic() - started,
+                len(summary.key_points),
+                len(summary.chapters),
+                len(raw),
+            )
+            return summary
+
+        chunk_partials: list[str] = []
+        num_chunks = len(chunks)
+
+        use_hierarchy = num_chunks >= self._hierarchy_threshold
+        num_groups = _num_groups(num_chunks, self._group_size) if use_hierarchy else 0
+        if use_hierarchy and num_groups <= 1:
+            use_hierarchy = False
+            num_groups = 0
+
+        if progress:
+            total_steps = num_chunks + (num_groups if use_hierarchy else 0) + 1
+            progress.configure(total_steps)
+
+        for index, chunk in enumerate(chunks, start=1):
+            if progress:
+                progress.start_step(f"фрагмент {index}/{num_chunks}")
+            chunk_started = time.monotonic()
+            logger.info("summary.chunk.start index=%s total=%s chars=%s", index, num_chunks, len(chunk))
+            partial = await self._llm.generate(
+                CHUNK_PROMPT.format(url=url, title=title, index=index, total=num_chunks, chunk=chunk),
+                system=SUMMARY_SYSTEM_PROMPT,
+                usage=usage,
+            )
+            logger.info(
+                "summary.chunk.done index=%s total=%s duration_sec=%.1f response_chars=%s",
+                index,
+                num_chunks,
+                time.monotonic() - chunk_started,
+                len(partial),
+            )
+            chunk_partials.append(f"Фрагмент {index}:\n{partial}")
+            if progress:
+                progress.complete_step()
+
+        if use_hierarchy:
+            groups = _split_into_groups(chunk_partials, self._group_size)
+            logger.info(
+                "summary.hierarchy.start partials=%s groups=%s group_size=%s",
+                len(chunk_partials),
+                len(groups),
+                self._group_size,
+            )
+            mid_partials: list[str] = []
+            for group_index, group in enumerate(groups, start=1):
+                if progress:
+                    progress.start_step(f"группа {group_index}/{len(groups)}")
+                group_started = time.monotonic()
+                group_text = _compact_partials(group, MID_SYNTHESIS_MAX_CHARS)
+                logger.info(
+                    "summary.hierarchy.group.start index=%s total=%s members=%s compact_chars=%s",
+                    group_index,
+                    len(groups),
+                    len(group),
+                    len(group_text),
+                )
+                mid = await self._llm.generate(
+                    MID_SYNTHESIS_PROMPT.format(
+                        url=url,
+                        title=title,
+                        group_index=group_index,
+                        group_total=len(groups),
+                        partials=group_text,
+                    ),
+                    system=SUMMARY_SYSTEM_PROMPT,
+                    usage=usage,
+                )
+                logger.info(
+                    "summary.hierarchy.group.done index=%s total=%s duration_sec=%.1f response_chars=%s",
+                    group_index,
+                    len(groups),
+                    time.monotonic() - group_started,
+                    len(mid),
+                )
+                mid_partials.append(f"Группа {group_index}:\n{mid.strip()}")
+                if progress:
+                    progress.complete_step()
+            synthesis_partials = mid_partials
+            synthesis_source = "hierarchy"
+        else:
+            synthesis_partials = chunk_partials
+            synthesis_source = "flat"
+
+        partials_chars = sum(len(item) for item in synthesis_partials)
+        partials_text = _compact_partials(synthesis_partials, SYNTHESIS_PARTIALS_MAX_CHARS)
+        logger.info(
+            "summary.synthesis.start source=%s partials=%s chars=%s compact_chars=%s",
+            synthesis_source,
+            len(synthesis_partials),
+            partials_chars,
+            len(partials_text),
+        )
+        if progress:
+            progress.start_step("финальная сборка")
+        raw = await self._llm.generate(
+            SYNTHESIS_PROMPT.format(url=url, title=title, partials=partials_text),
+            system=SUMMARY_SYSTEM_PROMPT,
+            usage=usage,
+        )
+
+        if not raw.strip():
+            if progress:
+                progress.start_step("повтор финальной сборки")
+            partials_text = _compact_partials(synthesis_partials, SYNTHESIS_RETRY_PARTIALS_MAX_CHARS)
+            logger.warning(
+                "summary.synthesis.empty_retry source=%s partials=%s compact_chars=%s",
+                synthesis_source,
+                len(synthesis_partials),
+                len(partials_text),
+            )
+            raw = await self._llm.generate(
+                COMPACT_SUMMARY_PROMPT.format(url=url, title=title, source=partials_text),
+                system=SUMMARY_SYSTEM_PROMPT,
+                usage=usage,
+            )
+
+        if raw.strip():
+            try:
+                summary = self._parse_summary(raw)
+            except SummaryParseError as exc:
+                logger.warning(
+                    "summary.synthesis.parse_retry source=%s partials=%s raw_chars=%s error=%s",
+                    synthesis_source,
+                    len(synthesis_partials),
+                    len(raw),
+                    exc,
+                )
+                if progress:
+                    progress.start_step("повтор финальной сборки")
+                partials_text = _compact_partials(synthesis_partials, SYNTHESIS_RETRY_PARTIALS_MAX_CHARS)
+                retry_raw = await self._llm.generate(
+                    COMPACT_SUMMARY_PROMPT.format(url=url, title=title, source=partials_text),
+                    system=SUMMARY_SYSTEM_PROMPT,
+                    usage=usage,
+                )
+                if retry_raw.strip():
+                    raw = retry_raw
+                try:
+                    summary = self._parse_summary(raw)
+                except SummaryParseError as retry_exc:
+                    logger.warning(
+                        "summary.synthesis.parse_fallback source=%s partials=%s raw_chars=%s error=%s",
+                        synthesis_source,
+                        len(synthesis_partials),
+                        len(raw),
+                        retry_exc,
+                    )
+                    summary = _fallback_summary_from_partials(synthesis_partials, raw_text=raw)
+        else:
+            logger.warning(
+                "summary.synthesis.empty_fallback source=%s partials=%s",
+                synthesis_source,
+                len(synthesis_partials),
+            )
+            summary = _fallback_summary_from_partials(synthesis_partials)
+
+        if progress:
+            progress.complete_step()
+        logger.info(
+            "summary.done mode=chunked duration_sec=%.1f key_points=%s chapters=%s raw_chars=%s",
+            time.monotonic() - started,
+            len(summary.key_points),
+            len(summary.chapters),
+            len(raw),
+        )
+        return summary
+
+    def _parse_summary(self, raw: str) -> Summary:
+        try:
+            data = _load_json(raw)
+        except SummaryParseError:
+            summary = _summary_from_damaged_json(raw)
+            if summary is not None:
+                logger.warning(
+                    "summary.parse_json.recovered raw_chars=%s key_points=%s chapters=%s",
+                    len(raw),
+                    len(summary.key_points),
+                    len(summary.chapters),
+                )
+                return summary
+            raise
+        chapters = [
+            Chapter(
+                start=str(item.get("start", "")).strip(),
+                title=str(item.get("title", "")).strip(),
+                notes=str(item.get("notes", "")).strip(),
+            )
+            for item in data.get("chapters", [])
+            if isinstance(item, dict)
+        ]
+        key_points = [str(item).strip() for item in data.get("key_points", []) if str(item).strip()]
+
+        return Summary(
+            overview=str(data.get("overview", "")).strip() or raw.strip(),
+            key_points=key_points,
+            chapters=chapters,
+            raw_text=raw,
+        )
+
+
+def _load_json(raw: str) -> dict:
+    cleaned = _clean_json_text(raw)
+    last_error: json.JSONDecodeError | None = None
+
+    for candidate in _json_candidates(cleaned):
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            continue
+        if isinstance(data, dict):
+            return data
+        raise SummaryParseError("LLM returned JSON, but the root value is not an object")
+
+    if last_error:
+        raise SummaryParseError(str(last_error)) from last_error
+    raise SummaryParseError("LLM did not return a JSON object")
+
+
+def _clean_json_text(raw: str) -> str:
+    cleaned = raw.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    return re.sub(r"```$", "", cleaned).strip()
+
+
+def _json_candidates(cleaned: str) -> list[str]:
+    candidates = [cleaned]
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start >= 0 and end > start:
+        extracted = cleaned[start : end + 1]
+        if extracted != cleaned:
+            candidates.append(extracted)
+    return candidates
+
+
+def _summary_from_damaged_json(raw: str) -> Summary | None:
+    cleaned = _clean_json_text(raw)
+    if "{" not in cleaned:
+        return None
+
+    overview_value = _extract_json_value(cleaned, "overview")
+    key_points_value = _extract_json_value(cleaned, "key_points")
+    chapters_value = _extract_json_value(cleaned, "chapters")
+
+    overview = overview_value.strip() if isinstance(overview_value, str) else ""
+    key_points = _string_list(key_points_value)
+    chapters = _chapters_from_value(chapters_value)
+    if not chapters:
+        chapters = _extract_complete_chapters(cleaned)
+
+    if not overview and key_points:
+        overview = _overview_from_points(key_points)
+    if not key_points and chapters:
+        key_points = _key_points_from_chapters(chapters)
+
+    if not overview and not key_points and not chapters:
+        return None
+
+    return Summary(
+        overview=overview or "Модель вернула повреждённый JSON, но часть структуры удалось восстановить.",
+        key_points=key_points,
+        chapters=chapters,
+        raw_text=cleaned or raw,
+    )
+
+
+def _extract_json_value(text: str, key: str):
+    pattern = rf'"{re.escape(key)}"\s*:'
+    decoder = json.JSONDecoder()
+    for match in re.finditer(pattern, text):
+        candidate = text[match.end() :].lstrip()
+        try:
+            value, _end = decoder.raw_decode(candidate)
+        except json.JSONDecodeError:
+            continue
+        return value
+    return None
+
+
+def _string_list(value) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _chapters_from_value(value) -> list[Chapter]:
+    if not isinstance(value, list):
+        return []
+    chapters: list[Chapter] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        chapter = _chapter_from_dict(item)
+        if chapter.title or chapter.notes:
+            chapters.append(chapter)
+    return chapters
+
+
+def _chapter_from_dict(item: dict) -> Chapter:
+    return Chapter(
+        start=str(item.get("start", "")).strip(),
+        title=str(item.get("title", "")).strip(),
+        notes=str(item.get("notes", "")).strip(),
+    )
+
+
+def _extract_complete_chapters(text: str) -> list[Chapter]:
+    array_start = _find_array_start(text, "chapters")
+    if array_start is None:
+        return []
+
+    chapters: list[Chapter] = []
+    for object_text in _iter_complete_json_objects(text, array_start + 1):
+        try:
+            item = json.loads(object_text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(item, dict):
+            continue
+        chapter = _chapter_from_dict(item)
+        if chapter.title or chapter.notes:
+            chapters.append(chapter)
+    return chapters
+
+
+def _find_array_start(text: str, key: str) -> int | None:
+    match = re.search(rf'"{re.escape(key)}"\s*:', text)
+    if not match:
+        return None
+    array_start = text.find("[", match.end())
+    return array_start if array_start >= 0 else None
+
+
+def _iter_complete_json_objects(text: str, start: int):
+    depth = 0
+    object_start: int | None = None
+    in_string = False
+    escaped = False
+
+    for index in range(start, len(text)):
+        char = text[index]
+
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                object_start = index
+            depth += 1
+        elif char == "}":
+            if depth == 0:
+                continue
+            depth -= 1
+            if depth == 0 and object_start is not None:
+                yield text[object_start : index + 1]
+                object_start = None
+        elif char == "]" and depth == 0:
+            break
+
+
+def _overview_from_points(points: list[str]) -> str:
+    first_points = [point.rstrip(".") for point in points[:2] if point.strip()]
+    if not first_points:
+        return ""
+    overview = ". ".join(first_points)
+    if not overview.endswith((".", "!", "?")):
+        overview = f"{overview}."
+    return overview
+
+
+def _key_points_from_chapters(chapters: list[Chapter]) -> list[str]:
+    points: list[str] = []
+    for chapter in chapters:
+        text = chapter.title or _first_sentence(chapter.notes)
+        if text:
+            points.append(text)
+    return points
+
+
+def _num_groups(n: int, max_size: int) -> int:
+    if n <= 0 or max_size <= 0:
+        return 0
+    return max(1, (n + max_size - 1) // max_size)
+
+
+def _split_into_groups(items: list[str], max_size: int) -> list[list[str]]:
+    if not items:
+        return []
+    if max_size <= 0 or len(items) <= max_size:
+        return [list(items)]
+    num_groups = _num_groups(len(items), max_size)
+    per_group = len(items) // num_groups
+    extra = len(items) % num_groups
+    groups: list[list[str]] = []
+    idx = 0
+    for group_idx in range(num_groups):
+        size = per_group + (1 if group_idx < extra else 0)
+        groups.append(items[idx : idx + size])
+        idx += size
+    return groups
+
+
+def _compact_partials(partials: list[str], max_chars: int) -> str:
+    if not partials:
+        return ""
+
+    separator_len = 2 * (len(partials) - 1)
+    per_partial = max(250, (max_chars - separator_len) // len(partials))
+    compacted = [_truncate_text(partial, per_partial) for partial in partials]
+    return "\n\n".join(compacted)
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+
+    truncated = text[: max(0, max_chars - 3)].rstrip()
+    return f"{truncated}..."
+
+
+def _fallback_summary_from_partials(partials: list[str], raw_text: str | None = None) -> Summary:
+    if raw_text:
+        recovered = _summary_from_damaged_json(raw_text)
+        if recovered is not None and (recovered.key_points or recovered.chapters):
+            return recovered
+
+    chapters = [
+        _chapter_from_partial(index, partial)
+        for index, partial in enumerate(partials, start=1)
+        if partial.strip()
+    ]
+    fallback_raw_text = raw_text or "\n\n".join(partials).strip()
+    key_points = _key_points_from_chapters(chapters)
+    return Summary(
+        overview=_overview_from_points(key_points)
+        or (
+            "Финальная JSON-сборка не завершилась, поэтому сохранена структурная выжимка "
+            "из промежуточных конспектов ролика."
+        ),
+        key_points=key_points,
+        chapters=chapters,
+        raw_text=fallback_raw_text,
+    )
+
+
+def _chapter_from_partial(index: int, partial: str) -> Chapter:
+    cleaned = re.sub(r"^\s*(Фрагмент|Группа)\s+\d+\s*:\s*", "", partial.strip())
+    first_line = next((line.strip() for line in cleaned.splitlines() if line.strip()), "")
+    title = _title_from_text(first_line) or f"Фрагмент {index}"
+    notes = cleaned or partial.strip()
+    return Chapter(start="", title=title, notes=notes)
+
+
+def _title_from_text(text: str) -> str:
+    text = re.sub(r"^[#*\-\d\.\s]+", "", text).strip()
+    sentence = _first_sentence(text) or text
+    return _truncate_text(sentence, 90)
+
+
+def _first_sentence(text: str) -> str:
+    text = " ".join(text.split())
+    if not text:
+        return ""
+    match = re.search(r"^(.{20,220}?[.!?])(?:\s|$)", text)
+    if match:
+        return match.group(1).strip()
+    return _truncate_text(text, 160)
+
+
+def _fallback_summary_from_raw(raw: str) -> Summary:
+    recovered = _summary_from_damaged_json(raw)
+    if recovered is not None:
+        return recovered
+
+    cleaned = _clean_json_text(raw)
+    if cleaned.startswith("{"):
+        overview = (
+            "Модель вернула summary в повреждённом JSON-формате. "
+            "Полный ответ модели опубликован в Telegra.ph."
+        )
+    else:
+        overview = _truncate_text(cleaned, 1200) or "Модель не вернула пригодный текст summary."
+
+    return Summary(
+        overview=overview,
+        key_points=[],
+        chapters=[],
+        raw_text=cleaned or raw,
+    )
+
+
+def _format_duration(seconds: int) -> str:
+    minutes, secs = divmod(max(0, seconds), 60)
+    if minutes:
+        return f"{minutes} мин {secs:02d} сек"
+    return f"{secs} сек"
