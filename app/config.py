@@ -32,6 +32,21 @@ class Settings:
     transcript_chunk_max_chars: int
     synthesis_hierarchy_threshold: int
     synthesis_group_size: int
+    monitoring_enabled: bool
+    monitoring_config_path: Path
+    monitoring_state_path: Path
+    monitoring_target_chat_id: int | None
+    monitoring_llm_retry_interval_sec: int
+
+
+def _parse_optional_int(raw: str) -> int | None:
+    value = raw.strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 
 def load_settings() -> Settings:
@@ -44,6 +59,16 @@ def load_settings() -> Settings:
     data_dir = Path(os.getenv("BOT_DATA_DIR", "/data")).expanduser()
     cookies_raw = os.getenv("YTDLP_COOKIES_PATH", "").strip()
     cookies_path = Path(cookies_raw).expanduser() if cookies_raw else None
+
+    monitoring_config_path = Path(
+        os.getenv("MONITORING_CONFIG_PATH", str(data_dir / "monitoring.yaml"))
+    ).expanduser()
+    monitoring_state_path = Path(
+        os.getenv("MONITORING_STATE_PATH", str(data_dir / "monitoring_state.json"))
+    ).expanduser()
+    monitoring_target_chat_id = _parse_optional_int(os.getenv("MONITORING_TARGET_CHAT_ID", ""))
+    monitoring_enabled = os.getenv("MONITORING_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+    monitoring_llm_retry_interval_sec = int(os.getenv("MONITORING_LLM_RETRY_INTERVAL_SEC", "300"))
 
     return Settings(
         telegram_bot_token=token,
@@ -65,4 +90,9 @@ def load_settings() -> Settings:
         transcript_chunk_max_chars=int(os.getenv("TRANSCRIPT_CHUNK_MAX_CHARS", "3000")),
         synthesis_hierarchy_threshold=int(os.getenv("SYNTHESIS_HIERARCHY_THRESHOLD", "6")),
         synthesis_group_size=int(os.getenv("SYNTHESIS_GROUP_SIZE", "5")),
+        monitoring_enabled=monitoring_enabled,
+        monitoring_config_path=monitoring_config_path,
+        monitoring_state_path=monitoring_state_path,
+        monitoring_target_chat_id=monitoring_target_chat_id,
+        monitoring_llm_retry_interval_sec=monitoring_llm_retry_interval_sec,
     )

@@ -11,9 +11,25 @@ class TranscriptSegment:
 
 
 @dataclass(frozen=True)
+class VideoChapter:
+    start: float
+    title: str
+
+
+@dataclass(frozen=True)
 class VideoMetadata:
     video_id: str
     title: str
+    channel_name: str
+    channel_url: str
+    duration_sec: float = 0.0
+    description: str = ""
+    chapters: tuple[VideoChapter, ...] = ()
+
+
+@dataclass(frozen=True)
+class ChannelInfo:
+    channel_id: str
     channel_name: str
     channel_url: str
 

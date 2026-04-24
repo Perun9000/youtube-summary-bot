@@ -9,7 +9,7 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import NoTranscriptFound, TranscriptsDisabled, VideoUnavailable
 
 from app.config import Settings
-from app.models import TranscriptSegment, VideoMetadata
+from app.models import ChannelInfo, TranscriptSegment, VideoChapter, VideoMetadata
 from app.utils import extract_video_id
 
 
@@ -45,11 +45,17 @@ class YouTubeService:
                     or ""
                 )
                 channel_url = info.get("channel_url") or info.get("uploader_url") or ""
+                duration = info.get("duration") or 0
+                description = info.get("description") or ""
+                chapters = _parse_chapters(info.get("chapters"))
                 return VideoMetadata(
                     video_id=video_id,
                     title=title,
                     channel_name=str(channel_name).strip(),
                     channel_url=str(channel_url).strip(),
+                    duration_sec=float(duration or 0),
+                    description=str(description),
+                    chapters=chapters,
                 )
         except Exception:
             return VideoMetadata(
@@ -58,6 +64,47 @@ class YouTubeService:
                 channel_name="",
                 channel_url="",
             )
+
+    def resolve_channel(self, url: str) -> ChannelInfo:
+        """Resolve a channel handle / custom URL to a canonical channel_id.
+
+        Uses yt-dlp in flat-extract mode so we don't fetch the whole video list.
+        """
+        options = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "extract_flat": "in_playlist",
+            "playlistend": 1,
+        }
+        self._add_cookie_option(options)
+
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        candidate_ids = [
+            info.get("channel_id"),
+            info.get("uploader_id"),
+            info.get("id"),
+        ]
+        channel_id = next(
+            (
+                str(candidate).strip()
+                for candidate in candidate_ids
+                if isinstance(candidate, str) and str(candidate).strip().startswith("UC")
+            ),
+            "",
+        )
+        if not channel_id:
+            raise RuntimeError(f"Не удалось определить channel_id для {url}")
+
+        channel_name = str(info.get("channel") or info.get("uploader") or info.get("title") or "").strip()
+        channel_url = str(info.get("channel_url") or info.get("webpage_url") or url).strip()
+        return ChannelInfo(
+            channel_id=channel_id,
+            channel_name=channel_name,
+            channel_url=channel_url,
+        )
 
     def fetch_transcript(self, video_id: str) -> list[TranscriptSegment]:
         try:
@@ -143,3 +190,22 @@ class YouTubeService:
         cookies_path = self._settings.ytdlp_cookies_path
         if cookies_path and cookies_path.exists():
             options["cookiefile"] = str(cookies_path)
+
+
+def _parse_chapters(raw: object) -> tuple[VideoChapter, ...]:
+    if not isinstance(raw, list):
+        return ()
+    chapters: list[VideoChapter] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            start = float(item.get("start_time") or item.get("start") or 0)
+        except (TypeError, ValueError):
+            continue
+        title = str(item.get("title") or "").strip()
+        if not title:
+            continue
+        chapters.append(VideoChapter(start=start, title=title))
+    chapters.sort(key=lambda chapter: chapter.start)
+    return tuple(chapters)

@@ -257,9 +257,16 @@ class Summarizer:
         chunks: list[str],
         progress: SummaryProgress | None = None,
         usage: GenerationUsage | None = None,
+        context_hint: str | None = None,
     ) -> Summary:
         started = time.monotonic()
-        logger.info("summary.start title=%r chunks=%s", title, len(chunks))
+        logger.info(
+            "summary.start title=%r chunks=%s context_hint=%s",
+            title,
+            len(chunks),
+            bool(context_hint),
+        )
+        system_prompt = _system_prompt_with_hint(context_hint)
         if len(chunks) == 1:
             if progress:
                 progress.configure(1)
@@ -267,7 +274,7 @@ class Summarizer:
             logger.info("summary.single_chunk.start chars=%s", len(chunks[0]))
             raw = await self._llm.generate(
                 SUMMARY_JSON_PROMPT.format(url=url, title=title, transcript=chunks[0]),
-                system=SUMMARY_SYSTEM_PROMPT,
+                system=system_prompt,
                 usage=usage,
             )
             try:
@@ -282,7 +289,7 @@ class Summarizer:
                         title=title,
                         source=_truncate_text(chunks[0], SYNTHESIS_RETRY_PARTIALS_MAX_CHARS),
                     ),
-                    system=SUMMARY_SYSTEM_PROMPT,
+                    system=system_prompt,
                     usage=usage,
                 )
                 if retry_raw.strip():
@@ -327,7 +334,7 @@ class Summarizer:
             logger.info("summary.chunk.start index=%s total=%s chars=%s", index, num_chunks, len(chunk))
             partial = await self._llm.generate(
                 CHUNK_PROMPT.format(url=url, title=title, index=index, total=num_chunks, chunk=chunk),
-                system=SUMMARY_SYSTEM_PROMPT,
+                system=system_prompt,
                 usage=usage,
             )
             logger.info(
@@ -370,7 +377,7 @@ class Summarizer:
                         group_total=len(groups),
                         partials=group_text,
                     ),
-                    system=SUMMARY_SYSTEM_PROMPT,
+                    system=system_prompt,
                     usage=usage,
                 )
                 logger.info(
@@ -402,7 +409,7 @@ class Summarizer:
             progress.start_step("финальная сборка")
         raw = await self._llm.generate(
             SYNTHESIS_PROMPT.format(url=url, title=title, partials=partials_text),
-            system=SUMMARY_SYSTEM_PROMPT,
+            system=system_prompt,
             usage=usage,
         )
 
@@ -418,7 +425,7 @@ class Summarizer:
             )
             raw = await self._llm.generate(
                 COMPACT_SUMMARY_PROMPT.format(url=url, title=title, source=partials_text),
-                system=SUMMARY_SYSTEM_PROMPT,
+                system=system_prompt,
                 usage=usage,
             )
 
@@ -438,7 +445,7 @@ class Summarizer:
                 partials_text = _compact_partials(synthesis_partials, SYNTHESIS_RETRY_PARTIALS_MAX_CHARS)
                 retry_raw = await self._llm.generate(
                     COMPACT_SUMMARY_PROMPT.format(url=url, title=title, source=partials_text),
-                    system=SUMMARY_SYSTEM_PROMPT,
+                    system=system_prompt,
                     usage=usage,
                 )
                 if retry_raw.strip():
@@ -812,3 +819,12 @@ def _format_duration(seconds: int) -> str:
     if minutes:
         return f"{minutes} мин {secs:02d} сек"
     return f"{secs} сек"
+
+
+def _system_prompt_with_hint(context_hint: str | None) -> str:
+    if not context_hint:
+        return SUMMARY_SYSTEM_PROMPT
+    hint = context_hint.strip()
+    if not hint:
+        return SUMMARY_SYSTEM_PROMPT
+    return f"{SUMMARY_SYSTEM_PROMPT}\n\nДополнительный контекст:\n{hint}"

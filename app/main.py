@@ -8,14 +8,21 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher
 from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeDefault, MenuButtonCommands
 
-from app.bot_handlers import Services, build_router
+from app.bot_handlers import Services, build_router, enqueue_scheduled_candidate
 from app.config import load_settings
 from app.llm_client import create_llm_client
+from app.monitoring_config import MonitoringConfig
+from app.monitoring_service import MonitoringService
+from app.monitoring_state import MonitoringState
 from app.qa_service import QAService
+from app.scheduler_service import run_monitoring_scheduler
 from app.summarizer import Summarizer
 from app.telegraph_service import TelegraphService
 from app.whisper_service import WhisperService
 from app.youtube_service import YouTubeService
+
+
+logger = logging.getLogger(__name__)
 
 
 BOT_COMMANDS: list[BotCommand] = [
@@ -72,6 +79,8 @@ async def main() -> None:
     configure_logging(settings.bot_data_dir)
 
     llm = create_llm_client(settings)
+    bot = Bot(token=settings.telegram_bot_token)
+
     services = Services(
         settings=settings,
         llm=llm,
@@ -94,13 +103,52 @@ async def main() -> None:
         summary_status_base_texts={},
         summary_status_parse_modes={},
         summary_status_disable_previews={},
+        bot=bot,
     )
 
-    bot = Bot(token=settings.telegram_bot_token)
+    scheduler_task: asyncio.Task[None] | None = None
+    if settings.monitoring_enabled:
+        monitoring_config = MonitoringConfig(settings.monitoring_config_path)
+        monitoring_config.load()
+        monitoring_state = MonitoringState(settings.monitoring_state_path)
+        monitoring_state.load()
+
+        async def _enqueue(candidate, channel):
+            await enqueue_scheduled_candidate(candidate, channel, services)
+
+        services.monitoring = MonitoringService(
+            config=monitoring_config,
+            state=monitoring_state,
+            youtube=services.youtube,
+            enqueue=_enqueue,
+        )
+        scheduler_task = asyncio.create_task(
+            run_monitoring_scheduler(services.monitoring),
+            name="monitoring-scheduler",
+        )
+        logger.info(
+            "monitoring.boot enabled=true config=%s state=%s target_chat_id=%s",
+            settings.monitoring_config_path,
+            settings.monitoring_state_path,
+            settings.monitoring_target_chat_id,
+        )
+    else:
+        logger.info("monitoring.boot enabled=false")
+
     await configure_bot_commands(bot)
     dispatcher = Dispatcher()
     dispatcher.include_router(build_router(services))
-    await dispatcher.start_polling(bot)
+    try:
+        await dispatcher.start_polling(bot)
+    finally:
+        if scheduler_task is not None and not scheduler_task.done():
+            scheduler_task.cancel()
+            try:
+                await scheduler_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("monitoring.scheduler.shutdown_failed")
 
 
 if __name__ == "__main__":

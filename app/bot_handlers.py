@@ -6,21 +6,28 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Awaitable, TypeVar
 
-from aiogram import F, Router
+from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import Message
 
 from app.config import Settings
 from app.llm_client import GenerationUsage, LLMClient
-from app.models import Summary, VideoContext
+from app.models import Summary, TranscriptSegment, VideoContext, VideoMetadata
+from app.monitoring_service import (
+    MonitoringService,
+    ScheduledCandidate,
+    filter_segments_by_spans,
+    format_spans_for_humans,
+)
 from app.qa_service import QAService
 from app.summarizer import Summarizer, SummaryProgress
 from app.telegraph_service import TelegraphService
 from app.transcript_chunker import chunk_transcript, segments_to_text
-from app.utils import escape_html, extract_video_id, extract_youtube_url
+from app.utils import classify_youtube_url, escape_html, extract_video_id, extract_youtube_url
 from app.whisper_service import WhisperService
 from app.youtube_service import TranscriptUnavailable, YouTubeService
 
@@ -28,15 +35,34 @@ from app.youtube_service import TranscriptUnavailable, YouTubeService
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
 MAX_TELEGRAM_MESSAGE_CHARS = 4000
+TRANSCRIPTS_SUBDIR = "transcripts"
+
+
+def _save_transcript_to_file(data_dir: Path, video_id: str, transcript_text: str) -> Path:
+    transcripts_dir = data_dir / TRANSCRIPTS_SUBDIR
+    transcripts_dir.mkdir(parents=True, exist_ok=True)
+    path = transcripts_dir / f"{video_id}.txt"
+    path.write_text(transcript_text, encoding="utf-8")
+    return path
 
 
 @dataclass
 class SummaryJob:
     sequence: int
-    message: Message
+    message: Message | None
     url: str
     enqueued_at: float
+    chat_id: int
     title_hint: str | None = None
+    scheduled: bool = False
+    disable_notification: bool = False
+    pre_fetched_metadata: VideoMetadata | None = None
+    pre_fetched_segments: list[TranscriptSegment] | None = None
+    pre_fetched_transcript_source: str | None = None
+    segment_spans: list[tuple[float, float]] | None = None
+    expert_matches: list[str] | None = None
+    show_matches: list[str] | None = None
+    retry_count: int = 0
 
 
 @dataclass
@@ -58,6 +84,8 @@ class Services:
     summary_status_base_texts: dict[int, str]
     summary_status_parse_modes: dict[int, str | None]
     summary_status_disable_previews: dict[int, bool]
+    bot: Bot | None = None
+    monitoring: MonitoringService | None = None
 
 
 def build_router(services: Services) -> Router:
@@ -162,7 +190,16 @@ def build_router(services: Services) -> Router:
 
         url = extract_youtube_url(text)
         if url:
-            await _enqueue_summary_job(message, url, services)
+            kind = classify_youtube_url(url)
+            if kind == "channel":
+                await _handle_channel_url(message, url, services)
+                return
+            if kind == "video":
+                await _enqueue_summary_job(message, url, services)
+                return
+            await message.answer(
+                "Не разобрал ссылку. Пришли URL ролика или канала YouTube."
+            )
             return
 
         context = services.contexts.get(message.chat.id)
@@ -188,7 +225,13 @@ async def _enqueue_summary_job(message: Message, url: str, services: Services) -
         active_job = services.summary_active_job
         active_count = 1 if active_job is not None else 0
         position = active_count + services.summary_queue.qsize() + 1
-        job = SummaryJob(sequence=sequence, message=message, url=url, enqueued_at=time.monotonic())
+        job = SummaryJob(
+            sequence=sequence,
+            message=message,
+            url=url,
+            enqueued_at=time.monotonic(),
+            chat_id=message.chat.id,
+        )
         await services.summary_queue.put(job)
         if services.summary_worker_task is None or services.summary_worker_task.done():
             services.summary_worker_task = asyncio.create_task(_summary_queue_worker(services))
@@ -212,7 +255,7 @@ async def _enqueue_summary_job(message: Message, url: str, services: Services) -
             job=job,
             bump=True,
         )
-    elif active_job is not None and active_job.message.chat.id == message.chat.id:
+    elif active_job is not None and active_job.chat_id == message.chat.id:
         await _bump_service_status(services, message, active_job)
     else:
         await _set_service_status(
@@ -222,6 +265,90 @@ async def _enqueue_summary_job(message: Message, url: str, services: Services) -
             job=job,
             bump=True,
         )
+
+
+async def _handle_channel_url(message: Message, url: str, services: Services) -> None:
+    if services.monitoring is None:
+        await message.answer(
+            "Мониторинг каналов выключен. Включи MONITORING_ENABLED=true и перезапусти бота."
+        )
+        return
+
+    notice = await message.answer("Проверяю канал и добавляю в мониторинг...")
+    try:
+        channel, added = await services.monitoring.add_channel_by_url(url)
+    except Exception as exc:
+        logger.exception("monitoring.add_channel.failed url=%s", url)
+        await notice.edit_text(f"Не получилось добавить канал. Причина: {exc}")
+        return
+
+    label = channel.channel_name or channel.channel_id
+    if added:
+        text = (
+            f"Канал добавлен в мониторинг: {label}.\n"
+            f"Новые видео буду проверять раз в сутки."
+        )
+    else:
+        text = f"Канал уже в мониторинге: {label}."
+    await notice.edit_text(text)
+
+
+async def enqueue_scheduled_candidate(
+    candidate: ScheduledCandidate, channel, services: Services
+) -> None:
+    """Enqueue a summary job for a scheduled monitoring hit.
+
+    Called by MonitoringService after the filter pipeline has accepted a video.
+    """
+    target_chat_id = services.settings.monitoring_target_chat_id
+    if target_chat_id is None:
+        logger.warning(
+            "monitoring.enqueue.no_target_chat video_id=%s channel_id=%s",
+            candidate.metadata.video_id,
+            channel.channel_id,
+        )
+        return
+
+    async with services.summary_queue_lock:
+        services.summary_next_sequence += 1
+        sequence = services.summary_next_sequence
+        job = SummaryJob(
+            sequence=sequence,
+            message=None,
+            url=candidate.feed_entry.url,
+            enqueued_at=time.monotonic(),
+            chat_id=target_chat_id,
+            title_hint=candidate.metadata.title or candidate.feed_entry.title,
+            scheduled=True,
+            disable_notification=True,
+            pre_fetched_metadata=candidate.metadata,
+            pre_fetched_segments=list(candidate.transcript_segments) or None,
+            pre_fetched_transcript_source=candidate.transcript_source,
+            segment_spans=list(candidate.segment_spans) or None,
+            expert_matches=list(candidate.expert_matches) or None,
+            show_matches=list(candidate.show_matches) or None,
+        )
+        await services.summary_queue.put(job)
+        if services.summary_worker_task is None or services.summary_worker_task.done():
+            services.summary_worker_task = asyncio.create_task(_summary_queue_worker(services))
+
+    logger.info(
+        "monitoring.enqueue.scheduled sequence=%s video_id=%s channel_id=%s experts=%s spans=%s",
+        sequence,
+        candidate.metadata.video_id,
+        channel.channel_id,
+        candidate.expert_matches,
+        candidate.segment_spans,
+    )
+
+
+async def _is_llm_available(services: Services) -> bool:
+    try:
+        await asyncio.wait_for(services.llm.list_models(), timeout=10)
+        return True
+    except Exception as exc:
+        logger.info("llm.health.unavailable provider=%s error=%s", services.llm.provider_name, exc)
+        return False
 
 
 async def _summary_queue_worker(services: Services) -> None:
@@ -240,28 +367,46 @@ async def _summary_queue_worker(services: Services) -> None:
                         return
                     continue
 
+            if job.scheduled and not await _is_llm_available(services):
+                retry_interval = services.settings.monitoring_llm_retry_interval_sec
+                job.retry_count += 1
+                logger.info(
+                    "queue.job.defer_scheduled sequence=%s chat_id=%s retry=%s sleep_sec=%s",
+                    job.sequence,
+                    job.chat_id,
+                    job.retry_count,
+                    retry_interval,
+                )
+                async with services.summary_queue_lock:
+                    services.summary_active_job = None
+                await services.summary_queue.put(job)
+                services.summary_queue.task_done()
+                await asyncio.sleep(max(30, retry_interval))
+                continue
+
             async with services.summary_queue_lock:
                 services.summary_active_job = job
 
             wait_sec = time.monotonic() - job.enqueued_at
             logger.info(
-                "queue.job.start sequence=%s chat_id=%s wait_sec=%.1f pending=%s url=%s",
+                "queue.job.start sequence=%s chat_id=%s wait_sec=%.1f pending=%s url=%s scheduled=%s",
                 job.sequence,
-                job.message.chat.id,
+                job.chat_id,
                 wait_sec,
                 services.summary_queue.qsize(),
                 job.url,
+                job.scheduled,
             )
             try:
                 await _process_youtube_job(job, services)
                 logger.info(
                     "queue.job.done sequence=%s chat_id=%s pending=%s",
                     job.sequence,
-                    job.message.chat.id,
+                    job.chat_id,
                     services.summary_queue.qsize(),
                 )
             except asyncio.CancelledError:
-                logger.info("queue.job.cancelled sequence=%s chat_id=%s", job.sequence, job.message.chat.id)
+                logger.info("queue.job.cancelled sequence=%s chat_id=%s", job.sequence, job.chat_id)
                 raise
             except Exception:
                 logger.exception("queue.job.failed sequence=%s url=%s", job.sequence, job.url)
@@ -321,13 +466,16 @@ def _drain_summary_queue(queue: asyncio.Queue[SummaryJob]) -> int:
 
 async def _set_service_status(
     services: Services,
-    source_message: Message,
+    source_message: Message | None,
     text: str,
     job: SummaryJob | None = None,
     parse_mode: str | None = None,
     disable_web_page_preview: bool = False,
     bump: bool = False,
-) -> Message:
+) -> Message | None:
+    if source_message is None or (job is not None and job.scheduled):
+        # Scheduled jobs run silently — no interim status messages in the chat.
+        return None
     chat_id = source_message.chat.id
     rendered_text = await _render_service_status(text, services, job)
     rendered_text = _fit_telegram_message(rendered_text)
@@ -428,8 +576,11 @@ async def _refresh_active_service_status(services: Services) -> None:
         active_job = services.summary_active_job
     if active_job is None:
         return
+    # Scheduled jobs run silently — no interim status refresh in chat.
+    if active_job.scheduled or active_job.message is None:
+        return
 
-    chat_id = active_job.message.chat.id
+    chat_id = active_job.chat_id
     text = services.summary_status_base_texts.get(chat_id)
     if not text:
         return
@@ -490,74 +641,112 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
     started = time.monotonic()
     message = job.message
     url = job.url
-    chat_id = message.chat.id
+    chat_id = job.chat_id
     video_id = "unknown"
     transcript_source = "unknown"
     title = url
     await _set_service_status(services, message, "Получаю данные ролика...", job=job)
     try:
         video_id = extract_video_id(url)
-        logger.info("job.start job_id=%s chat_id=%s video_id=%s url=%s", job_id, chat_id, video_id, url)
-
-        stage_started = time.monotonic()
-        metadata = await asyncio.to_thread(services.youtube.fetch_metadata, url)
-        video_id = metadata.video_id
-        title = metadata.title
         logger.info(
-            "job.metadata.done job_id=%s video_id=%s title=%r channel=%r duration_sec=%.1f",
+            "job.start job_id=%s chat_id=%s video_id=%s url=%s scheduled=%s",
             job_id,
+            chat_id,
             video_id,
-            title,
-            metadata.channel_name,
-            time.monotonic() - stage_started,
+            url,
+            job.scheduled,
         )
 
-        try:
-            await _set_service_status(services, message, "Пробую получить готовые субтитры YouTube...", job=job)
-            stage_started = time.monotonic()
-            segments = await asyncio.to_thread(services.youtube.fetch_transcript, video_id)
-            transcript_source = "youtube"
+        stage_started = time.monotonic()
+        if job.pre_fetched_metadata is not None:
+            metadata = job.pre_fetched_metadata
             logger.info(
-                "job.transcript.done job_id=%s source=youtube segments=%s duration_sec=%.1f",
+                "job.metadata.reused job_id=%s video_id=%s title=%r",
                 job_id,
+                metadata.video_id,
+                metadata.title,
+            )
+        else:
+            metadata = await asyncio.to_thread(services.youtube.fetch_metadata, url)
+            logger.info(
+                "job.metadata.done job_id=%s video_id=%s title=%r channel=%r duration_sec=%.1f",
+                job_id,
+                metadata.video_id,
+                metadata.title,
+                metadata.channel_name,
+                time.monotonic() - stage_started,
+            )
+        video_id = metadata.video_id
+        title = metadata.title
+
+        if job.pre_fetched_segments is not None:
+            segments = list(job.pre_fetched_segments)
+            transcript_source = job.pre_fetched_transcript_source or "youtube"
+            logger.info(
+                "job.transcript.reused job_id=%s source=%s segments=%s",
+                job_id,
+                transcript_source,
                 len(segments),
-                time.monotonic() - stage_started,
             )
-        except TranscriptUnavailable:
-            await _set_service_status(
-                services,
-                message,
-                "Субтитры недоступны. Скачиваю аудио и распознаю локально...",
-                job=job,
-            )
-            logger.info("job.transcript.unavailable job_id=%s fallback=audio", job_id)
-            audio_path = await _run_with_telegram_status(
-                services=services,
-                source_message=message,
-                operation=asyncio.to_thread(services.youtube.download_audio, url),
-                base_text="Субтитры недоступны. Скачиваю аудио...",
-                job=job,
-            )
+        else:
+            try:
+                await _set_service_status(services, message, "Пробую получить готовые субтитры YouTube...", job=job)
+                stage_started = time.monotonic()
+                segments = await asyncio.to_thread(services.youtube.fetch_transcript, video_id)
+                transcript_source = "youtube"
+                logger.info(
+                    "job.transcript.done job_id=%s source=youtube segments=%s duration_sec=%.1f",
+                    job_id,
+                    len(segments),
+                    time.monotonic() - stage_started,
+                )
+            except TranscriptUnavailable:
+                await _set_service_status(
+                    services,
+                    message,
+                    "Субтитры недоступны. Скачиваю аудио и распознаю локально...",
+                    job=job,
+                )
+                logger.info("job.transcript.unavailable job_id=%s fallback=audio", job_id)
+                audio_path = await _run_with_telegram_status(
+                    services=services,
+                    source_message=message,
+                    operation=asyncio.to_thread(services.youtube.download_audio, url),
+                    base_text="Субтитры недоступны. Скачиваю аудио...",
+                    job=job,
+                )
+                logger.info(
+                    "job.audio_download.done job_id=%s path=%s duration_sec=%.1f",
+                    job_id,
+                    audio_path,
+                    time.monotonic() - stage_started,
+                )
+                stage_started = time.monotonic()
+                segments = await _run_with_telegram_status(
+                    services=services,
+                    source_message=message,
+                    operation=asyncio.to_thread(services.whisper.transcribe, audio_path),
+                    base_text="Распознаю аудио локально через Whisper...",
+                    job=job,
+                )
+                transcript_source = "whisper"
+                logger.info(
+                    "job.transcript.done job_id=%s source=whisper segments=%s duration_sec=%.1f",
+                    job_id,
+                    len(segments),
+                    time.monotonic() - stage_started,
+                )
+
+        # If this is a scheduled segment-mode job, trim segments to the expert span(s).
+        if job.segment_spans:
+            original_count = len(segments)
+            segments = filter_segments_by_spans(segments, job.segment_spans)
             logger.info(
-                "job.audio_download.done job_id=%s path=%s duration_sec=%.1f",
+                "job.segment_filter.done job_id=%s spans=%s before=%s after=%s",
                 job_id,
-                audio_path,
-                time.monotonic() - stage_started,
-            )
-            stage_started = time.monotonic()
-            segments = await _run_with_telegram_status(
-                services=services,
-                source_message=message,
-                operation=asyncio.to_thread(services.whisper.transcribe, audio_path),
-                base_text="Распознаю аудио локально через Whisper...",
-                job=job,
-            )
-            transcript_source = "whisper"
-            logger.info(
-                "job.transcript.done job_id=%s source=whisper segments=%s duration_sec=%.1f",
-                job_id,
+                job.segment_spans,
+                original_count,
                 len(segments),
-                time.monotonic() - stage_started,
             )
 
         transcript_text = segments_to_text(segments)
@@ -570,14 +759,60 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             services.settings.transcript_chunk_max_chars,
         )
 
+        try:
+            saved_path = await asyncio.to_thread(
+                _save_transcript_to_file,
+                services.settings.bot_data_dir,
+                video_id,
+                transcript_text,
+            )
+            logger.info(
+                "job.transcript.saved job_id=%s path=%s chars=%s",
+                job_id,
+                saved_path,
+                len(transcript_text),
+            )
+        except Exception as exc:
+            logger.warning("job.transcript.save_failed job_id=%s error=%s", job_id, exc)
+
+        transcript_url: str | None = None
+        if segments:
+            try:
+                await _set_service_status(services, message, "Публикую транскрипт в Telegra.ph...", job=job)
+                transcript_url = await _run_with_telegram_status(
+                    services=services,
+                    source_message=message,
+                    operation=services.telegraph.publish_transcript(
+                        title=title,
+                        video_url=url,
+                        video_id=video_id,
+                        segments=segments,
+                        source=transcript_source,
+                    ),
+                    base_text="Публикую транскрипт в Telegra.ph...",
+                    job=job,
+                )
+                logger.info("job.transcript.published job_id=%s url=%s", job_id, transcript_url)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("job.transcript.publish_failed job_id=%s", job_id)
+                transcript_url = None
+
         usage = GenerationUsage()
         summary_progress = SummaryProgress()
+        context_hint = _build_context_hint(job)
         await _set_service_status(services, message, f"Генерирую summary через {services.llm.provider_name}...", job=job)
         summary = await _run_with_telegram_status(
             services=services,
             source_message=message,
             operation=services.summarizer.summarize(
-                url=url, title=title, chunks=chunks, progress=summary_progress, usage=usage,
+                url=url,
+                title=title,
+                chunks=chunks,
+                progress=summary_progress,
+                usage=usage,
+                context_hint=context_hint,
             ),
             base_text=f"Генерирую summary через {services.llm.provider_name}...",
             job=job,
@@ -588,20 +823,28 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
         telegraph_url = await _run_with_telegram_status(
             services=services,
             source_message=message,
-            operation=services.telegraph.publish(title=title, url=url, summary=summary),
+            operation=services.telegraph.publish(
+                title=title,
+                url=url,
+                summary=summary,
+                transcript_url=transcript_url,
+            ),
             base_text="Публикую полный конспект в Telegra.ph...",
             job=job,
         )
 
-        services.contexts[message.chat.id] = VideoContext(
-            url=url,
-            video_id=video_id,
-            title=title,
-            transcript_text=transcript_text,
-            chunks=chunks,
-            summary=summary,
-            telegraph_url=telegraph_url,
-        )
+        # Scheduled jobs come from daily monitoring, not from an interactive chat
+        # session — we don't want to hijack the user's Q&A context with the bot.
+        if not job.scheduled:
+            services.contexts[chat_id] = VideoContext(
+                url=url,
+                video_id=video_id,
+                title=title,
+                transcript_text=transcript_text,
+                chunks=chunks,
+                summary=summary,
+                telegraph_url=telegraph_url,
+            )
 
         total_duration_sec = time.monotonic() - started
         try:
@@ -634,17 +877,21 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             disable_web_page_preview=True,
         )
 
-        await message.answer(
-            _format_telegram_summary(
-                title=title,
-                video_url=url,
-                summary=summary,
-                telegraph_url=telegraph_url,
-                channel_name=metadata.channel_name,
-                channel_url=metadata.channel_url,
-            ),
-            parse_mode="HTML",
-            disable_web_page_preview=True,
+        summary_text = _format_telegram_summary(
+            title=title,
+            video_url=url,
+            summary=summary,
+            telegraph_url=telegraph_url,
+            channel_name=metadata.channel_name,
+            channel_url=metadata.channel_url,
+            scheduled=job.scheduled,
+            segment_spans=job.segment_spans,
+            expert_matches=job.expert_matches,
+        )
+        await _send_summary_delivery(
+            services=services,
+            job=job,
+            text=summary_text,
         )
         _forget_service_status(services, chat_id)
 
@@ -673,10 +920,10 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
     except Exception as exc:
         logger.exception("job.failed job_id=%s video_id=%s duration_sec=%.1f", job_id, video_id, time.monotonic() - started)
         await _set_service_status(services, message, "Генерация summary прервана.", job=job)
-        await message.answer(
-            _format_generation_error(video_url=url, title=title, reason=str(exc)),
-            parse_mode="HTML",
-            disable_web_page_preview=True,
+        await _send_summary_delivery(
+            services=services,
+            job=job,
+            text=_format_generation_error(video_url=url, title=title, reason=str(exc)),
         )
         _forget_service_status(services, chat_id)
         raise
@@ -685,7 +932,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
 async def _run_with_telegram_status(
     *,
     services: Services,
-    source_message: Message,
+    source_message: Message | None,
     operation: Awaitable[T],
     base_text: str,
     job: SummaryJob,
@@ -744,6 +991,9 @@ def _format_telegram_summary(
     telegraph_url: str,
     channel_name: str,
     channel_url: str,
+    scheduled: bool = False,
+    segment_spans: list[tuple[float, float]] | None = None,
+    expert_matches: list[str] | None = None,
 ) -> str:
     if channel_name and channel_url:
         channel_line = (
@@ -756,13 +1006,84 @@ def _format_telegram_summary(
         channel_line = "Новое видео"
 
     title_line = f'<b><a href="{escape_html(video_url)}">{escape_html(title)}</a></b>'
+
+    segment_line = ""
+    if scheduled and segment_spans:
+        spans_text = format_spans_for_humans(segment_spans)
+        if expert_matches:
+            experts_text = ", ".join(expert_matches)
+            segment_line = (
+                f"<i>Фрагмент с участием: {escape_html(experts_text)} "
+                f"({escape_html(spans_text)})</i>"
+            )
+        else:
+            segment_line = f"<i>Фрагмент ролика: {escape_html(spans_text)}</i>"
+
     overview_line = f"<b>О чем видео:</b>\n{escape_html(summary.overview)}"
     telegraph_line = (
         f'Саммари — <a href="{escape_html(telegraph_url)}">{escape_html(telegraph_url)}</a>'
     )
     reading_line = f"Время чтения: {_estimate_reading_time_minutes(summary)} мин"
 
-    return "\n\n".join([channel_line, title_line, overview_line, telegraph_line, reading_line])[:4000]
+    blocks = [channel_line, title_line]
+    if segment_line:
+        blocks.append(segment_line)
+    blocks.extend([overview_line, telegraph_line, reading_line])
+    return "\n\n".join(blocks)[:4000]
+
+
+async def _send_summary_delivery(
+    services: Services,
+    job: SummaryJob,
+    text: str,
+) -> None:
+    """Send the final summary message to the user.
+
+    Manual jobs reply to the original message. Scheduled jobs go through bot.send_message
+    with disable_notification=True so the user isn't pinged overnight.
+    """
+    if job.message is not None and not job.scheduled:
+        await job.message.answer(
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        return
+
+    if services.bot is None:
+        logger.warning(
+            "delivery.bot_missing sequence=%s chat_id=%s",
+            job.sequence,
+            job.chat_id,
+        )
+        return
+
+    await services.bot.send_message(
+        chat_id=job.chat_id,
+        text=text,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        disable_notification=job.disable_notification,
+    )
+
+
+def _build_context_hint(job: SummaryJob) -> str | None:
+    """Build a summarizer context hint for segment-mode (scheduled) jobs."""
+    if not job.segment_spans:
+        return None
+    spans_text = format_spans_for_humans(job.segment_spans)
+    experts = ", ".join(job.expert_matches) if job.expert_matches else ""
+    if experts:
+        return (
+            f"Это фрагмент длинного шоу с участием: {experts}. "
+            f"Таймкоды фрагмента: {spans_text}. "
+            "Саммаризируй только этот фрагмент: весь transcript, который ты получаешь, — "
+            "это уже вырезанный кусок. Не упоминай остальную часть ролика."
+        )
+    return (
+        f"Это фрагмент длинного ролика (таймкоды: {spans_text}). "
+        "Саммаризируй только этот фрагмент, не упоминай остальную часть ролика."
+    )
 
 
 def _format_generation_error(video_url: str, title: str, reason: str) -> str:

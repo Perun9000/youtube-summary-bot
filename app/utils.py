@@ -40,6 +40,35 @@ def extract_video_id(url: str) -> str:
     raise ValueError("Не удалось определить video_id из ссылки")
 
 
+def classify_youtube_url(url: str) -> str:
+    """Returns 'video', 'channel', or 'unknown'."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return "unknown"
+
+    host = parsed.netloc.lower()
+    if host not in YOUTUBE_HOSTS and not host.endswith(".youtube.com"):
+        return "unknown"
+
+    try:
+        extract_video_id(url)
+        return "video"
+    except ValueError:
+        pass
+
+    parts = [part for part in parsed.path.split("/") if part]
+    if not parts:
+        return "unknown"
+
+    first = parts[0]
+    if first.startswith("@"):
+        return "channel"
+    if first in {"channel", "c", "user"}:
+        return "channel"
+    return "unknown"
+
+
 def format_ts(seconds: float) -> str:
     seconds_int = max(0, int(seconds))
     hours, remainder = divmod(seconds_int, 3600)
