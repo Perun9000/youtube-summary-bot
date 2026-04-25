@@ -33,6 +33,19 @@ class ScheduledCandidate:
 EnqueueCallback = Callable[[ScheduledCandidate, MonitoredChannel], Awaitable[None]]
 
 
+@dataclass
+class ScanProgress:
+    """Snapshot of run_scan() progress, emitted before each channel and once on completion."""
+
+    channels_total: int
+    channels_done: int                   # how many channels finished by the time of this snapshot
+    current_channel: MonitoredChannel | None  # None on the final "done" snapshot
+    enqueued_total: int
+
+
+ProgressCallback = Callable[[ScanProgress], Awaitable[None]]
+
+
 class MonitoringService:
     def __init__(
         self,
@@ -96,18 +109,26 @@ class MonitoringService:
 
         return channel, added
 
-    async def run_scan(self) -> None:
+    async def run_scan(self, progress: ProgressCallback | None = None) -> int:
         async with self._scan_lock:
             self._config.load()
             rules = self._config.rules
-            if not rules.channels:
+            total = len(rules.channels)
+            if total == 0:
                 logger.info("monitoring.scan.skip reason=no_channels")
-                return
+                return 0
 
-            logger.info("monitoring.scan.start channels=%s", len(rules.channels))
+            logger.info("monitoring.scan.start channels=%s", total)
             candidates_enqueued = 0
             async with httpx.AsyncClient() as client:
-                for channel in rules.channels:
+                for index, channel in enumerate(rules.channels):
+                    if progress is not None:
+                        await _safe_progress(progress, ScanProgress(
+                            channels_total=total,
+                            channels_done=index,
+                            current_channel=channel,
+                            enqueued_total=candidates_enqueued,
+                        ))
                     try:
                         candidates_enqueued += await self._scan_channel(client, channel, rules)
                     except Exception:
@@ -117,6 +138,15 @@ class MonitoringService:
                         )
             self._state.save()
             logger.info("monitoring.scan.done enqueued=%s", candidates_enqueued)
+
+            if progress is not None:
+                await _safe_progress(progress, ScanProgress(
+                    channels_total=total,
+                    channels_done=total,
+                    current_channel=None,
+                    enqueued_total=candidates_enqueued,
+                ))
+            return candidates_enqueued
 
     async def _scan_channel(
         self,
@@ -137,17 +167,20 @@ class MonitoringService:
             if self._state.is_seen(channel.channel_id, entry.video_id):
                 continue
             try:
-                candidate = await self._evaluate_entry(channel, entry, rules)
+                candidate, defer = await self._evaluate_entry(channel, entry, rules)
             except Exception:
                 logger.exception(
                     "monitoring.entry.evaluate_failed channel_id=%s video_id=%s",
                     channel.channel_id,
                     entry.video_id,
                 )
+                # Treat unexpected failures as terminal — mark seen so we don't
+                # retry the same broken entry forever.
                 self._state.mark_seen(channel.channel_id, entry.video_id)
                 continue
 
-            self._state.mark_seen(channel.channel_id, entry.video_id)
+            if not defer:
+                self._state.mark_seen(channel.channel_id, entry.video_id)
 
             if candidate is None:
                 continue
@@ -168,7 +201,15 @@ class MonitoringService:
         channel: MonitoredChannel,
         entry: FeedEntry,
         rules: MonitoringRules,
-    ) -> ScheduledCandidate | None:
+    ) -> tuple[ScheduledCandidate | None, bool]:
+        """Run the filter pipeline for a single RSS entry.
+
+        Returns ``(candidate, defer)`` where:
+        - ``(candidate, False)`` — accepted, will be enqueued; caller marks seen.
+        - ``(None, False)``     — rejected definitively; caller marks seen.
+        - ``(None, True)``      — rejected for now (e.g. live stream with unknown
+          duration), caller MUST NOT mark seen so the next scan re-evaluates.
+        """
         # Cheap pre-filter on blacklists first — we may skip yt-dlp altogether.
         pre_text = f"{entry.title}\n{entry.description}"
         if rules.shows_blacklist and _matches_any(pre_text, rules.shows_blacklist):
@@ -177,25 +218,36 @@ class MonitoringService:
                 entry.video_id,
                 entry.title,
             )
-            return None
+            return None, False
         if rules.experts_blacklist and _matches_any(pre_text, rules.experts_blacklist):
             logger.info(
                 "monitoring.entry.skip reason=experts_blacklist_pre video_id=%s title=%r",
                 entry.video_id,
                 entry.title,
             )
-            return None
+            return None, False
 
         # Fetch full metadata for duration, chapters and canonical description.
         metadata = await asyncio.to_thread(self._youtube.fetch_metadata, entry.url)
 
-        if metadata.duration_sec and metadata.duration_sec < rules.min_duration_sec:
+        # Defer videos with unknown/zero duration: live streams in progress and
+        # just-published VODs that YouTube hasn't tagged with a length yet.
+        # Whisper-fallback on a multi-hour live stream would burn CPU for hours;
+        # better to wait until tomorrow's scan when the duration is known.
+        if not metadata.duration_sec or metadata.duration_sec <= 0:
+            logger.info(
+                "monitoring.entry.skip reason=duration_unknown video_id=%s defer=true",
+                entry.video_id,
+            )
+            return None, True
+
+        if metadata.duration_sec < rules.min_duration_sec:
             logger.info(
                 "monitoring.entry.skip reason=too_short video_id=%s duration=%.0f",
                 entry.video_id,
                 metadata.duration_sec,
             )
-            return None
+            return None, False
 
         full_text = _compose_text_for_matching(metadata)
         chapter_titles = " \n".join(chapter.title for chapter in metadata.chapters)
@@ -203,17 +255,17 @@ class MonitoringService:
         # Blacklists (second pass, full text).
         if rules.shows_blacklist and _matches_any(full_text + "\n" + chapter_titles, rules.shows_blacklist):
             logger.info("monitoring.entry.skip reason=shows_blacklist video_id=%s", entry.video_id)
-            return None
+            return None, False
         if rules.experts_blacklist and _matches_any(full_text + "\n" + chapter_titles, rules.experts_blacklist):
             logger.info("monitoring.entry.skip reason=experts_blacklist video_id=%s", entry.video_id)
-            return None
+            return None, False
 
         show_matches: list[str] = []
         if rules.shows_whitelist:
             show_matches = _matches_all(full_text, rules.shows_whitelist)
             if not show_matches:
                 logger.info("monitoring.entry.skip reason=no_show_match video_id=%s", entry.video_id)
-                return None
+                return None, False
 
         # Experts whitelist — matches on title/description/chapter titles first,
         # then we may dive into the transcript for the final verdict.
@@ -245,7 +297,7 @@ class MonitoringService:
                 "monitoring.entry.skip reason=no_expert_match video_id=%s",
                 entry.video_id,
             )
-            return None
+            return None, False
 
         # Segment-mode: only для "long" videos, когда есть whitelisted expert matches.
         segment_spans: list[tuple[float, float]] = []
@@ -269,7 +321,7 @@ class MonitoringService:
                     entry.video_id,
                     expert_matches,
                 )
-                return None
+                return None, False
 
         logger.info(
             "monitoring.entry.accepted video_id=%s title=%r duration=%.0f "
@@ -283,18 +335,33 @@ class MonitoringService:
             transcript_source,
         )
 
-        return ScheduledCandidate(
-            feed_entry=entry,
-            metadata=metadata,
-            transcript_segments=segments,
-            transcript_source=transcript_source,
-            segment_spans=segment_spans,
-            expert_matches=expert_matches,
-            show_matches=show_matches,
+        return (
+            ScheduledCandidate(
+                feed_entry=entry,
+                metadata=metadata,
+                transcript_segments=segments,
+                transcript_source=transcript_source,
+                segment_spans=segment_spans,
+                expert_matches=expert_matches,
+                show_matches=show_matches,
+            ),
+            False,
         )
 
 
 # --------- pure helpers (testable without bot wiring) ---------
+
+
+async def _safe_progress(callback: ProgressCallback, snapshot: ScanProgress) -> None:
+    """Invoke a progress callback while shielding the scan loop from its failures."""
+    try:
+        await callback(snapshot)
+    except Exception:
+        logger.exception(
+            "monitoring.progress.callback_failed channels_done=%s/%s",
+            snapshot.channels_done,
+            snapshot.channels_total,
+        )
 
 
 def _matches_any(text: str, patterns: list[str]) -> list[str]:
