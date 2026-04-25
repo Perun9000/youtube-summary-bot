@@ -19,6 +19,7 @@ from app.llm_client import GenerationUsage, LLMClient
 from app.models import Summary, TranscriptSegment, VideoContext, VideoMetadata
 from app.monitoring_service import (
     MonitoringService,
+    ScanProgress,
     ScheduledCandidate,
     filter_segments_by_spans,
     format_spans_for_humans,
@@ -86,6 +87,9 @@ class Services:
     summary_status_disable_previews: dict[int, bool]
     bot: Bot | None = None
     monitoring: MonitoringService | None = None
+    monitoring_scan_task: asyncio.Task[None] | None = None
+    monitoring_scan_progress: ScanProgress | None = None
+    monitoring_scan_started_at: float | None = None
 
 
 def build_router(services: Services) -> Router:
@@ -112,6 +116,8 @@ def build_router(services: Services) -> Router:
             "/model - показать модель, которую бот использует для summary и Q&A\n\n"
             "/queue - показать очередь summary\n\n"
             "/stop - остановить текущую генерацию и очистить очередь\n\n"
+            "/scan_now - вручную запустить сканер мониторинга или показать статус идущего скана\n\n"
+            "/scan_stop - прервать запущенный мониторинговый скан\n\n"
             "После обработки ролика можно задавать вопросы по нему в этом же чате. "
             "Контекст хранится в памяти контейнера до рестарта."
         )
@@ -176,6 +182,38 @@ def build_router(services: Services) -> Router:
             return
 
         await _stop_summary_queue(message, services)
+
+    @router.message(Command("scan_now"))
+    async def scan_now(message: Message) -> None:
+        if not _is_allowed(message, services.settings):
+            await message.answer("Этот бот закрыт для личного использования.")
+            return
+        if services.monitoring is None:
+            await message.answer(
+                "Мониторинг выключен. Включи MONITORING_ENABLED=true и перезапусти бота."
+            )
+            return
+
+        existing = services.monitoring_scan_task
+        if existing is not None and not existing.done():
+            await message.answer(_format_scan_status(services))
+            return
+
+        asyncio.create_task(_run_manual_scan(message, services))
+
+    @router.message(Command("scan_stop"))
+    async def scan_stop(message: Message) -> None:
+        if not _is_allowed(message, services.settings):
+            await message.answer("Этот бот закрыт для личного использования.")
+            return
+
+        existing = services.monitoring_scan_task
+        if existing is None or existing.done():
+            await message.answer("Сейчас никаких сканов не идёт.")
+            return
+
+        existing.cancel()
+        await message.answer("Отменяю текущий скан...")
 
     @router.message(F.text)
     async def text_message(message: Message) -> None:
@@ -265,6 +303,134 @@ async def _enqueue_summary_job(message: Message, url: str, services: Services) -
             job=job,
             bump=True,
         )
+
+
+SCAN_PROGRESS_THROTTLE_SEC = 1.5
+
+
+def _format_scan_status(services: Services) -> str:
+    """Render a fresh status snapshot for /scan_now invoked while a scan is already running."""
+    snap = services.monitoring_scan_progress
+    if snap is None:
+        # Task created but progress callback hasn't fired yet (very early stage).
+        return "Скан запущен, подбираю первый канал..."
+
+    if snap.current_channel is None:
+        return (
+            f"Скан почти завершён: {snap.channels_done}/{snap.channels_total}. "
+            f"В очереди summary: {snap.enqueued_total}."
+        )
+    label = snap.current_channel.channel_name or snap.current_channel.channel_id
+    return (
+        f"Скан уже идёт.\n"
+        f"Прогресс: {snap.channels_done}/{snap.channels_total}\n"
+        f"Сейчас: {label}\n"
+        f"В очереди summary: {snap.enqueued_total}\n\n"
+        f"Чтобы прервать — /scan_stop."
+    )
+
+
+async def _run_manual_scan(message: Message, services: Services) -> None:
+    """Hand-trigger a monitoring scan and report progress to Telegram.
+
+    Fires from /scan_now. The scan itself takes the same lock the daily
+    scheduler uses, so a parallel scheduled tick won't double-run.
+
+    Renders progress into a single status message that is edited as each
+    channel finishes; edits are throttled so we don't hit Telegram's
+    rate limit on per-message edits.
+
+    Cancellation: if the wrapping asyncio.Task is cancelled (e.g. via
+    /scan_stop), we replace the status text and bail out. The
+    MonitoringService unwinds httpx/lock state on its own.
+    """
+    if services.monitoring is None:
+        return
+
+    rules = services.monitoring.config.rules
+    channels_count = len(rules.channels)
+    if channels_count == 0:
+        await message.answer(
+            "В data/monitoring.yaml не задан ни один канал. Добавь хэндлы и повтори."
+        )
+        return
+
+    notice = await message.answer(
+        f"Запускаю ручной скан мониторинга по {channels_count} каналам. "
+        f"Это может занять пару минут."
+    )
+
+    last_edit_at = 0.0
+    last_text = ""
+
+    async def _edit_status(text: str, force: bool = False) -> None:
+        nonlocal last_edit_at, last_text
+        now = time.monotonic()
+        if not force and now - last_edit_at < SCAN_PROGRESS_THROTTLE_SEC:
+            return
+        if text == last_text:
+            return
+        try:
+            await notice.edit_text(text)
+            last_edit_at = now
+            last_text = text
+        except Exception:
+            # Telegram could throw "message is not modified" or rate-limit,
+            # both are non-fatal for the scan itself.
+            pass
+
+    async def _on_progress(snapshot: ScanProgress) -> None:
+        services.monitoring_scan_progress = snapshot
+        if snapshot.current_channel is not None:
+            current_label = (
+                snapshot.current_channel.channel_name
+                or snapshot.current_channel.channel_id
+            )
+            text = (
+                f"Сканирую мониторинг: {snapshot.channels_done}/{snapshot.channels_total}\n"
+                f"Сейчас: {current_label}\n"
+                f"В очереди summary: {snapshot.enqueued_total}"
+            )
+            await _edit_status(text)
+
+    services.monitoring_scan_task = asyncio.current_task()
+    services.monitoring_scan_progress = None
+    services.monitoring_scan_started_at = time.monotonic()
+    try:
+        try:
+            enqueued = await services.monitoring.run_scan(progress=_on_progress)
+        except asyncio.CancelledError:
+            snap = services.monitoring_scan_progress
+            done = snap.channels_done if snap is not None else 0
+            enq = snap.enqueued_total if snap is not None else 0
+            await _edit_status(
+                f"Скан остановлен. Прошёл каналов: {done}/{channels_count}. "
+                f"В очередь успели добавить: {enq}.",
+                force=True,
+            )
+            raise
+        except Exception as exc:
+            logger.exception("monitoring.scan_now.failed")
+            await _edit_status(f"Скан упал: {exc}", force=True)
+            return
+
+        if enqueued == 0:
+            final = (
+                f"Скан завершён ({channels_count}/{channels_count}). "
+                f"Новых подходящих видео не найдено: либо уже прошли генерацию, "
+                f"либо не прошли фильтры."
+            )
+        else:
+            final = (
+                f"Скан завершён ({channels_count}/{channels_count}). "
+                f"В очередь summary добавлено: {enqueued}. "
+                f"Жди уведомлений по мере готовности."
+            )
+        await _edit_status(final, force=True)
+    finally:
+        services.monitoring_scan_task = None
+        services.monitoring_scan_progress = None
+        services.monitoring_scan_started_at = None
 
 
 async def _handle_channel_url(message: Message, url: str, services: Services) -> None:
@@ -477,7 +643,13 @@ async def _set_service_status(
         # Scheduled jobs run silently — no interim status messages in the chat.
         return None
     chat_id = source_message.chat.id
-    rendered_text = await _render_service_status(text, services, job)
+    rendered_text, effective_parse_mode = await _render_service_status(
+        text, services, job, parse_mode
+    )
+    # If we upgraded to HTML purely because of the hyperlink header, suppress
+    # Telegram's link preview so the YouTube card doesn't shadow the status.
+    if effective_parse_mode == "HTML" and parse_mode is None:
+        disable_web_page_preview = True
     rendered_text = _fit_telegram_message(rendered_text)
     old_message = services.summary_status_messages.get(chat_id)
 
@@ -489,7 +661,7 @@ async def _set_service_status(
         try:
             await old_message.edit_text(
                 rendered_text,
-                parse_mode=parse_mode,
+                parse_mode=effective_parse_mode,
                 disable_web_page_preview=disable_web_page_preview,
             )
             return old_message
@@ -503,7 +675,7 @@ async def _set_service_status(
 
     new_message = await source_message.answer(
         rendered_text,
-        parse_mode=parse_mode,
+        parse_mode=effective_parse_mode,
         disable_web_page_preview=disable_web_page_preview,
     )
     services.summary_status_messages[chat_id] = new_message
@@ -533,11 +705,58 @@ def _forget_service_status(services: Services, chat_id: int) -> None:
     services.summary_status_disable_previews.pop(chat_id, None)
 
 
-async def _render_service_status(text: str, services: Services, job: SummaryJob | None) -> str:
+async def _render_service_status(
+    text: str,
+    services: Services,
+    job: SummaryJob | None,
+    parse_mode: str | None,
+) -> tuple[str, str | None]:
+    """Compose status message body, injecting a hyperlink header for the active job.
+
+    Returns ``(rendered_text, effective_parse_mode)``. When a job with a known URL
+    is supplied, we prepend ``<a href="URL">TITLE</a>`` and force ``parse_mode="HTML"``,
+    escaping the plain-text body and queue block so they survive HTML rendering.
+
+    Callers that pass ``parse_mode="HTML"`` are trusted to deliver HTML-safe ``text``
+    (e.g. the post-generation info block).
+    """
+    header = _format_job_header(job)
     queue_block = await _queue_block(services, job)
-    if not queue_block:
-        return text
-    return f"{text}\n\n{queue_block}"
+
+    if parse_mode == "HTML":
+        # Body is already HTML; queue block is plain text and needs escaping.
+        queue_block_safe = escape_html(queue_block) if queue_block else ""
+        parts = [p for p in (header, text, queue_block_safe) if p]
+        return "\n\n".join(parts), "HTML"
+
+    if header:
+        # Upgrade to HTML to render the hyperlink. Escape body + queue.
+        body = escape_html(text)
+        queue_block_safe = escape_html(queue_block) if queue_block else ""
+        parts = [p for p in (header, body, queue_block_safe) if p]
+        return "\n\n".join(parts), "HTML"
+
+    if queue_block:
+        return f"{text}\n\n{queue_block}", parse_mode
+    return text, parse_mode
+
+
+def _format_job_header(job: SummaryJob | None) -> str:
+    """Render an HTML hyperlink header for a job, or empty string if URL unknown."""
+    if job is None or not job.url:
+        return ""
+    title_hint = (job.title_hint or "").strip()
+    if title_hint:
+        label = title_hint
+    else:
+        try:
+            video_id = extract_video_id(job.url)
+            label = f"YouTube video {video_id}"
+        except Exception:
+            label = job.url
+    safe_label = escape_html(label)
+    safe_url = escape_html(job.url)
+    return f'<a href="{safe_url}">{safe_label}</a>'
 
 
 async def _queue_block(services: Services, job: SummaryJob | None) -> str:
