@@ -10,7 +10,7 @@ from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, BotCommand
 
 from app.bot_handlers import Services, build_router, enqueue_scheduled_candidate
 from app.config import load_settings
-from app.llm_client import create_llm_client
+from app.llm_client import create_llm_client, health_check_with_reason
 from app.monitoring_config import MonitoringConfig
 from app.monitoring_service import MonitoringService
 from app.monitoring_state import MonitoringState
@@ -33,6 +33,10 @@ BOT_COMMANDS: list[BotCommand] = [
     BotCommand(command="model", description="Текущая модель бота"),
     BotCommand(command="queue", description="Очередь summary"),
     BotCommand(command="stop", description="Остановить генерацию"),
+    BotCommand(command="scan_now", description="Запустить мониторинг сейчас"),
+    BotCommand(command="scan_stop", description="Прервать мониторинговый скан"),
+    BotCommand(command="llm_mode", description="LLM-провайдер: статус"),
+    BotCommand(command="llm_paid", description="LLM: тоггл paid/free"),
 ]
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
@@ -116,6 +120,9 @@ async def main() -> None:
         async def _enqueue(candidate, channel):
             await enqueue_scheduled_candidate(candidate, channel, services)
 
+        async def _check_llm() -> tuple[bool, str]:
+            return await health_check_with_reason(services.llm)
+
         services.monitoring = MonitoringService(
             config=monitoring_config,
             state=monitoring_state,
@@ -123,14 +130,15 @@ async def main() -> None:
             enqueue=_enqueue,
         )
         scheduler_task = asyncio.create_task(
-            run_monitoring_scheduler(services.monitoring),
+            run_monitoring_scheduler(services.monitoring, llm_check=_check_llm),
             name="monitoring-scheduler",
         )
         logger.info(
-            "monitoring.boot enabled=true config=%s state=%s target_chat_id=%s",
+            "monitoring.boot enabled=true config=%s state=%s target_chat_id=%s provider=%s",
             settings.monitoring_config_path,
             settings.monitoring_state_path,
             settings.monitoring_target_chat_id,
+            settings.llm_provider,
         )
     else:
         logger.info("monitoring.boot enabled=false")

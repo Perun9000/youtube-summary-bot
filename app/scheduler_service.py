@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, time as dtime, timedelta
+from typing import Awaitable, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.monitoring_service import MonitoringService
@@ -13,7 +14,10 @@ logger = logging.getLogger(__name__)
 FALLBACK_TZ = "UTC"
 
 
-async def run_monitoring_scheduler(service: MonitoringService) -> None:
+async def run_monitoring_scheduler(
+    service: MonitoringService,
+    llm_check: Callable[[], Awaitable[tuple[bool, str]]] | None = None,
+) -> None:
     logger.info("scheduler.start")
     try:
         while True:
@@ -43,7 +47,7 @@ async def run_monitoring_scheduler(service: MonitoringService) -> None:
 
             logger.info("scheduler.tick start")
             try:
-                await service.run_scan()
+                await service.run_scan(llm_check=llm_check)
             except Exception:
                 logger.exception("scheduler.scan.failed")
             # Tiny guard so that a fast-running scan doesn't retrigger within the same minute.

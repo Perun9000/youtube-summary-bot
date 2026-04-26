@@ -14,9 +14,11 @@ from app.utils import format_ts
 logger = logging.getLogger(__name__)
 
 # Telegra.ph limit on page content is ~64 KB when serialised as JSON.
-# We cap the plain text we pack into transcript nodes so the JSON payload
-# (tags, attrs, youtube links) stays comfortably under that limit.
-TRANSCRIPT_PAGE_TEXT_BUDGET_CHARS = 55000
+# Each YouTube-sourced segment turns into a node with timestamp-link tag +
+# href attribute, which adds ~150 bytes of JSON overhead per segment on top
+# of the actual text. So we have to budget by the *serialised* size rather
+# than plain text length. Set a comfortable ceiling under the API limit.
+TRANSCRIPT_PAGE_JSON_BUDGET_BYTES = 60000
 
 
 class TelegraphService:
@@ -176,19 +178,30 @@ def _transcript_to_nodes(
     segments: list[TranscriptSegment],
     source: str,
 ) -> tuple[list[dict | str], int, bool]:
-    nodes: list[dict | str] = [
-        {
-            "tag": "p",
-            "children": [
-                {"tag": "a", "attrs": {"href": video_url}, "children": ["Оригинальный ролик"]},
-            ],
-        },
-    ]
+    """Build Telegra.ph nodes for a transcript page, capped by JSON byte budget.
 
-    used_chars = 0
+    Telegra.ph's createPage rejects payloads above ~64 KB with CONTENT_TOO_BIG.
+    YouTube-sourced timestamp links add ~150 B of JSON overhead per segment,
+    so we accumulate the actual serialised size as we go and stop when we'd
+    spill over the budget — keeping plenty of headroom for the truncation
+    note + JSON envelope.
+    """
+    header_node: dict = {
+        "tag": "p",
+        "children": [
+            {"tag": "a", "attrs": {"href": video_url}, "children": ["Оригинальный ролик"]},
+        ],
+    }
+    nodes: list[dict | str] = [header_node]
+    used_bytes = len(json.dumps(header_node, ensure_ascii=False).encode("utf-8"))
+
     kept = 0
     truncated = False
     total_non_empty = 0
+    # Reserve a slice of the budget for the truncation footer (~250 B for
+    # an em-tag + Russian text + JSON wrapping), so we still have room to
+    # tell the user we cut something.
+    soft_limit = TRANSCRIPT_PAGE_JSON_BUDGET_BYTES - 400
 
     for segment in segments:
         text = " ".join(segment.text.split())
@@ -196,28 +209,27 @@ def _transcript_to_nodes(
             continue
         total_non_empty += 1
         ts_label = f"[{format_ts(segment.start)}]"
-        line_chars = len(ts_label) + 1 + len(text)
-
-        if used_chars + line_chars > TRANSCRIPT_PAGE_TEXT_BUDGET_CHARS:
-            truncated = True
-            continue
 
         if source == "youtube":
             start_seconds = int(max(0, segment.start))
             ts_href = f"https://www.youtube.com/watch?v={video_id}&t={start_seconds}s"
-            nodes.append(
-                {
-                    "tag": "p",
-                    "children": [
-                        {"tag": "a", "attrs": {"href": ts_href}, "children": [ts_label]},
-                        f" {text}",
-                    ],
-                }
-            )
+            node = {
+                "tag": "p",
+                "children": [
+                    {"tag": "a", "attrs": {"href": ts_href}, "children": [ts_label]},
+                    f" {text}",
+                ],
+            }
         else:
-            nodes.append({"tag": "p", "children": [f"{ts_label} {text}"]})
+            node = {"tag": "p", "children": [f"{ts_label} {text}"]}
 
-        used_chars += line_chars
+        node_bytes = len(json.dumps(node, ensure_ascii=False).encode("utf-8"))
+        if used_bytes + node_bytes > soft_limit:
+            truncated = True
+            continue
+
+        nodes.append(node)
+        used_bytes += node_bytes
         kept += 1
 
     if truncated:

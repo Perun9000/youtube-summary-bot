@@ -15,7 +15,7 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 from app.config import Settings
-from app.llm_client import GenerationUsage, LLMClient
+from app.llm_client import GenerationUsage, LLMClient, OpenRouterClient, health_check_with_reason
 from app.models import Summary, TranscriptSegment, VideoContext, VideoMetadata
 from app.monitoring_service import (
     MonitoringService,
@@ -118,6 +118,8 @@ def build_router(services: Services) -> Router:
             "/stop - остановить текущую генерацию и очистить очередь\n\n"
             "/scan_now - вручную запустить сканер мониторинга или показать статус идущего скана\n\n"
             "/scan_stop - прервать запущенный мониторинговый скан\n\n"
+            "/llm_mode - показать активный LLM-провайдер и режим (free/paid)\n\n"
+            "/llm_paid - переключить OpenRouter между paid и free (тоггл)\n\n"
             "После обработки ролика можно задавать вопросы по нему в этом же чате. "
             "Контекст хранится в памяти контейнера до рестарта."
         )
@@ -200,6 +202,52 @@ def build_router(services: Services) -> Router:
             return
 
         asyncio.create_task(_run_manual_scan(message, services))
+
+    @router.message(Command("llm_mode"))
+    async def llm_mode(message: Message) -> None:
+        if not _is_allowed(message, services.settings):
+            await message.answer("Этот бот закрыт для личного использования.")
+            return
+        await message.answer(_format_llm_mode_status(services))
+
+    @router.message(Command("llm_paid"))
+    async def llm_paid(message: Message) -> None:
+        """Toggle OpenRouter paid mode on/off.
+
+        Off → free-chain (default).
+        On → single paid model from OPENROUTER_MODEL_PAID.
+        """
+        if not _is_allowed(message, services.settings):
+            await message.answer("Этот бот закрыт для личного использования.")
+            return
+        if not isinstance(services.llm, OpenRouterClient):
+            await message.answer(
+                "Команда работает только при LLM_PROVIDER=openrouter. "
+                "Сейчас провайдер: " + services.llm.provider_name
+            )
+            return
+
+        if services.llm.is_paid_mode():
+            # Toggle OFF — back to free chain.
+            services.llm.set_paid_mode(False)
+            await message.answer(
+                "Платный режим выключен. Вернулся на free-цепочку моделей.\n\n"
+                + _format_llm_mode_status(services)
+            )
+            return
+
+        # Toggle ON — switch to paid.
+        if not services.llm.has_paid_model():
+            await message.answer(
+                "OPENROUTER_MODEL_PAID не настроен в .env. Прежде чем включать "
+                "платный режим, добавь нужную модель и пересобери бот."
+            )
+            return
+        services.llm.set_paid_mode(True)
+        await message.answer(
+            "Платный режим включён. Убедись, что на OpenRouter есть баланс.\n\n"
+            + _format_llm_mode_status(services)
+        )
 
     @router.message(Command("scan_stop"))
     async def scan_stop(message: Message) -> None:
@@ -308,6 +356,63 @@ async def _enqueue_summary_job(message: Message, url: str, services: Services) -
 SCAN_PROGRESS_THROTTLE_SEC = 1.5
 
 
+def _format_llm_mode_status(services: Services) -> str:
+    """Render the active LLM provider/mode for /llm_mode."""
+    llm = services.llm
+    provider = llm.provider_name
+    if not isinstance(llm, OpenRouterClient):
+        return (
+            f"Провайдер: {provider}\n"
+            "Переключение режимов /llm_paid /llm_free доступно только для OpenRouter."
+        )
+
+    mode = "platный" if llm.is_paid_mode() else "бесплатный (free)"
+    chain = llm.current_chain()
+    chain_lines = "\n".join(f"  {i+1}. {m}" for i, m in enumerate(chain)) or "  (пусто)"
+    snap = llm.budget.snapshot()
+    settings = services.settings
+
+    lines = [
+        f"Провайдер: {provider}",
+        f"Режим: {mode}",
+        "",
+        "Модели в порядке приоритета:",
+        chain_lines,
+        "",
+    ]
+
+    if llm.is_paid_mode():
+        lines.append(
+            "Платная модель — без fallback'а. Лимиты:"
+        )
+        if settings.openrouter_daily_budget_usd > 0:
+            lines.append(
+                f"  Дневной бюджет: ${snap.get('spent_usd', 0.0):.4f} / "
+                f"${settings.openrouter_daily_budget_usd:.2f}"
+            )
+        else:
+            lines.append("  Дневной бюджет: отключён ($0 = без лимита)")
+    else:
+        passes = settings.openrouter_fallback_retry_passes + 1
+        delay = settings.openrouter_fallback_retry_delay_sec
+        lines.append(
+            f"Fallback: {passes} прохода × {len(chain)} моделей "
+            f"(задержка между проходами {delay}с). Лимиты:"
+        )
+
+    if settings.openrouter_daily_request_limit > 0:
+        lines.append(
+            f"  Запросов сегодня: {snap.get('request_count', 0)} / "
+            f"{settings.openrouter_daily_request_limit}"
+        )
+    else:
+        lines.append("  Дневной лимит запросов: отключён")
+
+    lines.append("")
+    lines.append("Команда переключения: /llm_paid (тоггл paid ↔ free)")
+    return "\n".join(lines)
+
+
 def _format_scan_status(services: Services) -> str:
     """Render a fresh status snapshot for /scan_now invoked while a scan is already running."""
     snap = services.monitoring_scan_progress
@@ -396,9 +501,15 @@ async def _run_manual_scan(message: Message, services: Services) -> None:
     services.monitoring_scan_task = asyncio.current_task()
     services.monitoring_scan_progress = None
     services.monitoring_scan_started_at = time.monotonic()
+    async def _check_llm() -> tuple[bool, str]:
+        return await health_check_with_reason(services.llm)
+
     try:
         try:
-            enqueued = await services.monitoring.run_scan(progress=_on_progress)
+            enqueued = await services.monitoring.run_scan(
+                progress=_on_progress,
+                llm_check=_check_llm,
+            )
         except asyncio.CancelledError:
             snap = services.monitoring_scan_progress
             done = snap.channels_done if snap is not None else 0
@@ -639,10 +750,24 @@ async def _set_service_status(
     disable_web_page_preview: bool = False,
     bump: bool = False,
 ) -> Message | None:
-    if source_message is None or (job is not None and job.scheduled):
-        # Scheduled jobs run silently — no interim status messages in the chat.
+    # Resolve the chat_id and the "send" path:
+    # - manual jobs: source_message.answer() / .edit_text()
+    # - scheduled jobs (no source_message): services.bot.send_message(chat_id=...)
+    chat_id: int | None = None
+    use_bot_send = False
+    if source_message is not None:
+        chat_id = source_message.chat.id
+    elif (
+        job is not None
+        and job.scheduled
+        and job.chat_id is not None
+        and services.bot is not None
+    ):
+        chat_id = job.chat_id
+        use_bot_send = True
+    else:
         return None
-    chat_id = source_message.chat.id
+
     rendered_text, effective_parse_mode = await _render_service_status(
         text, services, job, parse_mode
     )
@@ -673,11 +798,24 @@ async def _set_service_status(
     if old_message:
         await _delete_message_safely(old_message)
 
-    new_message = await source_message.answer(
-        rendered_text,
-        parse_mode=effective_parse_mode,
-        disable_web_page_preview=disable_web_page_preview,
-    )
+    # Scheduled jobs: do not ping the user with each interim status update.
+    # Manual jobs keep their existing default-notify behaviour.
+    silent = use_bot_send
+
+    if use_bot_send:
+        new_message = await services.bot.send_message(
+            chat_id=chat_id,
+            text=rendered_text,
+            parse_mode=effective_parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+            disable_notification=silent,
+        )
+    else:
+        new_message = await source_message.answer(
+            rendered_text,
+            parse_mode=effective_parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+        )
     services.summary_status_messages[chat_id] = new_message
     return new_message
 
@@ -795,8 +933,9 @@ async def _refresh_active_service_status(services: Services) -> None:
         active_job = services.summary_active_job
     if active_job is None:
         return
-    # Scheduled jobs run silently — no interim status refresh in chat.
-    if active_job.scheduled or active_job.message is None:
+    # Both manual and scheduled jobs can refresh: scheduled ones go through
+    # services.bot.send_message via _set_service_status with source_message=None.
+    if not active_job.scheduled and active_job.message is None:
         return
 
     chat_id = active_job.chat_id
@@ -969,13 +1108,18 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             )
 
         transcript_text = segments_to_text(segments)
-        chunks = chunk_transcript(transcript_text, max_chars=services.settings.transcript_chunk_max_chars)
+        active_model = await services.llm.active_model()
+        chunk_size = services.settings.effective_chunk_max_chars(active_model=active_model)
+        chunks = chunk_transcript(transcript_text, max_chars=chunk_size)
         logger.info(
-            "job.chunking.done job_id=%s transcript_chars=%s chunks=%s max_chars=%s",
+            "job.chunking.done job_id=%s transcript_chars=%s chunks=%s max_chars=%s "
+            "provider=%s active_model=%s",
             job_id,
             len(transcript_text),
             len(chunks),
-            services.settings.transcript_chunk_max_chars,
+            chunk_size,
+            services.settings.llm_provider,
+            active_model,
         )
 
         try:
@@ -1352,7 +1496,7 @@ def _format_service_info(
         f"Температура: {settings.llm_temperature}",
         f"Max tokens ответа: {settings.llm_max_tokens}",
         f"Auto-load модели: {'on' if settings.lmstudio_auto_load else 'off'}",
-        f"Размер чанка transcript: {settings.transcript_chunk_max_chars} симв.",
+        f"Размер чанка transcript: {settings.effective_chunk_max_chars(active_model=model)} симв.",
         "",
         f"Токены: {tokens_line}",
         f"Время LLM: {_format_elapsed(int(usage.duration_sec))}",

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
+import json
 from dataclasses import dataclass
 import logging
+import threading
 import time
+from pathlib import Path
 from typing import Protocol
 
 import httpx
@@ -15,6 +19,7 @@ logger = logging.getLogger(__name__)
 LLM_GENERATE_TIMEOUT_SEC = 1200
 LLM_GENERATE_MAX_ATTEMPTS = 2
 LLM_GENERATE_RETRY_DELAY_SEC = 15
+OPENROUTER_BUDGET_EXCEEDED_MARKER = "OPENROUTER_BUDGET_EXCEEDED"
 
 
 @dataclass
@@ -65,7 +70,518 @@ class LLMClient(Protocol):
 
 
 def create_llm_client(settings: Settings) -> LLMClient:
+    if settings.llm_provider == "openrouter":
+        return OpenRouterClient(settings)
     return LMStudioClient(settings)
+
+
+async def health_check_with_reason(client: "LLMClient", timeout_sec: float = 10.0) -> tuple[bool, str]:
+    """Return ``(ok, reason)`` — provider-aware health probe.
+
+    For OpenRouter we additionally verify the daily budget hasn't been spent.
+    Used by both manual /scan_now and the daily scheduler to defer the entire
+    scan-tick when the upstream is unusable, instead of marking videos as seen
+    and losing them when the LLM finally comes back.
+    """
+    if isinstance(client, OpenRouterClient):
+        ok, reason = client.budget.check()
+        if not ok:
+            return False, reason
+    try:
+        await asyncio.wait_for(client.list_models(), timeout=timeout_sec)
+        return True, ""
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {str(exc)[:200]}"
+
+
+class OpenRouterBudget:
+    """Persistent daily budget tracker for OpenRouter calls.
+
+    Stores ``{"date": "YYYY-MM-DD", "spent_usd": ..., "request_count": ...}``
+    in a JSON file. Resets on the first call of a new local day.
+    Thread-safe; safe across multiple asyncio tasks since updates go through
+    a process-local lock and a tiny critical section.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        daily_budget_usd: float,
+        daily_request_limit: int,
+    ) -> None:
+        self._path = path
+        self._daily_budget_usd = max(0.0, daily_budget_usd)
+        self._daily_request_limit = max(0, daily_request_limit)
+        self._lock = threading.Lock()
+        self._state = {"date": "", "spent_usd": 0.0, "request_count": 0}
+        self._load()
+
+    def _today(self) -> str:
+        return dt.date.today().isoformat()
+
+    def _load(self) -> None:
+        if not self._path.exists():
+            self._state = {"date": self._today(), "spent_usd": 0.0, "request_count": 0}
+            return
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("openrouter.budget.load_failed path=%s error=%s", self._path, exc)
+            self._state = {"date": self._today(), "spent_usd": 0.0, "request_count": 0}
+            return
+
+        if data.get("date") != self._today():
+            self._state = {"date": self._today(), "spent_usd": 0.0, "request_count": 0}
+            return
+
+        self._state = {
+            "date": str(data.get("date") or self._today()),
+            "spent_usd": float(data.get("spent_usd") or 0.0),
+            "request_count": int(data.get("request_count") or 0),
+        }
+
+    def _save(self) -> None:
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+            tmp.write_text(json.dumps(self._state, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(self._path)
+        except Exception as exc:
+            logger.warning("openrouter.budget.save_failed path=%s error=%s", self._path, exc)
+
+    def _rollover_if_needed(self) -> None:
+        if self._state.get("date") != self._today():
+            self._state = {"date": self._today(), "spent_usd": 0.0, "request_count": 0}
+
+    def check(self) -> tuple[bool, str]:
+        """Return ``(can_proceed, reason)``. Reason is empty when ``can_proceed`` is True."""
+        with self._lock:
+            self._rollover_if_needed()
+            spent = float(self._state.get("spent_usd", 0.0))
+            requests = int(self._state.get("request_count", 0))
+
+            if self._daily_budget_usd > 0 and spent >= self._daily_budget_usd:
+                return False, (
+                    f"Дневной бюджет OpenRouter исчерпан: "
+                    f"${spent:.4f}/${self._daily_budget_usd:.2f}."
+                )
+            if self._daily_request_limit > 0 and requests >= self._daily_request_limit:
+                return False, (
+                    f"Дневной лимит запросов OpenRouter исчерпан: "
+                    f"{requests}/{self._daily_request_limit}."
+                )
+            return True, ""
+
+    def record(self, cost_usd: float) -> None:
+        """Account a single completed request (with whatever cost OpenRouter reported)."""
+        with self._lock:
+            self._rollover_if_needed()
+            self._state["spent_usd"] = float(self._state.get("spent_usd", 0.0)) + max(0.0, cost_usd)
+            self._state["request_count"] = int(self._state.get("request_count", 0)) + 1
+            self._save()
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            self._rollover_if_needed()
+            return dict(self._state)
+
+
+@dataclass(frozen=True)
+class _OpenRouterUsageInfo:
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    cost_usd: float
+
+
+class OpenRouterRuntimeState:
+    """Persistent toggle for paid vs free model mode.
+
+    Survives container restarts; written atomically. Default = free.
+    Single field today (paid_mode) but kept as a tiny class so we can
+    add more runtime-tunable LLM knobs without breaking storage shape.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._lock = threading.Lock()
+        self._paid_mode = False
+        self._load()
+
+    def _load(self) -> None:
+        if not self._path.exists():
+            return
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+            self._paid_mode = bool(data.get("paid_mode", False))
+        except Exception as exc:
+            logger.warning("openrouter.runtime.load_failed path=%s error=%s", self._path, exc)
+
+    def _save(self) -> None:
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {"paid_mode": self._paid_mode}
+            tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(self._path)
+        except Exception as exc:
+            logger.warning("openrouter.runtime.save_failed path=%s error=%s", self._path, exc)
+
+    def is_paid_mode(self) -> bool:
+        with self._lock:
+            return self._paid_mode
+
+    def set_paid_mode(self, paid: bool) -> None:
+        with self._lock:
+            self._paid_mode = bool(paid)
+            self._save()
+
+
+class OpenRouterClient:
+    """LLM client backed by OpenRouter's OpenAI-compatible API.
+
+    Two run-time modes, switchable via /llm_paid and /llm_free in the bot:
+
+    - **Free mode** (default): cycles through ``openrouter_model_free_chain``.
+      On HTTP 429 / 5xx / ReadTimeout, falls through to the next model in
+      the chain. After a full pass through the chain fails, sleeps
+      ``openrouter_fallback_retry_delay_sec`` and retries the chain up to
+      ``openrouter_fallback_retry_passes`` more times before raising.
+
+    - **Paid mode**: single model ``openrouter_model_paid``, with the standard
+      ``LLM_GENERATE_MAX_ATTEMPTS`` timeout-retry behavior. No fallback —
+      paid endpoints don't really 429 short of account-level limits.
+
+    Cost / request guards:
+    - ``OPENROUTER_DAILY_BUDGET_USD`` — soft $ cap (set 0 to disable; useful
+      for free where cost is always 0).
+    - ``OPENROUTER_DAILY_REQUEST_LIMIT`` — soft request count cap.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+        self._budget = OpenRouterBudget(
+            path=settings.openrouter_budget_state_path,
+            daily_budget_usd=settings.openrouter_daily_budget_usd,
+            daily_request_limit=settings.openrouter_daily_request_limit,
+        )
+        self._runtime = OpenRouterRuntimeState(settings.openrouter_runtime_state_path)
+        self._cached_context_length: dict[str, int] = {}
+
+    @property
+    def provider_name(self) -> str:
+        return "OpenRouter"
+
+    @property
+    def budget(self) -> OpenRouterBudget:
+        return self._budget
+
+    @property
+    def runtime(self) -> OpenRouterRuntimeState:
+        return self._runtime
+
+    def is_paid_mode(self) -> bool:
+        return self._runtime.is_paid_mode()
+
+    def set_paid_mode(self, paid: bool) -> None:
+        self._runtime.set_paid_mode(paid)
+        self._cached_context_length.clear()
+
+    def has_paid_model(self) -> bool:
+        return bool(self._settings.openrouter_model_paid)
+
+    def current_chain(self) -> tuple[str, ...]:
+        """Return the ordered list of models the next generate() will try."""
+        if self.is_paid_mode():
+            return (self._settings.openrouter_model_paid,) if self._settings.openrouter_model_paid else ()
+        return tuple(self._settings.openrouter_model_free_chain)
+
+    async def generate(
+        self,
+        prompt: str,
+        system: str | None = None,
+        usage: GenerationUsage | None = None,
+    ) -> str:
+        ok, reason = self._budget.check()
+        if not ok:
+            logger.warning("llm.generate.budget_block provider=openrouter reason=%s", reason)
+            raise RuntimeError(f"{OPENROUTER_BUDGET_EXCEEDED_MARKER}: {reason}")
+
+        chain = self.current_chain()
+        if not chain:
+            raise RuntimeError("OpenRouter: список моделей пуст. Проверь .env.")
+
+        if self.is_paid_mode():
+            return await self._generate_with_retries(chain[0], prompt, system, usage)
+
+        # Free mode — cycle through the chain, then sleep + retry full chain.
+        passes = self._settings.openrouter_fallback_retry_passes + 1
+        delay = self._settings.openrouter_fallback_retry_delay_sec
+        last_error: Exception | None = None
+        for pass_idx in range(passes):
+            for model in chain:
+                try:
+                    return await self._generate_one_attempt(model, prompt, system, usage)
+                except _OpenRouterRetriable as exc:
+                    last_error = exc.cause
+                    logger.warning(
+                        "llm.generate.fallback provider=openrouter model=%s pass=%s/%s "
+                        "trying_next reason=%s",
+                        model, pass_idx + 1, passes, exc.short_reason,
+                    )
+                    continue
+            if pass_idx + 1 < passes:
+                logger.info(
+                    "llm.generate.chain_exhausted pass=%s/%s sleep_sec=%s",
+                    pass_idx + 1, passes, delay,
+                )
+                await asyncio.sleep(delay)
+
+        models_tried = ", ".join(chain)
+        raise RuntimeError(
+            f"OpenRouter: все free-модели в цепочке отказались отвечать за {passes} проходов "
+            f"({models_tried}). Последняя ошибка: {last_error}. "
+            "Попробуй позже или переключись на платную через /llm_paid."
+        )
+
+    async def _generate_with_retries(
+        self,
+        model: str,
+        prompt: str,
+        system: str | None,
+        usage: GenerationUsage | None,
+    ) -> str:
+        """Single-model invocation with the standard timeout-retry policy.
+
+        Used for paid mode where there's no fallback chain.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(1, LLM_GENERATE_MAX_ATTEMPTS + 1):
+            try:
+                return await self._generate_one_attempt(model, prompt, system, usage)
+            except _OpenRouterRetriable as exc:
+                last_exc = exc.cause
+                if attempt >= LLM_GENERATE_MAX_ATTEMPTS:
+                    raise RuntimeError(
+                        f"OpenRouter ({model}) не ответил после {attempt} попыток: "
+                        f"{exc.short_reason}"
+                    ) from exc.cause
+                logger.warning(
+                    "llm.generate.retry provider=openrouter model=%s attempt=%s/%s reason=%s "
+                    "delay_sec=%s",
+                    model, attempt, LLM_GENERATE_MAX_ATTEMPTS, exc.short_reason,
+                    LLM_GENERATE_RETRY_DELAY_SEC,
+                )
+                await asyncio.sleep(LLM_GENERATE_RETRY_DELAY_SEC)
+        if last_exc is not None:
+            raise RuntimeError(f"OpenRouter ({model}) не ответил.") from last_exc
+        raise RuntimeError(f"OpenRouter ({model}) не ответил.")
+
+    async def _generate_one_attempt(
+        self,
+        model: str,
+        prompt: str,
+        system: str | None,
+        usage: GenerationUsage | None,
+    ) -> str:
+        """One HTTP call to OpenRouter for a specific model.
+
+        Returns response text on success, raises ``_OpenRouterRetriable`` for
+        rate limits / upstream errors / timeouts (so callers can fall through
+        to a different model or retry), or a plain ``RuntimeError`` for
+        non-retriable problems (auth, bad request, etc.).
+        """
+        started = time.monotonic()
+        messages: list[dict] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        payload: dict = {
+            "model": model,
+            "messages": messages,
+            "temperature": self._settings.llm_temperature,
+            "max_tokens": self._settings.llm_max_tokens,
+            "stream": False,
+            "usage": {"include": True},
+        }
+
+        async with httpx.AsyncClient(timeout=LLM_GENERATE_TIMEOUT_SEC) as client:
+            try:
+                response = await client.post(
+                    f"{self._settings.openrouter_base_url}/chat/completions",
+                    headers=self._headers(),
+                    json=payload,
+                )
+            except httpx.ConnectError as exc:
+                raise _OpenRouterRetriable("connect_error", exc) from exc
+            except httpx.ReadTimeout as exc:
+                raise _OpenRouterRetriable("timeout", exc) from exc
+            except httpx.HTTPError as exc:
+                raise _OpenRouterRetriable(f"http_error:{type(exc).__name__}", exc) from exc
+
+            status = response.status_code
+            if status == 429 or 500 <= status < 600:
+                detail = response.text.strip().replace("\n", " ")[:300]
+                exc = RuntimeError(f"OpenRouter HTTP {status}: {detail}")
+                raise _OpenRouterRetriable(f"http_{status}", exc)
+            try:
+                _raise_for_status(response, "OpenRouter")
+            except RuntimeError as exc:
+                # Non-retriable: 401, 402, 403, 404, 4xx (except 429), etc.
+                raise
+
+            data = response.json()
+
+        duration_sec = time.monotonic() - started
+        choices = data.get("choices", [])
+        if not choices:
+            result = ""
+        else:
+            message = choices[0].get("message", {})
+            result = _strip_thinking(str(message.get("content", ""))).strip()
+
+        usage_info = _extract_openrouter_usage(data.get("usage") or {})
+        if usage is not None:
+            usage.add(
+                prompt_tokens=usage_info.prompt_tokens,
+                completion_tokens=usage_info.completion_tokens,
+                total_tokens=usage_info.total_tokens,
+                duration_sec=duration_sec,
+            )
+
+        self._budget.record(usage_info.cost_usd)
+        snap = self._budget.snapshot()
+
+        logger.info(
+            "llm.generate.done provider=openrouter model=%s prompt_chars=%s response_chars=%s "
+            "prompt_tokens=%s completion_tokens=%s total_tokens=%s cost_usd=%.6f "
+            "duration_sec=%.1f budget_today_usd=%.4f budget_today_requests=%s "
+            "mode=%s",
+            model,
+            len(prompt),
+            len(result),
+            usage_info.prompt_tokens,
+            usage_info.completion_tokens,
+            usage_info.total_tokens,
+            usage_info.cost_usd,
+            duration_sec,
+            float(snap.get("spent_usd", 0.0)),
+            int(snap.get("request_count", 0)),
+            "paid" if self.is_paid_mode() else "free",
+        )
+        return result
+
+    async def list_models(self) -> list[str]:
+        async with httpx.AsyncClient(timeout=30) as client:
+            try:
+                response = await client.get(
+                    f"{self._settings.openrouter_base_url}/models",
+                    headers=self._headers(),
+                )
+                _raise_for_status(response, "OpenRouter")
+            except httpx.ConnectError as exc:
+                raise RuntimeError(_openrouter_connection_error()) from exc
+            data = response.json()
+        out: list[str] = []
+        for item in data.get("data", []):
+            mid = str(item.get("id") or "").strip()
+            if not mid:
+                continue
+            ctx = item.get("context_length")
+            ctx_str = f"; ctx={int(ctx)}" if isinstance(ctx, (int, float)) and ctx else ""
+            out.append(f"{mid}{ctx_str}")
+        return out
+
+    async def active_model(self) -> str:
+        chain = self.current_chain()
+        return chain[0] if chain else ""
+
+    async def loaded_context_length(self) -> int | None:
+        target = await self.active_model()
+        if not target:
+            return None
+        if target in self._cached_context_length:
+            return self._cached_context_length[target]
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    f"{self._settings.openrouter_base_url}/models",
+                    headers=self._headers(),
+                )
+                _raise_for_status(response, "OpenRouter")
+                data = response.json()
+        except Exception:
+            return None
+        for item in data.get("data", []):
+            if str(item.get("id") or "") == target:
+                ctx = item.get("context_length")
+                try:
+                    parsed = int(ctx)
+                    self._cached_context_length[target] = parsed
+                    return parsed
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    def _headers(self) -> dict[str, str]:
+        headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self._settings.openrouter_api_key or ''}",
+        }
+        if self._settings.openrouter_http_referer:
+            headers["HTTP-Referer"] = self._settings.openrouter_http_referer
+        if self._settings.openrouter_x_title:
+            headers["X-Title"] = self._settings.openrouter_x_title
+        return headers
+
+
+class _OpenRouterRetriable(Exception):
+    """Wraps a retriable OpenRouter failure (HTTP 429/5xx, timeout, conn err).
+
+    Carries the original cause + a short tag for log lines.
+    """
+
+    def __init__(self, short_reason: str, cause: Exception) -> None:
+        super().__init__(short_reason)
+        self.short_reason = short_reason
+        self.cause = cause
+
+
+def _extract_openrouter_usage(usage_data: dict) -> _OpenRouterUsageInfo:
+    prompt_tokens = int(usage_data.get("prompt_tokens") or 0)
+    completion_tokens = int(usage_data.get("completion_tokens") or 0)
+    total_tokens = int(
+        usage_data.get("total_tokens") or (prompt_tokens + completion_tokens)
+    )
+    cost_raw = usage_data.get("cost", 0)
+    try:
+        cost_usd = float(cost_raw)
+    except (TypeError, ValueError):
+        cost_usd = 0.0
+    return _OpenRouterUsageInfo(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        cost_usd=cost_usd,
+    )
+
+
+def _openrouter_connection_error() -> str:
+    return (
+        "OpenRouter недоступен. Проверь интернет/прокси из контейнера и доступ к "
+        "https://openrouter.ai. Если используешь VPN, убедись, что docker идёт через него."
+    )
+
+
+def _openrouter_timeout_error(model: str, timeout_sec: int, attempts: int) -> str:
+    minutes = max(1, round(timeout_sec / 60))
+    return (
+        f"OpenRouter не вернул ответ для модели {model} за {minutes} мин "
+        f"(попыток: {attempts}). Возможно перегружен провайдер: попробуй другую модель "
+        "через OPENROUTER_MODEL или вернись на LM Studio через LLM_PROVIDER=lmstudio."
+    )
 
 
 @dataclass(frozen=True)

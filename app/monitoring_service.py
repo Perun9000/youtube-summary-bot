@@ -109,7 +109,11 @@ class MonitoringService:
 
         return channel, added
 
-    async def run_scan(self, progress: ProgressCallback | None = None) -> int:
+    async def run_scan(
+        self,
+        progress: ProgressCallback | None = None,
+        llm_check: Callable[[], Awaitable[tuple[bool, str]]] | None = None,
+    ) -> int:
         async with self._scan_lock:
             self._config.load()
             rules = self._config.rules
@@ -117,6 +121,19 @@ class MonitoringService:
             if total == 0:
                 logger.info("monitoring.scan.skip reason=no_channels")
                 return 0
+
+            if llm_check is not None:
+                try:
+                    ok, reason = await llm_check()
+                except Exception as exc:
+                    ok = False
+                    reason = f"{type(exc).__name__}: {str(exc)[:200]}"
+                if not ok:
+                    logger.info(
+                        "monitoring.scan.skip reason=llm_unavailable detail=%s",
+                        reason,
+                    )
+                    return 0
 
             logger.info("monitoring.scan.start channels=%s", total)
             candidates_enqueued = 0
