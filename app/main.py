@@ -10,6 +10,7 @@ from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, BotCommand
 
 from app.bot_handlers import Services, build_router, enqueue_scheduled_candidate
 from app.config import load_settings
+from app.groq_whisper_service import GroqWhisperService
 from app.llm_client import create_llm_client, health_check_with_reason
 from app.monitoring_config import MonitoringConfig
 from app.monitoring_service import MonitoringService
@@ -84,6 +85,14 @@ async def main() -> None:
 
     llm = create_llm_client(settings)
     bot = Bot(token=settings.telegram_bot_token)
+    groq_whisper = GroqWhisperService(settings)
+    if groq_whisper.enabled:
+        logger.info(
+            "groq.boot enabled=true model=%s base_url=%s",
+            settings.groq_whisper_model, settings.groq_base_url,
+        )
+    else:
+        logger.info("groq.boot enabled=false reason=no_api_key")
 
     services = Services(
         settings=settings,
@@ -94,6 +103,8 @@ async def main() -> None:
             llm,
             hierarchy_threshold=settings.synthesis_hierarchy_threshold,
             group_size=settings.synthesis_group_size,
+            partial_max_tokens=settings.llm_max_tokens_partial,
+            final_max_tokens=settings.llm_max_tokens_final,
         ),
         qa=QAService(llm),
         telegraph=TelegraphService(settings),
@@ -108,6 +119,11 @@ async def main() -> None:
         summary_status_parse_modes={},
         summary_status_disable_previews={},
         bot=bot,
+        groq_whisper=groq_whisper,
+        transcription_queue=asyncio.Queue(),
+        transcription_queue_lock=asyncio.Lock(),
+        transcription_worker_task=None,
+        transcription_active_job=None,
     )
 
     scheduler_task: asyncio.Task[None] | None = None

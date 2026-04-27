@@ -18,6 +18,8 @@ class Settings:
     llm_provider: str
     llm_temperature: float
     llm_max_tokens: int
+    llm_max_tokens_partial: int
+    llm_max_tokens_final: int
     lmstudio_base_url: str
     lmstudio_model: str
     lmstudio_api_key: str | None
@@ -38,6 +40,9 @@ class Settings:
     whisper_model: str
     whisper_device: str
     whisper_compute_type: str
+    groq_api_key: str | None
+    groq_whisper_model: str
+    groq_base_url: str
     telegraph_access_token: str | None
     telegraph_author_name: str
     ytdlp_cookies_path: Path | None
@@ -198,6 +203,14 @@ def load_settings() -> Settings:
         llm_provider=llm_provider,
         llm_temperature=float(os.getenv("LLM_TEMPERATURE", "0.2")),
         llm_max_tokens=int(os.getenv("LLM_MAX_TOKENS", "1200")),
+        # Per-stage overrides for hierarchical summarization. If not set,
+        # fall back to the single LLM_MAX_TOKENS (back-compat).
+        llm_max_tokens_partial=int(
+            os.getenv("LLM_MAX_TOKENS_PARTIAL", os.getenv("LLM_MAX_TOKENS", "1200"))
+        ),
+        llm_max_tokens_final=int(
+            os.getenv("LLM_MAX_TOKENS_FINAL", os.getenv("LLM_MAX_TOKENS", "1200"))
+        ),
         lmstudio_base_url=os.getenv("LMSTUDIO_BASE_URL", "http://host.docker.internal:1234").rstrip("/"),
         lmstudio_model=os.getenv("LMSTUDIO_MODEL", "auto").strip(),
         lmstudio_api_key=os.getenv("LMSTUDIO_API_KEY", "").strip() or None,
@@ -218,6 +231,9 @@ def load_settings() -> Settings:
         whisper_model=os.getenv("WHISPER_MODEL", "small"),
         whisper_device=os.getenv("WHISPER_DEVICE", "cpu"),
         whisper_compute_type=os.getenv("WHISPER_COMPUTE_TYPE", "int8"),
+        groq_api_key=os.getenv("GROQ_API_KEY", "").strip() or None,
+        groq_whisper_model=os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo").strip(),
+        groq_base_url=os.getenv("GROQ_BASE_URL", "https://api.groq.com").rstrip("/"),
         telegraph_access_token=os.getenv("TELEGRAPH_ACCESS_TOKEN", "").strip() or None,
         telegraph_author_name=os.getenv("TELEGRAPH_AUTHOR_NAME", "YouTube Summary Bot"),
         ytdlp_cookies_path=cookies_path,

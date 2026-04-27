@@ -15,6 +15,7 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 from app.config import Settings
+from app.groq_whisper_service import GroqWhisperService, GroqWhisperUnavailable
 from app.llm_client import GenerationUsage, LLMClient, OpenRouterClient, health_check_with_reason
 from app.models import Summary, TranscriptSegment, VideoContext, VideoMetadata
 from app.monitoring_service import (
@@ -90,6 +91,15 @@ class Services:
     monitoring_scan_task: asyncio.Task[None] | None = None
     monitoring_scan_progress: ScanProgress | None = None
     monitoring_scan_started_at: float | None = None
+    # Transcription pipeline — отдельная очередь под видео без YouTube-субтитров.
+    # Main worker не блокируется ожиданием Groq Whisper'а, продолжает обрабатывать
+    # ролики с готовыми субтитрами, пока transcription worker качает аудио и
+    # дёргает облачный Whisper параллельно.
+    groq_whisper: "GroqWhisperService | None" = None
+    transcription_queue: asyncio.Queue[SummaryJob] | None = None
+    transcription_queue_lock: asyncio.Lock | None = None
+    transcription_worker_task: asyncio.Task[None] | None = None
+    transcription_active_job: SummaryJob | None = None
 
 
 def build_router(services: Services) -> Router:
@@ -711,6 +721,207 @@ async def _summary_queue_worker(services: Services) -> None:
                 services.summary_next_sequence = 0
 
 
+async def _enqueue_transcription_job(job: SummaryJob, services: Services) -> None:
+    """Push a job into the transcription queue and ensure a worker is running.
+
+    Called from the main worker when it learns YouTube has no captions for
+    the video. The transcription worker downloads audio, calls Groq Whisper,
+    populates ``job.pre_fetched_segments`` and re-enqueues to summary_queue.
+    """
+    if services.transcription_queue is None or services.transcription_queue_lock is None:
+        raise RuntimeError(
+            "transcription_queue не инициализирована (см. main.py при старте бота)."
+        )
+    async with services.transcription_queue_lock:
+        await services.transcription_queue.put(job)
+        if (
+            services.transcription_worker_task is None
+            or services.transcription_worker_task.done()
+        ):
+            services.transcription_worker_task = asyncio.create_task(
+                _transcription_queue_worker(services)
+            )
+        logger.info(
+            "transcription_queue.enqueued sequence=%s pending=%s url=%s",
+            job.sequence,
+            services.transcription_queue.qsize(),
+            job.url,
+        )
+
+
+async def _transcription_queue_worker(services: Services) -> None:
+    """Background worker that processes the transcription queue.
+
+    Pulls one job at a time:
+    1. Downloads audio via yt-dlp.
+    2. Calls Groq Whisper (free tier, multipart upload, returns segments).
+    3. Stamps the job with ``pre_fetched_segments`` + ``pre_fetched_transcript_source="groq"``.
+    4. Pushes the job back to ``summary_queue`` so the main worker continues
+       the regular path (no second transcript-fetch attempt — pre_fetched is
+       respected).
+
+    Failures are logged + reported to the user; job is dropped (not retried).
+    """
+    logger.info("transcription_queue.worker.start")
+    queue = services.transcription_queue
+    if queue is None or services.transcription_queue_lock is None:
+        return
+    try:
+        while True:
+            job: SummaryJob | None = None
+            try:
+                job = await asyncio.wait_for(queue.get(), timeout=1)
+            except TimeoutError:
+                async with services.transcription_queue_lock:
+                    if queue.empty():
+                        services.transcription_worker_task = None
+                        logger.info("transcription_queue.worker.stop")
+                        return
+                    continue
+
+            async with services.transcription_queue_lock:
+                services.transcription_active_job = job
+
+            logger.info(
+                "transcription_queue.job.start sequence=%s url=%s pending=%s",
+                job.sequence, job.url, queue.qsize(),
+            )
+            try:
+                await _process_transcription_job(job, services)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "transcription_queue.job.failed sequence=%s url=%s",
+                    job.sequence, job.url,
+                )
+            finally:
+                async with services.transcription_queue_lock:
+                    if services.transcription_active_job == job:
+                        services.transcription_active_job = None
+                queue.task_done()
+    except asyncio.CancelledError:
+        logger.info("transcription_queue.worker.cancelled")
+        async with services.transcription_queue_lock:
+            if services.transcription_worker_task is asyncio.current_task():
+                services.transcription_worker_task = None
+            services.transcription_active_job = None
+    except Exception:
+        logger.exception("transcription_queue.worker.failed")
+        async with services.transcription_queue_lock:
+            services.transcription_worker_task = None
+            services.transcription_active_job = None
+
+
+async def _process_transcription_job(job: SummaryJob, services: Services) -> None:
+    """One transcription cycle: download audio → Groq → re-enqueue."""
+    started = time.monotonic()
+
+    # Status reporting: чтобы Telegram-сообщение жило, обновим его на "скачиваю аудио".
+    await _set_service_status(
+        services, job.message, "Скачиваю аудио для распознавания через Groq...", job=job
+    )
+
+    download_started = time.monotonic()
+    audio_path = await asyncio.to_thread(services.youtube.download_audio, job.url)
+    download_duration = time.monotonic() - download_started
+    logger.info(
+        "transcription_queue.audio_download.done sequence=%s path=%s duration_sec=%.1f",
+        job.sequence, audio_path, download_duration,
+    )
+
+    await _set_service_status(
+        services, job.message, "Распознаю аудио через Groq Whisper Large v3 Turbo...", job=job
+    )
+
+    try:
+        segments = await services.groq_whisper.transcribe(Path(audio_path))
+    except GroqWhisperUnavailable as exc:
+        logger.warning(
+            "transcription_queue.groq_unavailable sequence=%s reason=%s",
+            job.sequence, exc,
+        )
+        await _send_transcription_failure(
+            services, job,
+            f"Groq Whisper недоступен: {exc}",
+        )
+        _cleanup_audio_file(audio_path)
+        return
+    except Exception as exc:
+        logger.exception("transcription_queue.groq_failed sequence=%s", job.sequence)
+        await _send_transcription_failure(
+            services, job,
+            f"Ошибка распознавания на Groq: {exc}",
+        )
+        _cleanup_audio_file(audio_path)
+        return
+    finally:
+        # Удаляем исходное аудио — даже если Groq упал, оно нам уже не нужно.
+        _cleanup_audio_file(audio_path)
+
+    if not segments:
+        logger.warning(
+            "transcription_queue.empty_result sequence=%s url=%s",
+            job.sequence, job.url,
+        )
+        await _send_transcription_failure(
+            services, job, "Groq вернул пустой транскрипт."
+        )
+        return
+
+    duration = time.monotonic() - started
+    logger.info(
+        "transcription_queue.job.done sequence=%s segments=%s duration_sec=%.1f "
+        "(download=%.1fs)",
+        job.sequence, len(segments), duration, download_duration,
+    )
+
+    # Стамп: транскрипт получен, отдаём обратно в summary_queue.
+    job.pre_fetched_segments = list(segments)
+    job.pre_fetched_transcript_source = "groq"
+    # Сбросим pre_fetched_metadata, если он не пришёл — пусть main worker
+    # перетянет actual метаданные ролика заново. (Скорее всего тут он None.)
+
+    await _set_service_status(
+        services, job.message,
+        "Распознавание завершено. Возвращаю в очередь summary...", job=job,
+    )
+
+    async with services.summary_queue_lock:
+        await services.summary_queue.put(job)
+        if services.summary_worker_task is None or services.summary_worker_task.done():
+            services.summary_worker_task = asyncio.create_task(_summary_queue_worker(services))
+
+
+def _cleanup_audio_file(audio_path) -> None:
+    try:
+        Path(audio_path).unlink(missing_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("transcription_queue.audio_cleanup_failed path=%s error=%s", audio_path, exc)
+
+
+async def _send_transcription_failure(services: Services, job: SummaryJob, reason: str) -> None:
+    """Tell the user the job died in transcription; don't re-enqueue."""
+    text = (
+        f"Не удалось получить транскрипт ролика.\n\n"
+        f"Причина: {reason}\n\n"
+        f"Ссылка: {job.url}"
+    )
+    try:
+        if job.message is not None and not job.scheduled:
+            await job.message.answer(text)
+        elif services.bot is not None and job.chat_id:
+            await services.bot.send_message(
+                chat_id=job.chat_id,
+                text=text,
+                disable_notification=job.disable_notification,
+            )
+    except Exception:
+        logger.exception(
+            "transcription_queue.failure_delivery_failed sequence=%s", job.sequence
+        )
+
+
 async def _stop_summary_queue(message: Message, services: Services) -> None:
     async with services.summary_queue_lock:
         active = services.summary_active_job
@@ -978,19 +1189,45 @@ def _fit_telegram_message(text: str) -> str:
 
 async def _format_queue_status(services: Services) -> str:
     async with services.summary_queue_lock:
-        active = services.summary_active_job
-        pending_count = services.summary_queue.qsize()
+        summary_active = services.summary_active_job
+        summary_pending = services.summary_queue.qsize()
 
-    if active is None and pending_count == 0:
-        return "Очередь summary пуста."
+    transcription_active = None
+    transcription_pending = 0
+    if (
+        services.transcription_queue is not None
+        and services.transcription_queue_lock is not None
+    ):
+        async with services.transcription_queue_lock:
+            transcription_active = services.transcription_active_job
+            transcription_pending = services.transcription_queue.qsize()
 
-    lines = []
-    if active is not None:
-        elapsed = int(time.monotonic() - active.enqueued_at)
-        lines.append(f"Сейчас обрабатывается: #{active.sequence} ({_format_elapsed(elapsed)} в очереди)")
+    nothing_in_summary = summary_active is None and summary_pending == 0
+    nothing_in_transcription = transcription_active is None and transcription_pending == 0
+    if nothing_in_summary and nothing_in_transcription:
+        return "Все очереди пусты."
+
+    lines: list[str] = []
+    lines.append("📝 Очередь summary:")
+    if summary_active is not None:
+        elapsed = int(time.monotonic() - summary_active.enqueued_at)
+        lines.append(
+            f"  Сейчас: #{summary_active.sequence} ({_format_elapsed(elapsed)} в очереди)"
+        )
     else:
-        lines.append("Сейчас ничего не обрабатывается.")
-    lines.append(f"Ожидают обработки: {pending_count}")
+        lines.append("  Сейчас: ничего не обрабатывается")
+    lines.append(f"  Ожидают: {summary_pending}")
+
+    lines.append("")
+    lines.append("🎙 Очередь распознавания (Groq Whisper):")
+    if transcription_active is not None:
+        elapsed = int(time.monotonic() - transcription_active.enqueued_at)
+        lines.append(
+            f"  Сейчас: #{transcription_active.sequence} ({_format_elapsed(elapsed)} в очереди)"
+        )
+    else:
+        lines.append("  Сейчас: ничего не распознаётся")
+    lines.append(f"  Ожидают: {transcription_pending}")
     return "\n".join(lines)
 
 
@@ -1059,41 +1296,56 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                     time.monotonic() - stage_started,
                 )
             except TranscriptUnavailable:
+                # === Локальный Whisper отключён. Cloud-инференс через Groq
+                # идёт в отдельной очереди transcription_queue, чтобы main
+                # worker не блокировался ожиданием транскрипции на длинных
+                # роликах. Старый код локального Whisper закомментирован
+                # ниже — оставляю на случай быстрого отката. ===
+                #
+                # await _set_service_status(
+                #     services, message,
+                #     "Субтитры недоступны. Скачиваю аудио и распознаю локально...",
+                #     job=job,
+                # )
+                # audio_path = await _run_with_telegram_status(
+                #     services=services, source_message=message,
+                #     operation=asyncio.to_thread(services.youtube.download_audio, url),
+                #     base_text="Субтитры недоступны. Скачиваю аудио...", job=job,
+                # )
+                # segments = await _run_with_telegram_status(
+                #     services=services, source_message=message,
+                #     operation=asyncio.to_thread(services.whisper.transcribe, audio_path),
+                #     base_text="Распознаю аудио локально через Whisper...", job=job,
+                # )
+                # transcript_source = "whisper"
+
+                if services.groq_whisper is None or not services.groq_whisper.enabled:
+                    raise RuntimeError(
+                        "Субтитры YouTube недоступны для этого ролика, "
+                        "а GROQ_API_KEY не настроен — облачное распознавание "
+                        "выключено. Добавь ключ Groq в .env и перезапусти бот."
+                    )
+                logger.info(
+                    "job.transcript.unavailable job_id=%s fallback=groq_queue",
+                    job_id,
+                )
                 await _set_service_status(
                     services,
                     message,
-                    "Субтитры недоступны. Скачиваю аудио и распознаю локально...",
+                    "Субтитры недоступны. Отправляю в очередь распознавания через Groq Whisper...",
                     job=job,
                 )
-                logger.info("job.transcript.unavailable job_id=%s fallback=audio", job_id)
-                audio_path = await _run_with_telegram_status(
-                    services=services,
-                    source_message=message,
-                    operation=asyncio.to_thread(services.youtube.download_audio, url),
-                    base_text="Субтитры недоступны. Скачиваю аудио...",
-                    job=job,
-                )
+                await _enqueue_transcription_job(job, services)
                 logger.info(
-                    "job.audio_download.done job_id=%s path=%s duration_sec=%.1f",
+                    "job.routed_to_transcription job_id=%s url=%s sequence=%s",
                     job_id,
-                    audio_path,
-                    time.monotonic() - stage_started,
+                    url,
+                    job.sequence,
                 )
-                stage_started = time.monotonic()
-                segments = await _run_with_telegram_status(
-                    services=services,
-                    source_message=message,
-                    operation=asyncio.to_thread(services.whisper.transcribe, audio_path),
-                    base_text="Распознаю аудио локально через Whisper...",
-                    job=job,
-                )
-                transcript_source = "whisper"
-                logger.info(
-                    "job.transcript.done job_id=%s source=whisper segments=%s duration_sec=%.1f",
-                    job_id,
-                    len(segments),
-                    time.monotonic() - stage_started,
-                )
+                # Возвращаемся: main worker возьмёт следующий job из summary_queue,
+                # а transcription worker сам перенаправит этот job обратно после
+                # успешного распознавания.
+                return
 
         # If this is a scheduled segment-mode job, trim segments to the expert span(s).
         if job.segment_spans:

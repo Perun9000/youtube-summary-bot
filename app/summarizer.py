@@ -245,10 +245,18 @@ class Summarizer:
         llm: LLMClient,
         hierarchy_threshold: int = DEFAULT_HIERARCHY_THRESHOLD,
         group_size: int = DEFAULT_GROUP_SIZE,
+        partial_max_tokens: int | None = None,
+        final_max_tokens: int | None = None,
     ) -> None:
         self._llm = llm
         self._hierarchy_threshold = max(2, hierarchy_threshold)
         self._group_size = max(2, group_size)
+        # When None, both stages use the LLMClient's default (settings.llm_max_tokens).
+        # Set both to enable per-stage budgets (e.g. small for chunk partials,
+        # large for final synthesis) — this prevents truncated overviews on long
+        # videos without burning tokens on intermediate condensations.
+        self._partial_max_tokens = partial_max_tokens
+        self._final_max_tokens = final_max_tokens
 
     async def summarize(
         self,
@@ -276,6 +284,7 @@ class Summarizer:
                 SUMMARY_JSON_PROMPT.format(url=url, title=title, transcript=chunks[0]),
                 system=system_prompt,
                 usage=usage,
+                max_tokens=self._final_max_tokens,
             )
             try:
                 summary = self._parse_summary(raw)
@@ -291,6 +300,7 @@ class Summarizer:
                     ),
                     system=system_prompt,
                     usage=usage,
+                    max_tokens=self._final_max_tokens,
                 )
                 if retry_raw.strip():
                     raw = retry_raw
@@ -336,6 +346,7 @@ class Summarizer:
                 CHUNK_PROMPT.format(url=url, title=title, index=index, total=num_chunks, chunk=chunk),
                 system=system_prompt,
                 usage=usage,
+                max_tokens=self._partial_max_tokens,
             )
             logger.info(
                 "summary.chunk.done index=%s total=%s duration_sec=%.1f response_chars=%s",
@@ -379,6 +390,7 @@ class Summarizer:
                     ),
                     system=system_prompt,
                     usage=usage,
+                    max_tokens=self._partial_max_tokens,
                 )
                 logger.info(
                     "summary.hierarchy.group.done index=%s total=%s duration_sec=%.1f response_chars=%s",
@@ -411,6 +423,7 @@ class Summarizer:
             SYNTHESIS_PROMPT.format(url=url, title=title, partials=partials_text),
             system=system_prompt,
             usage=usage,
+            max_tokens=self._final_max_tokens,
         )
 
         if not raw.strip():
@@ -427,6 +440,7 @@ class Summarizer:
                 COMPACT_SUMMARY_PROMPT.format(url=url, title=title, source=partials_text),
                 system=system_prompt,
                 usage=usage,
+                max_tokens=self._final_max_tokens,
             )
 
         if raw.strip():
@@ -447,6 +461,7 @@ class Summarizer:
                     COMPACT_SUMMARY_PROMPT.format(url=url, title=title, source=partials_text),
                     system=system_prompt,
                     usage=usage,
+                    max_tokens=self._final_max_tokens,
                 )
                 if retry_raw.strip():
                     raw = retry_raw

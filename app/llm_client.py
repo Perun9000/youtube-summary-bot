@@ -56,6 +56,7 @@ class LLMClient(Protocol):
         prompt: str,
         system: str | None = None,
         usage: GenerationUsage | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         ...
 
@@ -302,6 +303,7 @@ class OpenRouterClient:
         prompt: str,
         system: str | None = None,
         usage: GenerationUsage | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         ok, reason = self._budget.check()
         if not ok:
@@ -313,7 +315,9 @@ class OpenRouterClient:
             raise RuntimeError("OpenRouter: список моделей пуст. Проверь .env.")
 
         if self.is_paid_mode():
-            return await self._generate_with_retries(chain[0], prompt, system, usage)
+            return await self._generate_with_retries(
+                chain[0], prompt, system, usage, max_tokens
+            )
 
         # Free mode — cycle through the chain, then sleep + retry full chain.
         passes = self._settings.openrouter_fallback_retry_passes + 1
@@ -322,7 +326,9 @@ class OpenRouterClient:
         for pass_idx in range(passes):
             for model in chain:
                 try:
-                    return await self._generate_one_attempt(model, prompt, system, usage)
+                    return await self._generate_one_attempt(
+                        model, prompt, system, usage, max_tokens
+                    )
                 except _OpenRouterRetriable as exc:
                     last_error = exc.cause
                     logger.warning(
@@ -351,6 +357,7 @@ class OpenRouterClient:
         prompt: str,
         system: str | None,
         usage: GenerationUsage | None,
+        max_tokens: int | None,
     ) -> str:
         """Single-model invocation with the standard timeout-retry policy.
 
@@ -359,7 +366,9 @@ class OpenRouterClient:
         last_exc: Exception | None = None
         for attempt in range(1, LLM_GENERATE_MAX_ATTEMPTS + 1):
             try:
-                return await self._generate_one_attempt(model, prompt, system, usage)
+                return await self._generate_one_attempt(
+                    model, prompt, system, usage, max_tokens
+                )
             except _OpenRouterRetriable as exc:
                 last_exc = exc.cause
                 if attempt >= LLM_GENERATE_MAX_ATTEMPTS:
@@ -384,6 +393,7 @@ class OpenRouterClient:
         prompt: str,
         system: str | None,
         usage: GenerationUsage | None,
+        max_tokens: int | None,
     ) -> str:
         """One HTTP call to OpenRouter for a specific model.
 
@@ -398,11 +408,14 @@ class OpenRouterClient:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
+        effective_max_tokens = (
+            max_tokens if max_tokens is not None else self._settings.llm_max_tokens
+        )
         payload: dict = {
             "model": model,
             "messages": messages,
             "temperature": self._settings.llm_temperature,
-            "max_tokens": self._settings.llm_max_tokens,
+            "max_tokens": effective_max_tokens,
             "stream": False,
             "usage": {"include": True},
         }
@@ -606,6 +619,7 @@ class LMStudioClient:
         prompt: str,
         system: str | None = None,
         usage: GenerationUsage | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         started = time.monotonic()
         model = await self._resolve_model()
@@ -618,7 +632,7 @@ class LMStudioClient:
             "model": model,
             "messages": messages,
             "temperature": self._settings.llm_temperature,
-            "max_tokens": self._settings.llm_max_tokens,
+            "max_tokens": max_tokens if max_tokens is not None else self._settings.llm_max_tokens,
             "stream": False,
         }
 
