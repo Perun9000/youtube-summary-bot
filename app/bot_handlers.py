@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import datetime
 import time
 import uuid
 from collections.abc import Callable
@@ -17,6 +18,7 @@ from aiogram.types import Message
 from app.config import Settings
 from app.groq_whisper_service import GroqWhisperService, GroqWhisperUnavailable
 from app.llm_client import GenerationUsage, LLMClient, OpenRouterClient, health_check_with_reason
+from app.summary_cache import CachedSummary, SummaryCache
 from app.models import Summary, TranscriptSegment, VideoContext, VideoMetadata
 from app.monitoring_service import (
     MonitoringService,
@@ -100,6 +102,7 @@ class Services:
     transcription_queue_lock: asyncio.Lock | None = None
     transcription_worker_task: asyncio.Task[None] | None = None
     transcription_active_job: SummaryJob | None = None
+    summary_cache: "SummaryCache | None" = None
 
 
 def build_router(services: Services) -> Router:
@@ -314,6 +317,17 @@ def build_router(services: Services) -> Router:
 
 
 async def _enqueue_summary_job(message: Message, url: str, services: Services) -> None:
+    # Cache hit fast-path: если по этому ролику уже было саммари, отдаём его
+    # сразу, не занимая очередь и не дёргая LLM/Whisper.
+    cached = _lookup_cached_summary(url, services)
+    if cached is not None:
+        logger.info(
+            "queue.cache.hit chat_id=%s video_id=%s telegraph_url=%s",
+            message.chat.id, cached.video_id, cached.telegraph_url,
+        )
+        await _send_cached_summary_to_chat(message, cached, services)
+        return
+
     active_job: SummaryJob | None
     async with services.summary_queue_lock:
         services.summary_next_sequence += 1
@@ -1240,6 +1254,19 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
     video_id = "unknown"
     transcript_source = "unknown"
     title = url
+
+    # Cache check at the very top — covers scheduled jobs + race-conditions
+    # where the same video was queued twice in quick succession.
+    if _is_job_cacheable(job):
+        cached = _lookup_cached_summary(url, services)
+        if cached is not None:
+            logger.info(
+                "job.cache.hit job_id=%s chat_id=%s video_id=%s telegraph_url=%s",
+                job_id, chat_id, cached.video_id, cached.telegraph_url,
+            )
+            await _deliver_cached_summary_for_job(job, services, cached)
+            return
+
     await _set_service_status(services, message, "Получаю данные ролика...", job=job)
     try:
         video_id = extract_video_id(url)
@@ -1486,6 +1513,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                 total_duration_sec=total_duration_sec,
                 settings=services.settings,
                 loaded_context_length=loaded_ctx,
+                video_duration_sec=getattr(metadata, "duration_sec", None),
             ),
             job=job,
             parse_mode="HTML",
@@ -1509,6 +1537,27 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             text=summary_text,
         )
         _forget_service_status(services, chat_id)
+
+        # Кэшируем результат — но только для full-video. Segment-mode даёт
+        # частичное саммари по конкретному эксперту, его нельзя считать
+        # «каноном» для этого video_id.
+        if _is_job_cacheable(job) and services.summary_cache is not None and video_id != "unknown":
+            try:
+                _save_summary_to_cache(
+                    services=services,
+                    video_id=video_id,
+                    url=url,
+                    title=title,
+                    metadata=metadata,
+                    summary=summary,
+                    telegraph_url=telegraph_url,
+                    transcript_url=transcript_url,
+                    transcript_source=transcript_source,
+                    transcript_chars=len(transcript_text),
+                    model=model_name,
+                )
+            except Exception:
+                logger.exception("job.cache.save_failed job_id=%s video_id=%s", job_id, video_id)
 
         logger.info(
             "job.done job_id=%s video_id=%s duration_sec=%.1f telegraph_url=%s "
@@ -1599,6 +1648,35 @@ def _format_russian_hours(hours: int) -> str:
     return "часов"
 
 
+def _format_russian_minutes(minutes: int) -> str:
+    last_two = minutes % 100
+    last = minutes % 10
+    if 11 <= last_two <= 14:
+        return "минут"
+    if last == 1:
+        return "минута"
+    if 2 <= last <= 4:
+        return "минуты"
+    return "минут"
+
+
+def _format_video_duration(seconds: float | None) -> str:
+    """Render video duration like '1 час 1 минута' / '23 минуты' / '45 сек'."""
+    if seconds is None or seconds <= 0:
+        return "неизвестна"
+    sec = int(seconds)
+    hours, remainder = divmod(sec, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if not hours and not minutes:
+        return f"{secs} сек"
+    parts: list[str] = []
+    if hours:
+        parts.append(f"{hours} {_format_russian_hours(hours)}")
+    if minutes:
+        parts.append(f"{minutes} {_format_russian_minutes(minutes)}")
+    return " ".join(parts)
+
+
 def _format_telegram_summary(
     title: str,
     video_url: str,
@@ -1682,6 +1760,192 @@ async def _send_summary_delivery(
     )
 
 
+def _is_job_cacheable(job: SummaryJob) -> bool:
+    """We cache only canonical full-video summaries.
+
+    Segment-mode (scheduled jobs that hit `expert_segment_threshold_sec` and
+    produced span-filtered transcripts) gets a summary specific to one
+    expert window — it would be wrong to serve that as the canonical answer
+    when a later user requests the *whole* video.
+    """
+    return not (job.segment_spans and len(job.segment_spans) > 0)
+
+
+def _lookup_cached_summary(url: str, services: Services) -> CachedSummary | None:
+    """Resolve URL → video_id → cached entry, swallowing parse errors."""
+    if services.summary_cache is None:
+        return None
+    try:
+        video_id = extract_video_id(url)
+    except Exception:
+        return None
+    return services.summary_cache.get(video_id)
+
+
+def _format_cache_age(created_at_unix: float) -> str:
+    seconds_ago = max(0, int(time.time() - created_at_unix))
+    if seconds_ago < 60:
+        return "только что"
+    if seconds_ago < 3600:
+        minutes = seconds_ago // 60
+        return f"{minutes} мин назад"
+    if seconds_ago < 86400:
+        hours = seconds_ago // 3600
+        return f"{hours} ч назад"
+    days = seconds_ago // 86400
+    if days == 1:
+        return "вчера"
+    if days < 30:
+        return f"{days} дн. назад"
+    months = days // 30
+    if months == 1:
+        return "месяц назад"
+    return f"{months} мес. назад"
+
+
+def _format_cached_summary_text(cached: CachedSummary) -> str:
+    """Render the same Telegram message the user got the first time, with a
+    small "this was already done" header so they understand it's cached."""
+    summary = cached.to_summary()
+    body = _format_telegram_summary(
+        title=cached.title,
+        video_url=cached.url,
+        summary=summary,
+        telegraph_url=cached.telegraph_url,
+        channel_name=cached.channel_name,
+        channel_url=cached.channel_url,
+    )
+    note = (
+        f"📌 <i>Это видео уже было суммировано "
+        f"({escape_html(_format_cache_age(cached.created_at_unix))}). "
+        f"Вот сохранённый итог:</i>"
+    )
+    return f"{note}\n\n{body}"
+
+
+async def _send_cached_summary_to_chat(
+    message: Message,
+    cached: CachedSummary,
+    services: Services,
+) -> None:
+    """Manual flow: respond to a user message with cached summary + restore Q&A."""
+    text = _format_cached_summary_text(cached)
+    await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+    _restore_qa_context_from_cache(message.chat.id, cached, services)
+
+
+async def _deliver_cached_summary_for_job(
+    job: SummaryJob,
+    services: Services,
+    cached: CachedSummary,
+) -> None:
+    """Job-level delivery: works for both manual (job.message != None) and
+    scheduled (services.bot.send_message). Restores Q&A context only for
+    interactive (manual) sessions."""
+    text = _format_cached_summary_text(cached)
+    await _send_summary_delivery(services=services, job=job, text=text)
+    if not job.scheduled and job.chat_id:
+        _restore_qa_context_from_cache(job.chat_id, cached, services)
+
+
+def _restore_qa_context_from_cache(
+    chat_id: int,
+    cached: CachedSummary,
+    services: Services,
+) -> None:
+    """Re-hydrate VideoContext for follow-up Q&A when we serve a cached summary.
+
+    We pull the saved transcript text from disk (data/transcripts/<video_id>.txt
+    written when the summary was first generated). If the transcript file is
+    missing, Q&A still works on summary-only context — just less rich.
+    """
+    transcript_text = ""
+    chunks: list[str] = []
+    transcript_path = (
+        services.settings.bot_data_dir / TRANSCRIPTS_SUBDIR / f"{cached.video_id}.txt"
+    )
+    if transcript_path.exists():
+        try:
+            transcript_text = transcript_path.read_text(encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "cache.restore.transcript_read_failed video_id=%s error=%s",
+                cached.video_id, exc,
+            )
+    if transcript_text:
+        try:
+            active_model = services.settings.openrouter_model_paid  # safe default
+            try:
+                # Try active model first when available — same chunk size that
+                # would be used for fresh generation.
+                pass
+            except Exception:
+                pass
+            chunk_size = services.settings.effective_chunk_max_chars(
+                active_model=cached.model
+            )
+            chunks = chunk_transcript(transcript_text, max_chars=chunk_size)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "cache.restore.chunking_failed video_id=%s error=%s",
+                cached.video_id, exc,
+            )
+
+    services.contexts[chat_id] = VideoContext(
+        url=cached.url,
+        video_id=cached.video_id,
+        title=cached.title,
+        transcript_text=transcript_text,
+        chunks=chunks,
+        summary=cached.to_summary(),
+        telegraph_url=cached.telegraph_url,
+    )
+
+
+def _save_summary_to_cache(
+    *,
+    services: Services,
+    video_id: str,
+    url: str,
+    title: str,
+    metadata,
+    summary,
+    telegraph_url: str,
+    transcript_url: str | None,
+    transcript_source: str,
+    transcript_chars: int,
+    model: str,
+) -> None:
+    """Persist a freshly-generated summary so future requests for the same
+    video_id are answered from cache."""
+    if services.summary_cache is None:
+        return
+    now = time.time()
+    iso_time = datetime.datetime.fromtimestamp(now, tz=datetime.timezone.utc).isoformat()
+    entry = CachedSummary(
+        video_id=video_id,
+        url=url,
+        title=title,
+        channel_name=getattr(metadata, "channel_name", "") or "",
+        channel_url=getattr(metadata, "channel_url", "") or "",
+        summary_overview=summary.overview,
+        summary_key_points=list(summary.key_points),
+        summary_chapters=[
+            {"start": ch.start, "title": ch.title, "notes": ch.notes}
+            for ch in summary.chapters
+        ],
+        summary_raw_text=summary.raw_text,
+        telegraph_url=telegraph_url,
+        transcript_url=transcript_url,
+        transcript_source=transcript_source,
+        model=model or "unknown",
+        created_at_iso=iso_time,
+        created_at_unix=now,
+        transcript_chars=transcript_chars,
+    )
+    services.summary_cache.put(entry)
+
+
 def _build_context_hint(job: SummaryJob) -> str | None:
     """Build a summarizer context hint for segment-mode (scheduled) jobs."""
     if not job.segment_spans:
@@ -1721,11 +1985,14 @@ def _format_service_info(
     total_duration_sec: float,
     settings: Settings,
     loaded_context_length: int | None,
+    video_duration_sec: float | None = None,
 ) -> str:
     transcript_label = {
         "youtube": "субтитры YouTube",
         "whisper": "локальный Whisper",
+        "groq": "Groq Whisper",
         "unknown": "неизвестно",
+        "none": "нет",
     }.get(transcript_source, transcript_source)
 
     tokens_line = (
@@ -1742,18 +2009,33 @@ def _format_service_info(
     else:
         context_line = f"{configured_ctx} (настройка, загруженный неизвестен)"
 
+    # Max tokens ответа — потолки на partial и final по отдельности.
+    # Когда они одинаковые (back-compat), показываем одно значение, иначе оба.
+    if settings.llm_max_tokens_partial == settings.llm_max_tokens_final:
+        max_tokens_line = f"Max tokens ответа: {settings.llm_max_tokens_partial}"
+    else:
+        max_tokens_line = (
+            f"Max tokens ответа: {settings.llm_max_tokens_partial} (на чанк) / "
+            f"{settings.llm_max_tokens_final} (на финал)"
+        )
+
+    video_duration_line = (
+        f"Длительность видео: {_format_video_duration(video_duration_sec)}"
+        if video_duration_sec is not None
+        else "Длительность видео: неизвестна"
+    )
+
     lines = [
         f"Модель: {escape_html(model)}",
         f"Контекст: {context_line}",
         f"Температура: {settings.llm_temperature}",
-        f"Max tokens ответа: {settings.llm_max_tokens}",
-        f"Auto-load модели: {'on' if settings.lmstudio_auto_load else 'off'}",
-        f"Размер чанка transcript: {settings.effective_chunk_max_chars(active_model=model)} симв.",
+        max_tokens_line,
         "",
         f"Токены: {tokens_line}",
         f"Время LLM: {_format_elapsed(int(usage.duration_sec))}",
         f"Источник transcript: {escape_html(transcript_label)}",
         f"Длина transcript: {transcript_chars} симв.",
+        video_duration_line,
         f"Чанков: {chunks_count}",
         f"Общее время: {_format_elapsed(int(total_duration_sec))}",
         f"job_id: {escape_html(job_id)}",
