@@ -57,6 +57,8 @@ class Settings:
     monitoring_state_path: Path
     monitoring_target_chat_id: int | None
     monitoring_llm_retry_interval_sec: int
+    summary_cache_path: Path
+    summary_cache_ttl_days: int
 
     def effective_chunk_max_chars(self, active_model: str | None = None) -> int:
         """Pick the chunk size that best fits the LLM that will actually run.
@@ -111,6 +113,10 @@ def load_settings() -> Settings:
     monitoring_target_chat_id = _parse_optional_int(os.getenv("MONITORING_TARGET_CHAT_ID", ""))
     monitoring_enabled = os.getenv("MONITORING_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
     monitoring_llm_retry_interval_sec = int(os.getenv("MONITORING_LLM_RETRY_INTERVAL_SEC", "300"))
+    summary_cache_path = Path(
+        os.getenv("SUMMARY_CACHE_PATH", str(data_dir / "summary_cache.json"))
+    ).expanduser()
+    summary_cache_ttl_days = int(os.getenv("SUMMARY_CACHE_TTL_DAYS", "100"))
 
     llm_provider = os.getenv("LLM_PROVIDER", "lmstudio").strip().lower() or "lmstudio"
     if llm_provider not in {"lmstudio", "openrouter"}:
@@ -250,4 +256,6 @@ def load_settings() -> Settings:
         monitoring_state_path=monitoring_state_path,
         monitoring_target_chat_id=monitoring_target_chat_id,
         monitoring_llm_retry_interval_sec=monitoring_llm_retry_interval_sec,
+        summary_cache_path=summary_cache_path,
+        summary_cache_ttl_days=summary_cache_ttl_days,
     )

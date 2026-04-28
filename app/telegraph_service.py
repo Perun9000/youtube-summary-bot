@@ -7,7 +7,7 @@ import time
 import httpx
 
 from app.config import Settings
-from app.models import Summary, TranscriptSegment
+from app.models import Summary, TranscriptSegment, VideoComment
 from app.utils import format_ts
 
 
@@ -32,19 +32,23 @@ class TelegraphService:
         url: str,
         summary: Summary,
         transcript_url: str | None = None,
+        top_comments: list[VideoComment] | None = None,
     ) -> str:
         started = time.monotonic()
         logger.info(
-            "telegraph.publish.start title=%r key_points=%s chapters=%s transcript_url=%s",
+            "telegraph.publish.start title=%r key_points=%s chapters=%s transcript_url=%s comments=%s",
             title,
             len(summary.key_points),
             len(summary.chapters),
             transcript_url,
+            len(top_comments) if top_comments else 0,
         )
         if not self._access_token:
             self._access_token = await self._create_account()
 
-        content = _summary_to_nodes(url, summary, transcript_url=transcript_url)
+        content = _summary_to_nodes(
+            url, summary, transcript_url=transcript_url, top_comments=top_comments,
+        )
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
                 "https://api.telegra.ph/createPage",
@@ -140,6 +144,7 @@ def _summary_to_nodes(
     url: str,
     summary: Summary,
     transcript_url: str | None = None,
+    top_comments: list[VideoComment] | None = None,
 ) -> list[dict | str]:
     header_children: list[dict | str] = [
         {"tag": "a", "attrs": {"href": url}, "children": ["Оригинальный ролик"]},
@@ -167,6 +172,19 @@ def _summary_to_nodes(
 
     if not summary.chapters:
         nodes.append({"tag": "p", "children": [summary.raw_text]})
+
+    if top_comments:
+        nodes.append({"tag": "h3", "children": ["Топ-комментарии"]})
+        for c in top_comments:
+            # Header line with author + like count + pinned marker
+            pinned = "📌 " if c.is_pinned else ""
+            header_text = f"{pinned}{c.author} · ❤ {c.like_count}".strip()
+            nodes.append(
+                {"tag": "p", "children": [{"tag": "b", "children": [header_text]}]}
+            )
+            # Comment body — Telegra.ph supports <blockquote>, gives nice visual
+            # separation between meta-line and the actual comment.
+            nodes.append({"tag": "blockquote", "children": [c.text]})
 
     return nodes
 

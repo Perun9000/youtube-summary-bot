@@ -19,7 +19,7 @@ from app.config import Settings
 from app.groq_whisper_service import GroqWhisperService, GroqWhisperUnavailable
 from app.llm_client import GenerationUsage, LLMClient, OpenRouterClient, health_check_with_reason
 from app.summary_cache import CachedSummary, SummaryCache
-from app.models import Summary, TranscriptSegment, VideoContext, VideoMetadata
+from app.models import Summary, TranscriptSegment, VideoComment, VideoContext, VideoMetadata
 from app.monitoring_service import (
     MonitoringService,
     ScanProgress,
@@ -39,6 +39,7 @@ from app.youtube_service import TranscriptUnavailable, YouTubeService
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
 MAX_TELEGRAM_MESSAGE_CHARS = 4000
+TOP_COMMENT_MAX_CHARS = 2200
 TRANSCRIPTS_SUBDIR = "transcripts"
 
 
@@ -1461,6 +1462,22 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             status_getter=summary_progress.status_text,
         )
 
+        # Тащим топ-комментарии перед публикацией в Telegra.ph, чтобы они
+        # сразу попали в страницу одним вызовом createPage. Кейс «комментарии
+        # отключены» / yt-dlp упал на comments-extractor'е обрабатывается тихо:
+        # fetch_top_comments возвращает пустой список, summary отдаётся без
+        # секции комментариев.
+        await _set_service_status(services, message, "Тащу топ-комментарии...", job=job)
+        try:
+            top_comments = await asyncio.to_thread(services.youtube.fetch_top_comments, url)
+            logger.info(
+                "job.comments.done job_id=%s count=%s",
+                job_id, len(top_comments),
+            )
+        except Exception:
+            logger.exception("job.comments.failed job_id=%s", job_id)
+            top_comments = []
+
         await _set_service_status(services, message, "Публикую полный конспект в Telegra.ph...", job=job)
         telegraph_url = await _run_with_telegram_status(
             services=services,
@@ -1470,6 +1487,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                 url=url,
                 summary=summary,
                 transcript_url=transcript_url,
+                top_comments=top_comments,
             ),
             base_text="Публикую полный конспект в Telegra.ph...",
             job=job,
@@ -1530,6 +1548,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             scheduled=job.scheduled,
             segment_spans=job.segment_spans,
             expert_matches=job.expert_matches,
+            top_comment=top_comments[0] if top_comments else None,
         )
         await _send_summary_delivery(
             services=services,
@@ -1555,6 +1574,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                     transcript_source=transcript_source,
                     transcript_chars=len(transcript_text),
                     model=model_name,
+                    top_comments=top_comments,
                 )
             except Exception:
                 logger.exception("job.cache.save_failed job_id=%s video_id=%s", job_id, video_id)
@@ -1687,6 +1707,7 @@ def _format_telegram_summary(
     scheduled: bool = False,
     segment_spans: list[tuple[float, float]] | None = None,
     expert_matches: list[str] | None = None,
+    top_comment: VideoComment | None = None,
 ) -> str:
     if channel_name and channel_url:
         channel_line = (
@@ -1722,7 +1743,69 @@ def _format_telegram_summary(
     if segment_line:
         blocks.append(segment_line)
     blocks.extend([overview_line, telegraph_line, reading_line])
-    return "\n\n".join(blocks)[:4000]
+
+    if top_comment is not None:
+        base_text = "\n\n".join(blocks)
+        separator_len = 2 if base_text else 0
+        available_chars = MAX_TELEGRAM_MESSAGE_CHARS - len(base_text) - separator_len
+        top_comment_line = _format_top_comment_line(top_comment, available_chars)
+        if top_comment_line:
+            blocks.append(top_comment_line)
+
+    return _fit_telegram_message("\n\n".join(blocks))
+
+
+def _format_top_comment_line(top_comment: VideoComment, available_chars: int) -> str:
+    if available_chars <= 0:
+        return ""
+
+    likes_label = _format_likes(top_comment.like_count)
+    prefix = f"💬 <i>Топ-комментарий ({likes_label}):\n«"
+    suffix = "»</i>"
+    max_body_chars = min(TOP_COMMENT_MAX_CHARS, max(0, available_chars - len(prefix) - len(suffix)))
+    if max_body_chars <= 0:
+        return ""
+
+    raw_text = top_comment.text.strip()
+    snippet = _fit_escaped_text(raw_text, max_body_chars)
+    return f"{prefix}{snippet}{suffix}"
+
+
+def _fit_escaped_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(escape_html(text)) <= max_chars:
+        return escape_html(text)
+
+    ellipsis = "..."
+    low = 0
+    high = len(text)
+    best = ""
+    while low <= high:
+        mid = (low + high) // 2
+        candidate = text[:mid].rstrip() + ellipsis
+        escaped = escape_html(candidate)
+        if len(escaped) <= max_chars:
+            best = escaped
+            low = mid + 1
+        else:
+            high = mid - 1
+    return best or ellipsis[:max_chars]
+
+
+def _format_likes(count: int) -> str:
+    """Render like count with proper Russian declension: '1 лайк' / '2 лайка' / '5 лайков'."""
+    last_two = count % 100
+    last = count % 10
+    if 11 <= last_two <= 14:
+        word = "лайков"
+    elif last == 1:
+        word = "лайк"
+    elif 2 <= last <= 4:
+        word = "лайка"
+    else:
+        word = "лайков"
+    return f"{count} {word}"
 
 
 async def _send_summary_delivery(
@@ -1807,6 +1890,7 @@ def _format_cached_summary_text(cached: CachedSummary) -> str:
     """Render the same Telegram message the user got the first time, with a
     small "this was already done" header so they understand it's cached."""
     summary = cached.to_summary()
+    cached_comments = cached.to_top_comments()
     body = _format_telegram_summary(
         title=cached.title,
         video_url=cached.url,
@@ -1814,6 +1898,7 @@ def _format_cached_summary_text(cached: CachedSummary) -> str:
         telegraph_url=cached.telegraph_url,
         channel_name=cached.channel_name,
         channel_url=cached.channel_url,
+        top_comment=cached_comments[0] if cached_comments else None,
     )
     note = (
         f"📌 <i>Это видео уже было суммировано "
@@ -1915,6 +2000,7 @@ def _save_summary_to_cache(
     transcript_source: str,
     transcript_chars: int,
     model: str,
+    top_comments: list[VideoComment] | None = None,
 ) -> None:
     """Persist a freshly-generated summary so future requests for the same
     video_id are answered from cache."""
@@ -1942,6 +2028,15 @@ def _save_summary_to_cache(
         created_at_iso=iso_time,
         created_at_unix=now,
         transcript_chars=transcript_chars,
+        top_comments=[
+            {
+                "text": c.text,
+                "author": c.author,
+                "like_count": c.like_count,
+                "is_pinned": c.is_pinned,
+            }
+            for c in (top_comments or [])
+        ],
     )
     services.summary_cache.put(entry)
 

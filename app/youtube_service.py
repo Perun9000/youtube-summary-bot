@@ -9,7 +9,7 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import NoTranscriptFound, TranscriptsDisabled, VideoUnavailable
 
 from app.config import Settings
-from app.models import ChannelInfo, TranscriptSegment, VideoChapter, VideoMetadata
+from app.models import ChannelInfo, TranscriptSegment, VideoChapter, VideoComment, VideoMetadata
 from app.utils import extract_video_id
 
 
@@ -169,6 +169,83 @@ class YouTubeService:
             raise TranscriptUnavailable("Не удалось скачать аудио через yt-dlp")
         audio_files[0].replace(cached_path)
         return cached_path
+
+    def fetch_top_comments(
+        self,
+        url: str,
+        max_fetch: int = 20,
+        top_n: int = 5,
+    ) -> list[VideoComment]:
+        """Fetch and rank top YouTube comments via yt-dlp's comment extractor.
+
+        Strategy:
+          - Ask yt-dlp for up to ``max_fetch`` top-sorted comments (limits the
+            paginated walk yt-dlp normally does — we don't need thousands).
+          - Drop replies (parent != 'root') so we keep only top-level threads.
+          - Re-sort our subset by ``like_count`` descending and take top ``top_n``.
+
+        Returns an empty list (without raising) if comments are disabled,
+        the extractor fails, or the video has no comments yet — comments
+        are an optional enrichment, not a hard dependency.
+        """
+        options = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "noplaylist": True,
+            "getcomments": True,
+            "extractor_args": {
+                "youtube": {
+                    "max_comments": [str(max_fetch)],
+                    "comment_sort": ["top"],
+                }
+            },
+        }
+        self._add_cookie_option(options)
+
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as exc:
+            logger.warning("youtube.comments.fetch_failed url=%s error=%s", url, exc)
+            return []
+
+        raw = info.get("comments") if isinstance(info, dict) else None
+        if not isinstance(raw, list):
+            return []
+
+        comments: list[VideoComment] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            parent = item.get("parent")
+            # Replies have parent set to a parent-comment id (not 'root').
+            if parent and parent != "root":
+                continue
+            text = (item.get("text") or "").strip()
+            if not text:
+                continue
+            try:
+                like_count = int(item.get("like_count") or 0)
+            except (TypeError, ValueError):
+                like_count = 0
+            comments.append(
+                VideoComment(
+                    text=text,
+                    author=str(item.get("author") or "").strip(),
+                    like_count=like_count,
+                    is_pinned=bool(item.get("is_pinned")),
+                )
+            )
+
+        # YouTube's "top" sort is approximately by likes; we re-sort defensively.
+        comments.sort(key=lambda c: c.like_count, reverse=True)
+        result = comments[:top_n]
+        logger.info(
+            "youtube.comments.fetched url=%s fetched=%s top_level=%s returning=%s",
+            url, len(raw), len(comments), len(result),
+        )
+        return result
 
     def _pick_transcript(self, transcript_list):
         try:

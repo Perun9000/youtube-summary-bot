@@ -12,6 +12,7 @@ from app.bot_handlers import Services, build_router, enqueue_scheduled_candidate
 from app.config import load_settings
 from app.groq_whisper_service import GroqWhisperService
 from app.llm_client import create_llm_client, health_check_with_reason
+from app.summary_cache import SummaryCache
 from app.monitoring_config import MonitoringConfig
 from app.monitoring_service import MonitoringService
 from app.monitoring_state import MonitoringState
@@ -94,6 +95,17 @@ async def main() -> None:
     else:
         logger.info("groq.boot enabled=false reason=no_api_key")
 
+    summary_cache = SummaryCache(
+        settings.summary_cache_path,
+        ttl_days=settings.summary_cache_ttl_days,
+    )
+    logger.info(
+        "summary_cache.boot path=%s entries=%s ttl_days=%s",
+        settings.summary_cache_path,
+        summary_cache.size(),
+        settings.summary_cache_ttl_days,
+    )
+
     services = Services(
         settings=settings,
         llm=llm,
@@ -124,6 +136,7 @@ async def main() -> None:
         transcription_queue_lock=asyncio.Lock(),
         transcription_worker_task=None,
         transcription_active_job=None,
+        summary_cache=summary_cache,
     )
 
     scheduler_task: asyncio.Task[None] | None = None

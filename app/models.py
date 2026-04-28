@@ -59,3 +59,11 @@ class VideoContext:
     summary: Summary
     telegraph_url: str
 
+
+@dataclass(frozen=True)
+class VideoComment:
+    text: str
+    author: str
+    like_count: int
+    is_pinned: bool = False
+
