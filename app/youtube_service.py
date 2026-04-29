@@ -173,7 +173,7 @@ class YouTubeService:
     def fetch_top_comments(
         self,
         url: str,
-        max_fetch: int = 20,
+        max_fetch: int = 30,
         top_n: int = 5,
     ) -> list[VideoComment]:
         """Fetch and rank top YouTube comments via yt-dlp's comment extractor.
@@ -181,8 +181,15 @@ class YouTubeService:
         Strategy:
           - Ask yt-dlp for up to ``max_fetch`` top-sorted comments (limits the
             paginated walk yt-dlp normally does — we don't need thousands).
-          - Drop replies (parent != 'root') so we keep only top-level threads.
-          - Re-sort our subset by ``like_count`` descending and take top ``top_n``.
+          - Drop replies (``parent != 'root'``) → только верхний уровень.
+          - Drop pinned comments — закреплённые часто пишет сам автор канала
+            или они куратятся им и не отражают реакцию аудитории.
+          - Drop comments by the channel uploader (``author_is_uploader``) —
+            тоже не «реальный пользователь».
+          - Re-sort оставшиеся по ``like_count`` desc и берём топ ``top_n``.
+
+        ``max_fetch`` намеренно > top_n*4: после фильтрации pinned/author может
+        отсеяться 1–3 кандидата, нужен запас, чтобы на выходе всё ещё было top_n.
 
         Returns an empty list (without raising) if comments are disabled,
         the extractor fails, or the video has no comments yet — comments
@@ -215,12 +222,24 @@ class YouTubeService:
             return []
 
         comments: list[VideoComment] = []
+        skipped_pinned = 0
+        skipped_uploader = 0
         for item in raw:
             if not isinstance(item, dict):
                 continue
             parent = item.get("parent")
             # Replies have parent set to a parent-comment id (not 'root').
             if parent and parent != "root":
+                continue
+            # Закреплённые комментарии часто пишет сам автор канала или
+            # пиарят что-то заранее — нам нужны реакции аудитории, не курирование.
+            if item.get("is_pinned"):
+                skipped_pinned += 1
+                continue
+            # Если комментарий написан владельцем канала — тоже не «реальный
+            # пользователь», даже если не закреплён.
+            if item.get("author_is_uploader"):
+                skipped_uploader += 1
                 continue
             text = (item.get("text") or "").strip()
             if not text:
@@ -234,7 +253,7 @@ class YouTubeService:
                     text=text,
                     author=str(item.get("author") or "").strip(),
                     like_count=like_count,
-                    is_pinned=bool(item.get("is_pinned")),
+                    is_pinned=False,  # отфильтровали выше — здесь всегда False
                 )
             )
 
@@ -242,8 +261,10 @@ class YouTubeService:
         comments.sort(key=lambda c: c.like_count, reverse=True)
         result = comments[:top_n]
         logger.info(
-            "youtube.comments.fetched url=%s fetched=%s top_level=%s returning=%s",
-            url, len(raw), len(comments), len(result),
+            "youtube.comments.fetched url=%s fetched=%s top_level=%s "
+            "skipped_pinned=%s skipped_uploader=%s returning=%s",
+            url, len(raw), len(comments) + skipped_pinned + skipped_uploader,
+            skipped_pinned, skipped_uploader, len(result),
         )
         return result
 
