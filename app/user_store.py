@@ -22,8 +22,8 @@ class AllowedUser:
 class UserStore:
     """Persistent allow-list for Telegram users.
 
-    ``ALLOWED_USER_IDS`` remains a bootstrap seed for the first run and for
-    simple manual backfills. The live source of truth is ``/data/users.json``.
+    ``ALLOWED_USER_IDS`` is only a bootstrap seed for the first run. After
+    ``users.json`` exists, it is the live source of truth.
     """
 
     def __init__(
@@ -37,8 +37,12 @@ class UserStore:
         self._lock = threading.Lock()
         self._users: dict[int, AllowedUser] = {}
 
+        file_exists = self._path.exists()
         self._load()
-        self._seed(seed_user_ids)
+        if file_exists:
+            self._ensure_owner()
+        else:
+            self._seed(seed_user_ids)
 
     @property
     def owner_user_id(self) -> int | None:
@@ -124,6 +128,20 @@ class UserStore:
                     should_save = True
             if should_save or not self._path.exists():
                 self._save_locked()
+
+    def _ensure_owner(self) -> None:
+        if self._owner_user_id is None:
+            return
+
+        with self._lock:
+            if self._owner_user_id in self._users:
+                return
+            self._users[self._owner_user_id] = AllowedUser(
+                user_id=self._owner_user_id,
+                name="owner",
+                added_at=_now_iso(),
+            )
+            self._save_locked()
 
     def _save_locked(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)

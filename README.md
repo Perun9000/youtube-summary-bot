@@ -5,7 +5,7 @@
 ## Что уже настроено
 
 - Telegram long polling через `aiogram`.
-- Доступ ограничен allow-list'ом: `OWNER_USER_ID` для владельца, `ALLOWED_USER_IDS` как seed, дальше `/data/users.json`.
+- Доступ ограничен allow-list'ом: `OWNER_USER_ID` для владельца, `ALLOWED_USER_IDS` как seed при первом запуске, дальше `/data/users.json`.
 - Summary и Q&A только локально через LM Studio.
 - Транскрибация роликов без субтитров локально через `faster-whisper`.
 - `yt-dlp` используется как fallback для скачивания аудио и может использовать YouTube cookies.
