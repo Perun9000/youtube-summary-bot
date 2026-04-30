@@ -1404,12 +1404,6 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
         video_id = metadata.video_id
         title = metadata.title
         job.video_duration_sec = metadata.duration_sec or None
-        job.progress_estimate_sec = _estimate_job_total_seconds(
-            video_duration_sec=job.video_duration_sec,
-            chunks_count=None,
-            transcript_source=None,
-            llm_provider=services.settings.llm_provider,
-        )
 
         if job.pre_fetched_segments is not None:
             segments = list(job.pre_fetched_segments)
@@ -1501,7 +1495,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
         chunk_size = services.settings.effective_chunk_max_chars(active_model=active_model)
         chunks = chunk_transcript(transcript_text, max_chars=chunk_size)
         job.progress_estimate_sec = _estimate_job_total_seconds(
-            video_duration_sec=job.video_duration_sec,
+            transcript_chars=len(transcript_text),
             chunks_count=len(chunks),
             transcript_source=transcript_source,
             llm_provider=services.settings.llm_provider,
@@ -1515,6 +1509,11 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             chunk_size,
             services.settings.llm_provider,
             active_model,
+        )
+        logger.info(
+            "job.progress_estimate.done job_id=%s estimate_sec=%.1f",
+            job_id,
+            job.progress_estimate_sec or 0.0,
         )
 
         try:
@@ -1841,7 +1840,7 @@ def _format_job_progress(job: SummaryJob, elapsed_sec: int) -> str:
 
     raw_percent = (max(0, elapsed_sec) / job.progress_estimate_sec) * 100
     rounded = int(round(raw_percent / 10) * 10)
-    if raw_percent >= 5 and rounded == 0:
+    if elapsed_sec > 0 and rounded == 0:
         rounded = 10
     rounded = max(0, min(90, rounded))
     return f"Прогресс: ~{rounded}% (оценка)"
@@ -1849,35 +1848,42 @@ def _format_job_progress(job: SummaryJob, elapsed_sec: int) -> str:
 
 def _estimate_job_total_seconds(
     *,
-    video_duration_sec: float | None,
+    transcript_chars: int | None,
     chunks_count: int | None,
     transcript_source: str | None,
     llm_provider: str,
 ) -> float | None:
-    if (video_duration_sec is None or video_duration_sec <= 0) and not chunks_count:
+    if (transcript_chars is None or transcript_chars <= 0) and not chunks_count:
         return None
 
-    duration = max(0.0, video_duration_sec or 0.0)
+    chars = max(0, transcript_chars or 0)
     chunks = max(1, chunks_count or 1)
-    if duration <= 0:
-        # Fallback when metadata has no duration: one chunk is roughly a
-        # 5-10 minute speech segment with current chunk settings.
-        duration = chunks * 420.0
 
     if llm_provider == "lmstudio":
-        base_sec = 120.0
-        per_video_sec = 0.65
-        per_extra_chunk_sec = 90.0
+        # Historical local Qwen/LM Studio runs in bot.log: one 10k chunk often
+        # takes 4-8 minutes, and final synthesis adds another several minutes.
+        estimate = 240.0 + chunks * 330.0 + max(0, chunks - 1) * 120.0
     else:
-        base_sec = 90.0
-        per_video_sec = 0.28
-        per_extra_chunk_sec = 45.0
+        # Calibrated from current OpenRouter logs:
+        # - 1 chunk: median full job ~125s historically, ~100s after transcript
+        #   publishing was moved in parallel.
+        # - 2 chunks: observed full jobs ~245-280s before that parallelization,
+        #   so we target ~220s going forward.
+        chars_component = min(chars, 120_000) / 6_000
+        estimate = (
+            45.0
+            + chunks * 55.0
+            + max(0, chunks - 1) * 45.0
+            + chars_component
+        )
 
-    estimate = base_sec + duration * per_video_sec + max(0, chunks - 1) * per_extra_chunk_sec
     if transcript_source == "groq":
-        estimate += max(60.0, duration * 0.12)
+        # By the time we can count chunks, Groq transcription has already run,
+        # but elapsed is measured from the original link. Add a small cushion so
+        # those jobs do not jump too aggressively after re-entering summary.
+        estimate += 60.0
 
-    return max(120.0, estimate)
+    return max(90.0, estimate)
 
 
 def _format_russian_hours(hours: int) -> str:
