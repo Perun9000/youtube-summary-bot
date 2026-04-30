@@ -11,11 +11,16 @@ def _parse_user_ids(raw: str) -> set[int]:
     return {int(part.strip()) for part in raw.split(",") if part.strip()}
 
 
+def _parse_user_id_list(raw: str) -> list[int]:
+    return [int(part.strip()) for part in raw.split(",") if part.strip()]
+
+
 @dataclass(frozen=True)
 class Settings:
     telegram_bot_token: str
     allowed_user_ids: set[int]
     owner_user_id: int | None
+    allowed_users_path: Path
     llm_provider: str
     llm_temperature: float
     llm_max_tokens: int
@@ -102,6 +107,15 @@ def load_settings() -> Settings:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
 
     data_dir = Path(os.getenv("BOT_DATA_DIR", "/data")).expanduser()
+    allowed_user_ids_raw = os.getenv("ALLOWED_USER_IDS", "")
+    allowed_user_ids = _parse_user_ids(allowed_user_ids_raw)
+    owner_user_id = _parse_optional_int(os.getenv("OWNER_USER_ID", ""))
+    if owner_user_id is None:
+        owner_candidates = _parse_user_id_list(allowed_user_ids_raw)
+        owner_user_id = owner_candidates[0] if owner_candidates else None
+    allowed_users_path = Path(
+        os.getenv("ALLOWED_USERS_PATH", str(data_dir / "users.json"))
+    ).expanduser()
     cookies_raw = os.getenv("YTDLP_COOKIES_PATH", "").strip()
     cookies_path = Path(cookies_raw).expanduser() if cookies_raw else None
 
@@ -206,8 +220,9 @@ def load_settings() -> Settings:
 
     return Settings(
         telegram_bot_token=token,
-        allowed_user_ids=_parse_user_ids(os.getenv("ALLOWED_USER_IDS", "")),
-        owner_user_id=_parse_optional_int(os.getenv("OWNER_USER_ID", "")),
+        allowed_user_ids=allowed_user_ids,
+        owner_user_id=owner_user_id,
+        allowed_users_path=allowed_users_path,
         llm_provider=llm_provider,
         llm_temperature=float(os.getenv("LLM_TEMPERATURE", "0.2")),
         llm_max_tokens=int(os.getenv("LLM_MAX_TOKENS", "1200")),

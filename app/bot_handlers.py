@@ -31,6 +31,7 @@ from app.qa_service import QAService
 from app.summarizer import Summarizer, SummaryProgress
 from app.telegraph_service import TelegraphService
 from app.transcript_chunker import chunk_transcript, segments_to_text
+from app.user_store import UserStore
 from app.utils import classify_youtube_url, escape_html, extract_video_id, extract_youtube_url
 from app.whisper_service import WhisperService
 from app.youtube_service import TranscriptUnavailable, YouTubeService
@@ -73,6 +74,7 @@ class SummaryJob:
 @dataclass
 class Services:
     settings: Settings
+    users: UserStore
     llm: LLMClient
     youtube: YouTubeService
     whisper: WhisperService
@@ -111,7 +113,7 @@ def build_router(services: Services) -> Router:
 
     @router.message(Command("start"))
     async def start(message: Message) -> None:
-        if not _is_allowed(message, services.settings):
+        if not _is_allowed(message, services):
             await message.answer("Этот бот закрыт для личного использования.")
             return
         await message.answer(
@@ -120,11 +122,24 @@ def build_router(services: Services) -> Router:
 
     @router.message(Command("help"))
     async def help_command(message: Message) -> None:
-        if not _is_allowed(message, services.settings):
+        if not _is_allowed(message, services):
             await message.answer("Этот бот закрыт для личного использования.")
+            return
+        if not _is_owner(message, services):
+            await message.answer(
+                "Доступные команды:\n"
+                "/start - начать работу\n"
+                "/help - помощь\n\n"
+                "Пришли ссылку на YouTube-ролик — я верну краткое summary здесь "
+                "и полный конспект в Telegra.ph. После обработки можно задавать "
+                "вопросы по ролику в этом же чате."
+            )
             return
         await message.answer(
             "Команды:\n"
+            "/users - список пользователей\n\n"
+            "/user_add 123456789 Имя - добавить пользователя\n\n"
+            "/user_remove 123456789 - удалить пользователя\n\n"
             "/reset - забыть текущий ролик\n\n"
             "/models - показать модели, доступные локальному LLM-серверу\n\n"
             "/model - показать модель, которую бот использует для summary и Q&A\n\n"
@@ -138,18 +153,87 @@ def build_router(services: Services) -> Router:
             "Контекст хранится в памяти контейнера до рестарта."
         )
 
+    @router.message(Command("users"))
+    async def users(message: Message) -> None:
+        if not _is_owner(message, services):
+            await _answer_owner_only(message, services)
+            return
+
+        user_lines = []
+        for user in services.users.list_users():
+            label = f" — {user.name}" if user.name else ""
+            marker = " (owner)" if services.users.is_owner(user.user_id) else ""
+            user_lines.append(f"- {user.user_id}{label}{marker}")
+        users_text = "\n".join(user_lines) if user_lines else "Список пуст."
+        await message.answer(
+            "Пользователи с доступом:\n"
+            f"{users_text}\n\n"
+            "Добавить: /user_add 123456789 Имя\n"
+            "Удалить: /user_remove 123456789"
+        )
+
+    @router.message(Command("user_add"))
+    async def user_add(message: Message) -> None:
+        if not _is_owner(message, services):
+            await _answer_owner_only(message, services)
+            return
+
+        parts = (message.text or "").split(maxsplit=2)
+        if len(parts) < 2:
+            await message.answer("Формат: /user_add 123456789 Имя")
+            return
+        try:
+            user_id = int(parts[1])
+        except ValueError:
+            await message.answer("Telegram user id должен быть числом.")
+            return
+
+        name = parts[2] if len(parts) > 2 else ""
+        added = services.users.add_user(user_id, name)
+        if added:
+            await message.answer(f"Пользователь {user_id} добавлен.")
+        else:
+            await message.answer(f"Пользователь {user_id} уже был в списке. Данные обновлены.")
+
+    @router.message(Command("user_remove"))
+    async def user_remove(message: Message) -> None:
+        if not _is_owner(message, services):
+            await _answer_owner_only(message, services)
+            return
+
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2:
+            await message.answer("Формат: /user_remove 123456789")
+            return
+        try:
+            user_id = int(parts[1])
+        except ValueError:
+            await message.answer("Telegram user id должен быть числом.")
+            return
+
+        try:
+            removed = services.users.remove_user(user_id)
+        except ValueError as exc:
+            await message.answer(str(exc))
+            return
+
+        if removed:
+            await message.answer(f"Пользователь {user_id} удалён.")
+        else:
+            await message.answer(f"Пользователя {user_id} нет в списке.")
+
     @router.message(Command("reset"))
     async def reset(message: Message) -> None:
-        if not _is_allowed(message, services.settings):
-            await message.answer("Этот бот закрыт для личного использования.")
+        if not _is_owner(message, services):
+            await _answer_owner_only(message, services)
             return
         services.contexts.pop(message.chat.id, None)
         await message.answer("Текущий ролик забыт.")
 
     @router.message(Command("models"))
     async def models(message: Message) -> None:
-        if not _is_allowed(message, services.settings):
-            await message.answer("Этот бот закрыт для личного использования.")
+        if not _is_owner(message, services):
+            await _answer_owner_only(message, services)
             return
 
         try:
@@ -169,8 +253,8 @@ def build_router(services: Services) -> Router:
 
     @router.message(Command("model"))
     async def model(message: Message) -> None:
-        if not _is_allowed(message, services.settings):
-            await message.answer("Этот бот закрыт для личного использования.")
+        if not _is_owner(message, services):
+            await _answer_owner_only(message, services)
             return
 
         try:
@@ -185,24 +269,24 @@ def build_router(services: Services) -> Router:
 
     @router.message(Command("queue"))
     async def queue(message: Message) -> None:
-        if not _is_allowed(message, services.settings):
-            await message.answer("Этот бот закрыт для личного использования.")
+        if not _is_owner(message, services):
+            await _answer_owner_only(message, services)
             return
 
         await message.answer(await _format_queue_status(services))
 
     @router.message(Command("stop"))
     async def stop(message: Message) -> None:
-        if not _is_allowed(message, services.settings):
-            await message.answer("Этот бот закрыт для личного использования.")
+        if not _is_owner(message, services):
+            await _answer_owner_only(message, services)
             return
 
         await _stop_summary_queue(message, services)
 
     @router.message(Command("scan_now"))
     async def scan_now(message: Message) -> None:
-        if not _is_allowed(message, services.settings):
-            await message.answer("Этот бот закрыт для личного использования.")
+        if not _is_owner(message, services):
+            await _answer_owner_only(message, services)
             return
         if services.monitoring is None:
             await message.answer(
@@ -219,8 +303,8 @@ def build_router(services: Services) -> Router:
 
     @router.message(Command("llm_mode"))
     async def llm_mode(message: Message) -> None:
-        if not _is_allowed(message, services.settings):
-            await message.answer("Этот бот закрыт для личного использования.")
+        if not _is_owner(message, services):
+            await _answer_owner_only(message, services)
             return
         await message.answer(_format_llm_mode_status(services))
 
@@ -231,8 +315,8 @@ def build_router(services: Services) -> Router:
         Off → free-chain (default).
         On → single paid model from OPENROUTER_MODEL_PAID.
         """
-        if not _is_allowed(message, services.settings):
-            await message.answer("Этот бот закрыт для личного использования.")
+        if not _is_owner(message, services):
+            await _answer_owner_only(message, services)
             return
         if not isinstance(services.llm, OpenRouterClient):
             await message.answer(
@@ -265,8 +349,8 @@ def build_router(services: Services) -> Router:
 
     @router.message(Command("scan_stop"))
     async def scan_stop(message: Message) -> None:
-        if not _is_allowed(message, services.settings):
-            await message.answer("Этот бот закрыт для личного использования.")
+        if not _is_owner(message, services):
+            await _answer_owner_only(message, services)
             return
 
         existing = services.monitoring_scan_task
@@ -279,12 +363,15 @@ def build_router(services: Services) -> Router:
 
     @router.message(F.text)
     async def text_message(message: Message) -> None:
-        if not _is_allowed(message, services.settings):
+        if not _is_allowed(message, services):
             await message.answer("Этот бот закрыт для личного использования.")
             return
 
         text = message.text or ""
         if text.strip().lower() in {"stop", "стоп"}:
+            if not _is_owner(message, services):
+                await _answer_owner_only(message, services)
+                return
             await _stop_summary_queue(message, services)
             return
 
@@ -292,6 +379,9 @@ def build_router(services: Services) -> Router:
         if url:
             kind = classify_youtube_url(url)
             if kind == "channel":
+                if not _is_owner(message, services):
+                    await message.answer("Пришли ссылку на отдельный YouTube-ролик.")
+                    return
                 await _handle_channel_url(message, url, services)
                 return
             if kind == "video":
@@ -2136,7 +2226,20 @@ def _estimate_reading_time_minutes(summary: Summary) -> int:
     return max(1, round(words / 180))
 
 
-def _is_allowed(message: Message, settings: Settings) -> bool:
-    if not settings.allowed_user_ids:
-        return True
-    return bool(message.from_user and message.from_user.id in settings.allowed_user_ids)
+async def _answer_owner_only(message: Message, services: Services) -> None:
+    if not _is_allowed(message, services):
+        await message.answer("Этот бот закрыт для личного использования.")
+        return
+    await message.answer("Эта команда доступна только владельцу бота.")
+
+
+def _is_allowed(message: Message, services: Services) -> bool:
+    return services.users.is_allowed(_message_user_id(message))
+
+
+def _is_owner(message: Message, services: Services) -> bool:
+    return services.users.is_owner(_message_user_id(message))
+
+
+def _message_user_id(message: Message) -> int | None:
+    return message.from_user.id if message.from_user else None

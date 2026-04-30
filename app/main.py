@@ -6,10 +6,16 @@ from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher
-from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeDefault, MenuButtonCommands
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+    MenuButtonCommands,
+)
 
 from app.bot_handlers import Services, build_router, enqueue_scheduled_candidate
-from app.config import load_settings
+from app.config import Settings, load_settings
 from app.groq_whisper_service import GroqWhisperService
 from app.llm_client import create_llm_client, health_check_with_reason
 from app.summary_cache import SummaryCache
@@ -20,6 +26,7 @@ from app.qa_service import QAService
 from app.scheduler_service import run_monitoring_scheduler
 from app.summarizer import Summarizer
 from app.telegraph_service import TelegraphService
+from app.user_store import UserStore
 from app.whisper_service import WhisperService
 from app.youtube_service import YouTubeService
 
@@ -27,9 +34,16 @@ from app.youtube_service import YouTubeService
 logger = logging.getLogger(__name__)
 
 
-BOT_COMMANDS: list[BotCommand] = [
+PUBLIC_BOT_COMMANDS: list[BotCommand] = [
     BotCommand(command="start", description="Начать работу"),
     BotCommand(command="help", description="Что умеет бот"),
+]
+
+OWNER_BOT_COMMANDS: list[BotCommand] = [
+    *PUBLIC_BOT_COMMANDS,
+    BotCommand(command="users", description="Список пользователей"),
+    BotCommand(command="user_add", description="Добавить пользователя"),
+    BotCommand(command="user_remove", description="Удалить пользователя"),
     BotCommand(command="reset", description="Забыть текущий ролик"),
     BotCommand(command="models", description="Доступные LLM-модели"),
     BotCommand(command="model", description="Текущая модель бота"),
@@ -47,9 +61,14 @@ LOG_FILE_ROTATION_DAYS = 7
 LOG_FILE_BACKUP_COUNT = 8
 
 
-async def configure_bot_commands(bot: Bot) -> None:
-    await bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeDefault())
-    await bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllPrivateChats())
+async def configure_bot_commands(bot: Bot, settings: Settings) -> None:
+    await bot.set_my_commands(PUBLIC_BOT_COMMANDS, scope=BotCommandScopeDefault())
+    await bot.set_my_commands(PUBLIC_BOT_COMMANDS, scope=BotCommandScopeAllPrivateChats())
+    if settings.owner_user_id is not None:
+        await bot.set_my_commands(
+            OWNER_BOT_COMMANDS,
+            scope=BotCommandScopeChat(chat_id=settings.owner_user_id),
+        )
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
 
@@ -105,9 +124,21 @@ async def main() -> None:
         summary_cache.size(),
         settings.summary_cache_ttl_days,
     )
+    user_store = UserStore(
+        settings.allowed_users_path,
+        seed_user_ids=settings.allowed_user_ids,
+        owner_user_id=settings.owner_user_id,
+    )
+    logger.info(
+        "users.boot path=%s count=%s owner_user_id=%s",
+        settings.allowed_users_path,
+        len(user_store.list_users()),
+        settings.owner_user_id,
+    )
 
     services = Services(
         settings=settings,
+        users=user_store,
         llm=llm,
         youtube=YouTubeService(settings),
         whisper=WhisperService(settings),
@@ -172,7 +203,7 @@ async def main() -> None:
     else:
         logger.info("monitoring.boot enabled=false")
 
-    await configure_bot_commands(bot)
+    await configure_bot_commands(bot, settings)
     dispatcher = Dispatcher()
     dispatcher.include_router(build_router(services))
     try:
