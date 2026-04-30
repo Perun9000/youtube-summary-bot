@@ -230,7 +230,7 @@ class SummaryProgress:
     def status_text(self) -> str:
         if self.total_steps <= 0:
             return ""
-        return f"Прогресс: ~{self.percent()}%"
+        return f"Этап summary: {self.current_step} ({self.completed_steps}/{self.total_steps})"
 
     def percent(self) -> int:
         if self.total_steps <= 0:

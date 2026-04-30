@@ -59,6 +59,8 @@ class SummaryJob:
     url: str
     enqueued_at: float
     chat_id: int
+    video_duration_sec: float | None = None
+    progress_estimate_sec: float | None = None
     title_hint: str | None = None
     scheduled: bool = False
     disable_notification: bool = False
@@ -1159,6 +1161,15 @@ def _forget_service_status(services: Services, chat_id: int) -> None:
     services.summary_status_disable_previews.pop(chat_id, None)
 
 
+async def _delete_service_status(services: Services, chat_id: int) -> None:
+    message = services.summary_status_messages.pop(chat_id, None)
+    services.summary_status_base_texts.pop(chat_id, None)
+    services.summary_status_parse_modes.pop(chat_id, None)
+    services.summary_status_disable_previews.pop(chat_id, None)
+    if message is not None:
+        await _delete_message_safely(message)
+
+
 async def _render_service_status(
     text: str,
     services: Services,
@@ -1345,6 +1356,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
     video_id = "unknown"
     transcript_source = "unknown"
     title = url
+    transcript_publish_task: asyncio.Task[str | None] | None = None
 
     # Cache check at the very top — covers scheduled jobs + race-conditions
     # where the same video was queued twice in quick succession.
@@ -1391,6 +1403,13 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             )
         video_id = metadata.video_id
         title = metadata.title
+        job.video_duration_sec = metadata.duration_sec or None
+        job.progress_estimate_sec = _estimate_job_total_seconds(
+            video_duration_sec=job.video_duration_sec,
+            chunks_count=None,
+            transcript_source=None,
+            llm_provider=services.settings.llm_provider,
+        )
 
         if job.pre_fetched_segments is not None:
             segments = list(job.pre_fetched_segments)
@@ -1481,6 +1500,12 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
         active_model = await services.llm.active_model()
         chunk_size = services.settings.effective_chunk_max_chars(active_model=active_model)
         chunks = chunk_transcript(transcript_text, max_chars=chunk_size)
+        job.progress_estimate_sec = _estimate_job_total_seconds(
+            video_duration_sec=job.video_duration_sec,
+            chunks_count=len(chunks),
+            transcript_source=transcript_source,
+            llm_provider=services.settings.llm_provider,
+        )
         logger.info(
             "job.chunking.done job_id=%s transcript_chars=%s chunks=%s max_chars=%s "
             "provider=%s active_model=%s",
@@ -1510,27 +1535,17 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
 
         transcript_url: str | None = None
         if segments:
-            try:
-                await _set_service_status(services, message, "Публикую транскрипт в Telegra.ph...", job=job)
-                transcript_url = await _run_with_telegram_status(
+            transcript_publish_task = asyncio.create_task(
+                _publish_transcript_background(
                     services=services,
-                    source_message=message,
-                    operation=services.telegraph.publish_transcript(
-                        title=title,
-                        video_url=url,
-                        video_id=video_id,
-                        segments=segments,
-                        source=transcript_source,
-                    ),
-                    base_text="Публикую транскрипт в Telegra.ph...",
-                    job=job,
+                    job_id=job_id,
+                    title=title,
+                    video_url=url,
+                    video_id=video_id,
+                    segments=list(segments),
+                    source=transcript_source,
                 )
-                logger.info("job.transcript.published job_id=%s url=%s", job_id, transcript_url)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("job.transcript.publish_failed job_id=%s", job_id)
-                transcript_url = None
+            )
 
         usage = GenerationUsage()
         summary_progress = SummaryProgress()
@@ -1568,6 +1583,16 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             logger.exception("job.comments.failed job_id=%s", job_id)
             top_comments = []
 
+        if transcript_publish_task is not None:
+            if not transcript_publish_task.done():
+                await _set_service_status(
+                    services,
+                    message,
+                    "Дожидаюсь публикации транскрипта в Telegra.ph...",
+                    job=job,
+                )
+            transcript_url = await transcript_publish_task
+
         await _set_service_status(services, message, "Публикую полный конспект в Telegra.ph...", job=job)
         telegraph_url = await _run_with_telegram_status(
             services=services,
@@ -1597,36 +1622,39 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             )
 
         total_duration_sec = time.monotonic() - started
+        show_service_info = _job_is_owner(job, services)
         try:
             model_name = await services.llm.active_model()
         except Exception as exc:
             logger.warning("service_info.model_lookup_failed job_id=%s error=%s", job_id, exc)
             model_name = "unknown"
-        try:
-            loaded_ctx = await services.llm.loaded_context_length()
-        except Exception as exc:
-            logger.warning("service_info.context_lookup_failed job_id=%s error=%s", job_id, exc)
-            loaded_ctx = None
+        loaded_ctx = None
+        if show_service_info:
+            try:
+                loaded_ctx = await services.llm.loaded_context_length()
+            except Exception as exc:
+                logger.warning("service_info.context_lookup_failed job_id=%s error=%s", job_id, exc)
 
-        await _set_service_status(
-            services=services,
-            source_message=message,
-            text=_format_service_info(
-                job_id=job_id,
-                model=model_name,
-                usage=usage,
-                transcript_source=transcript_source,
-                transcript_chars=len(transcript_text),
-                chunks_count=len(chunks),
-                total_duration_sec=total_duration_sec,
-                settings=services.settings,
-                loaded_context_length=loaded_ctx,
-                video_duration_sec=getattr(metadata, "duration_sec", None),
-            ),
-            job=job,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
+        if show_service_info:
+            await _set_service_status(
+                services=services,
+                source_message=message,
+                text=_format_service_info(
+                    job_id=job_id,
+                    model=model_name,
+                    usage=usage,
+                    transcript_source=transcript_source,
+                    transcript_chars=len(transcript_text),
+                    chunks_count=len(chunks),
+                    total_duration_sec=total_duration_sec,
+                    settings=services.settings,
+                    loaded_context_length=loaded_ctx,
+                    video_duration_sec=getattr(metadata, "duration_sec", None),
+                ),
+                job=job,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
 
         summary_text = _format_telegram_summary(
             title=title,
@@ -1645,7 +1673,10 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             job=job,
             text=summary_text,
         )
-        _forget_service_status(services, chat_id)
+        if show_service_info:
+            _forget_service_status(services, chat_id)
+        else:
+            await _delete_service_status(services, chat_id)
 
         # Кэшируем результат — но только для full-video. Segment-mode даёт
         # частичное саммари по конкретному эксперту, его нельзя считать
@@ -1683,6 +1714,8 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             usage.duration_sec,
         )
     except asyncio.CancelledError:
+        if transcript_publish_task is not None and not transcript_publish_task.done():
+            await _cancel_task_safely(transcript_publish_task)
         logger.info("job.cancelled job_id=%s video_id=%s duration_sec=%.1f", job_id, video_id, time.monotonic() - started)
         try:
             await _set_service_status(services, message, "Генерация summary остановлена.", job=job)
@@ -1692,6 +1725,8 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
         _forget_service_status(services, chat_id)
         raise
     except Exception as exc:
+        if transcript_publish_task is not None and not transcript_publish_task.done():
+            await _cancel_task_safely(transcript_publish_task)
         logger.exception("job.failed job_id=%s video_id=%s duration_sec=%.1f", job_id, video_id, time.monotonic() - started)
         await _set_service_status(services, message, "Генерация summary прервана.", job=job)
         await _send_summary_delivery(
@@ -1701,6 +1736,44 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
         )
         _forget_service_status(services, chat_id)
         raise
+
+
+async def _publish_transcript_background(
+    *,
+    services: Services,
+    job_id: str,
+    title: str,
+    video_url: str,
+    video_id: str,
+    segments: list[TranscriptSegment],
+    source: str,
+) -> str | None:
+    try:
+        transcript_url = await services.telegraph.publish_transcript(
+            title=title,
+            video_url=video_url,
+            video_id=video_id,
+            segments=segments,
+            source=source,
+        )
+        logger.info("job.transcript.published job_id=%s url=%s", job_id, transcript_url)
+        return transcript_url
+    except asyncio.CancelledError:
+        logger.info("job.transcript.publish_cancelled job_id=%s", job_id)
+        raise
+    except Exception:
+        logger.exception("job.transcript.publish_failed job_id=%s", job_id)
+        return None
+
+
+async def _cancel_task_safely(task: asyncio.Task) -> None:
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("background_task.cancel_failed")
 
 
 async def _run_with_telegram_status(
@@ -1714,12 +1787,18 @@ async def _run_with_telegram_status(
     status_getter: Callable[[], str] | None = None,
 ) -> T:
     task = asyncio.create_task(operation)
-    started = time.monotonic()
     try:
         while not task.done():
-            elapsed = int(time.monotonic() - started)
+            elapsed = int(time.monotonic() - job.enqueued_at)
             status_text = status_getter() if status_getter else ""
-            lines = [base_text, "", f"Прошло: {_format_elapsed(elapsed)}"]
+            lines = [
+                base_text,
+                "",
+                f"Прошло с момента ссылки: {_format_elapsed(elapsed)}",
+            ]
+            progress_text = _format_job_progress(job, elapsed)
+            if progress_text:
+                lines.append(progress_text)
             if status_text:
                 lines.extend(["", status_text])
             text = "\n".join(lines)
@@ -1744,6 +1823,51 @@ def _format_elapsed(seconds: int) -> str:
     if minutes:
         return f"{minutes} мин {secs:02d} сек"
     return f"{secs} сек"
+
+
+def _format_job_progress(job: SummaryJob, elapsed_sec: int) -> str:
+    if job.progress_estimate_sec is None or job.progress_estimate_sec <= 0:
+        return ""
+
+    raw_percent = (max(0, elapsed_sec) / job.progress_estimate_sec) * 100
+    rounded = int(round(raw_percent / 10) * 10)
+    if raw_percent >= 5 and rounded == 0:
+        rounded = 10
+    rounded = max(0, min(90, rounded))
+    return f"Прогресс: ~{rounded}% (оценка)"
+
+
+def _estimate_job_total_seconds(
+    *,
+    video_duration_sec: float | None,
+    chunks_count: int | None,
+    transcript_source: str | None,
+    llm_provider: str,
+) -> float | None:
+    if (video_duration_sec is None or video_duration_sec <= 0) and not chunks_count:
+        return None
+
+    duration = max(0.0, video_duration_sec or 0.0)
+    chunks = max(1, chunks_count or 1)
+    if duration <= 0:
+        # Fallback when metadata has no duration: one chunk is roughly a
+        # 5-10 minute speech segment with current chunk settings.
+        duration = chunks * 420.0
+
+    if llm_provider == "lmstudio":
+        base_sec = 120.0
+        per_video_sec = 0.65
+        per_extra_chunk_sec = 90.0
+    else:
+        base_sec = 90.0
+        per_video_sec = 0.28
+        per_extra_chunk_sec = 45.0
+
+    estimate = base_sec + duration * per_video_sec + max(0, chunks - 1) * per_extra_chunk_sec
+    if transcript_source == "groq":
+        estimate += max(60.0, duration * 0.12)
+
+    return max(120.0, estimate)
 
 
 def _format_russian_hours(hours: int) -> str:
@@ -2239,6 +2363,12 @@ def _is_allowed(message: Message, services: Services) -> bool:
 
 def _is_owner(message: Message, services: Services) -> bool:
     return services.users.is_owner(_message_user_id(message))
+
+
+def _job_is_owner(job: SummaryJob, services: Services) -> bool:
+    if job.message is not None and job.message.from_user is not None:
+        return services.users.is_owner(job.message.from_user.id)
+    return services.users.is_owner(job.chat_id)
 
 
 def _message_user_id(message: Message) -> int | None:
