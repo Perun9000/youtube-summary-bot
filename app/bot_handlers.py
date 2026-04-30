@@ -1865,33 +1865,15 @@ def _lookup_cached_summary(url: str, services: Services) -> CachedSummary | None
     return services.summary_cache.get(video_id)
 
 
-def _format_cache_age(created_at_unix: float) -> str:
-    seconds_ago = max(0, int(time.time() - created_at_unix))
-    if seconds_ago < 60:
-        return "только что"
-    if seconds_ago < 3600:
-        minutes = seconds_ago // 60
-        return f"{minutes} мин назад"
-    if seconds_ago < 86400:
-        hours = seconds_ago // 3600
-        return f"{hours} ч назад"
-    days = seconds_ago // 86400
-    if days == 1:
-        return "вчера"
-    if days < 30:
-        return f"{days} дн. назад"
-    months = days // 30
-    if months == 1:
-        return "месяц назад"
-    return f"{months} мес. назад"
-
-
 def _format_cached_summary_text(cached: CachedSummary) -> str:
-    """Render the same Telegram message the user got the first time, with a
-    small "this was already done" header so they understand it's cached."""
+    """Render the cached summary identically to a fresh delivery — no header
+    or "this is cached" marker. From the user's perspective, sending a link a
+    second time should feel like a normal, fast response. Cache-hits are still
+    visible in logs (``queue.cache.hit`` / ``job.cache.hit``) for diagnostics.
+    """
     summary = cached.to_summary()
     cached_comments = cached.to_top_comments()
-    body = _format_telegram_summary(
+    return _format_telegram_summary(
         title=cached.title,
         video_url=cached.url,
         summary=summary,
@@ -1900,12 +1882,6 @@ def _format_cached_summary_text(cached: CachedSummary) -> str:
         channel_url=cached.channel_url,
         top_comment=cached_comments[0] if cached_comments else None,
     )
-    note = (
-        f"📌 <i>Это видео уже было суммировано "
-        f"({escape_html(_format_cache_age(cached.created_at_unix))}). "
-        f"Вот сохранённый итог:</i>"
-    )
-    return f"{note}\n\n{body}"
 
 
 async def _send_cached_summary_to_chat(

@@ -15,6 +15,7 @@ def _parse_user_ids(raw: str) -> set[int]:
 class Settings:
     telegram_bot_token: str
     allowed_user_ids: set[int]
+    owner_user_id: int | None
     llm_provider: str
     llm_temperature: float
     llm_max_tokens: int
@@ -206,6 +207,7 @@ def load_settings() -> Settings:
     return Settings(
         telegram_bot_token=token,
         allowed_user_ids=_parse_user_ids(os.getenv("ALLOWED_USER_IDS", "")),
+        owner_user_id=_parse_optional_int(os.getenv("OWNER_USER_ID", "")),
         llm_provider=llm_provider,
         llm_temperature=float(os.getenv("LLM_TEMPERATURE", "0.2")),
         llm_max_tokens=int(os.getenv("LLM_MAX_TOKENS", "1200")),
