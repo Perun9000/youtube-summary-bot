@@ -1564,7 +1564,6 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             ),
             base_text=f"Генерирую summary через {services.llm.provider_name}...",
             job=job,
-            status_getter=summary_progress.status_text,
         )
 
         # Тащим топ-комментарии перед публикацией в Telegra.ph, чтобы они
