@@ -1794,7 +1794,7 @@ async def _run_with_telegram_status(
             lines = [
                 base_text,
                 "",
-                f"Прошло с момента ссылки: {_format_elapsed(elapsed)}",
+                f"Прошло с момента ссылки: {_format_elapsed_minutes(elapsed)}",
             ]
             progress_text = _format_job_progress(job, elapsed)
             if progress_text:
@@ -1823,6 +1823,17 @@ def _format_elapsed(seconds: int) -> str:
     if minutes:
         return f"{minutes} мин {secs:02d} сек"
     return f"{secs} сек"
+
+
+def _format_elapsed_minutes(seconds: int) -> str:
+    total_seconds = max(0, seconds)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes = remainder // 60
+    if hours:
+        return f"{hours} {_format_russian_hours(hours)} {minutes} мин"
+    if minutes:
+        return f"{minutes} мин"
+    return "меньше минуты"
 
 
 def _format_job_progress(job: SummaryJob, elapsed_sec: int) -> str:
