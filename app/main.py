@@ -55,12 +55,16 @@ OWNER_BOT_COMMANDS: list[BotCommand] = [
     BotCommand(command="scan_stop", description="Прервать мониторинговый скан"),
     BotCommand(command="llm_mode", description="LLM-провайдер: статус"),
     BotCommand(command="llm_paid", description="LLM: тоггл paid/free"),
+    BotCommand(command="stats", description="Статистика бота за 30 дней"),
 ]
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 LOG_FILE_NAME = "bot.log"
-LOG_FILE_ROTATION_DAYS = 7
-LOG_FILE_BACKUP_COUNT = 8
+# Логи ротируются ежедневно (в полночь), хранится до 30 архивов —
+# в сумме ~30 дней истории. Достаточно для месячной аналитики через /stats
+# и команду scripts/analytics.py.
+LOG_FILE_ROTATION_DAYS = 1
+LOG_FILE_BACKUP_COUNT = 30
 
 
 async def configure_bot_commands(bot: Bot, settings: Settings) -> None:

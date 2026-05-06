@@ -26,6 +26,7 @@ from aiogram.types import (
 from app.config import Settings
 from app.channel_posts_store import ChannelPost, ChannelPostsStore
 from app.groq_whisper_service import GroqWhisperService, GroqWhisperUnavailable
+from app import log_analytics
 from app.llm_client import GenerationUsage, LLMClient, OpenRouterClient, health_check_with_reason
 from app.summary_cache import CachedSummary, SummaryCache
 from app.tags_catalog import CANONICAL_FORMATS, TagsCatalog
@@ -344,6 +345,22 @@ def build_router(services: Services) -> Router:
             return
         await message.answer(_format_llm_mode_status(services))
 
+    @router.message(Command("stats"))
+    async def stats(message: Message) -> None:
+        """Owner-only: краткий отчёт по логам за последние 30 дней."""
+        if not _is_owner(message, services):
+            await _answer_owner_only(message, services)
+            return
+        # Дёргаем парсинг в отдельном thread'е — чтение 30 файлов не блокирует loop.
+        await message.answer("Считаю статистику за 30 дней...")
+        try:
+            text = await asyncio.to_thread(_compute_stats_for_telegram, services, 30)
+        except Exception as exc:
+            logger.exception("stats.failed")
+            await message.answer(f"Не удалось собрать статистику: {exc}")
+            return
+        await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+
     @router.message(Command("llm_paid"))
     async def llm_paid(message: Message) -> None:
         """Toggle OpenRouter paid mode on/off.
@@ -543,6 +560,40 @@ async def _enqueue_summary_job(message: Message, url: str, services: Services) -
 
 
 SCAN_PROGRESS_THROTTLE_SEC = 1.5
+
+
+def _compute_stats_for_telegram(services: Services, days: int) -> str:
+    """Aggregate logs + render compact HTML for /stats command.
+
+    Synchronous function — caller wraps in ``asyncio.to_thread`` because
+    reading + parsing all rotated archives can take a few hundred ms.
+    """
+    logs_dir = services.settings.bot_data_dir / "logs"
+    since = datetime.datetime.now() - datetime.timedelta(days=days)
+    events = log_analytics.iter_events(logs_dir, since=since)
+    stats = log_analytics.aggregate(events)
+
+    # Резолв chat_id → display name (через UserStore.list_users()).
+    # Кэшим один раз перед агрегацией — не бить get'ом по каждому event'у.
+    name_by_id: dict[int, str] = {}
+    try:
+        for u in services.users.list_users():
+            if u.name:
+                name_by_id[u.user_id] = u.name
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("stats.user_resolver_failed error=%s", exc)
+
+    def _name_resolver(chat_id: str) -> str | None:
+        try:
+            return name_by_id.get(int(chat_id))
+        except (TypeError, ValueError):
+            return None
+
+    return log_analytics.format_telegram(
+        stats,
+        name_resolver=_name_resolver,
+        summary_cache=services.summary_cache,
+    )
 
 
 def _format_llm_mode_status(services: Services) -> str:
