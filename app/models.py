@@ -42,11 +42,22 @@ class Chapter:
 
 
 @dataclass(frozen=True)
+class SummaryTags:
+    """Tag bundle, attached to Summary for surfacing in delivery messages."""
+
+    topic: str = ""                       # одна тема
+    speakers: tuple[str, ...] = ()        # 0..3 фамилии
+    format: str = ""                      # один из CANONICAL_FORMATS
+    channel: str = ""                     # имя канала, нормализованное
+
+
+@dataclass(frozen=True)
 class Summary:
     overview: str
     key_points: list[str]
     chapters: list[Chapter]
     raw_text: str
+    tags: SummaryTags = SummaryTags()
 
 
 @dataclass(frozen=True)

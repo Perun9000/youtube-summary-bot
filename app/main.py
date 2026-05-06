@@ -20,6 +20,7 @@ from app.groq_whisper_service import GroqWhisperService
 from app.llm_client import create_llm_client, health_check_with_reason
 from app.channel_posts_store import ChannelPostsStore
 from app.summary_cache import SummaryCache
+from app.tags_catalog import TagsCatalog
 from app.monitoring_config import MonitoringConfig
 from app.monitoring_service import MonitoringService
 from app.monitoring_state import MonitoringState
@@ -133,6 +134,16 @@ async def main() -> None:
         channel_posts.size(),
         settings.telegram_publish_channel_id,
     )
+
+    tags_catalog = TagsCatalog(settings.tags_catalog_path)
+    logger.info(
+        "tags_catalog.boot path=%s topic=%s speaker=%s format=%s channel=%s",
+        settings.tags_catalog_path,
+        len(tags_catalog.all_tags("topic")),
+        len(tags_catalog.all_tags("speaker")),
+        len(tags_catalog.all_tags("format")),
+        len(tags_catalog.all_tags("channel")),
+    )
     user_store = UserStore(
         settings.allowed_users_path,
         seed_user_ids=settings.allowed_user_ids,
@@ -178,6 +189,7 @@ async def main() -> None:
         transcription_active_job=None,
         summary_cache=summary_cache,
         channel_posts=channel_posts,
+        tags_catalog=tags_catalog,
     )
 
     scheduler_task: asyncio.Task[None] | None = None

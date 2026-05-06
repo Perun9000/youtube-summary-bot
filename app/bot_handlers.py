@@ -6,6 +6,7 @@ import datetime
 import time
 import uuid
 from collections.abc import Callable
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, TypeVar
@@ -27,7 +28,8 @@ from app.channel_posts_store import ChannelPost, ChannelPostsStore
 from app.groq_whisper_service import GroqWhisperService, GroqWhisperUnavailable
 from app.llm_client import GenerationUsage, LLMClient, OpenRouterClient, health_check_with_reason
 from app.summary_cache import CachedSummary, SummaryCache
-from app.models import Summary, TranscriptSegment, VideoComment, VideoContext, VideoMetadata
+from app.tags_catalog import CANONICAL_FORMATS, TagsCatalog
+from app.models import Summary, SummaryTags, TranscriptSegment, VideoComment, VideoContext, VideoMetadata
 from app.monitoring_service import (
     MonitoringService,
     ScanProgress,
@@ -117,6 +119,7 @@ class Services:
     transcription_active_job: SummaryJob | None = None
     summary_cache: "SummaryCache | None" = None
     channel_posts: "ChannelPostsStore | None" = None
+    tags_catalog: "TagsCatalog | None" = None
     # Двухшаговые админ-команды («введи /user_add — бот спросит — ты отвечаешь
     # данными в следующем сообщении»). Ключ — chat_id, значение —
     # PendingAdminInput. Не персистится: после рестарта диалог теряется,
@@ -1626,6 +1629,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
         usage = GenerationUsage()
         summary_progress = SummaryProgress()
         context_hint = _build_context_hint(job)
+        topic_hint, speaker_hint = _build_tags_hints(services)
         await _set_service_status(services, message, f"Генерирую summary через {services.llm.provider_name}...", job=job)
         summary = await _run_with_telegram_status(
             services=services,
@@ -1637,9 +1641,23 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                 progress=summary_progress,
                 usage=usage,
                 context_hint=context_hint,
+                topic_hint=topic_hint,
+                speaker_hint=speaker_hint,
             ),
             base_text=f"Генерирую summary через {services.llm.provider_name}...",
             job=job,
+        )
+
+        # Нормализуем теги через TagsCatalog (fuzzy match на каталог) и
+        # добавляем тег канала из metadata. Если каталога нет — оставляем
+        # как пришло от LLM. Получаем frozen Summary с готовыми тегами.
+        summary = dataclasses.replace(
+            summary,
+            tags=_resolve_summary_tags(
+                raw_tags=summary.tags,
+                channel_name=getattr(metadata, "channel_name", "") or "",
+                services=services,
+            ),
         )
 
         if not comments_task.done():
@@ -2068,6 +2086,10 @@ def _format_telegram_summary(
         blocks.append(segment_line)
     blocks.extend([overview_line, telegraph_line, reading_line])
 
+    tags_line = _format_tags_line(summary.tags)
+    if tags_line:
+        blocks.append(tags_line)
+
     if top_comment is not None:
         base_text = "\n\n".join(blocks)
         separator_len = 2 if base_text else 0
@@ -2077,6 +2099,100 @@ def _format_telegram_summary(
             blocks.append(top_comment_line)
 
     return _fit_telegram_message("\n\n".join(blocks))
+
+
+def _format_tags_line(tags: SummaryTags) -> str:
+    """Render tags as a single Telegram line: ``🏷 #тема #Спикер #формат #Канал``.
+
+    Empty / None tags просто пропускаются. Если ни одного тега нет — пустая
+    строка, чтобы caller её не добавлял в blocks.
+    """
+    parts: list[str] = []
+    if tags.topic:
+        parts.append(f"#{tags.topic}")
+    for sp in tags.speakers:
+        if sp:
+            parts.append(f"#{sp}")
+    if tags.format:
+        parts.append(f"#{tags.format}")
+    if tags.channel:
+        parts.append(f"#{tags.channel}")
+    if not parts:
+        return ""
+    # Tags as plain text — Telegram сам делает их кликабельными.
+    return "🏷 " + " ".join(parts)
+
+
+def _build_tags_hints(services: Services) -> tuple[str, str]:
+    """Build prompt hints for the LLM: existing tags it can reuse.
+
+    Returns ``(topic_hint, speaker_hint)``, formatted as inline strings ready
+    to interpolate into the JSON-schema prompt.
+    """
+    catalog = services.tags_catalog
+    if catalog is None:
+        return ("", "")
+    topics = catalog.all_tags("topic")
+    speakers = catalog.all_tags("speaker")
+    topic_hint = ""
+    speaker_hint = ""
+    if topics:
+        # Берём не больше 30 — длиннее раздувает промпт без пользы.
+        sample = ", ".join(topics[:30])
+        topic_hint = f" Уже использованные темы (предпочти их, если подходят): {sample}."
+    if speakers:
+        sample = ", ".join(speakers[:30])
+        speaker_hint = f" Уже использованные фамилии (предпочти их, если подходят): {sample}."
+    return (topic_hint, speaker_hint)
+
+
+def _resolve_summary_tags(
+    *,
+    raw_tags: SummaryTags,
+    channel_name: str,
+    services: Services,
+) -> SummaryTags:
+    """Take raw LLM tags + channel from metadata, produce canonical SummaryTags.
+
+    Logic:
+      - topic: lookup_or_add → canonical existing or new in catalog
+      - speakers: same, до 3 штук
+      - format: lookup_or_add (closed-set, fallback to 'новости')
+      - channel: lookup_or_add из metadata (LLM не отдаёт его)
+    Catalog отсутствует → возвращаем raw_tags как есть.
+    """
+    catalog = services.tags_catalog
+    if catalog is None:
+        # Без каталога просто возвращаем то, что пришло, плюс канал.
+        channel_tag = _normalize_channel_simple(channel_name)
+        return dataclasses.replace(raw_tags, channel=channel_tag)
+
+    topic = catalog.lookup_or_add("topic", raw_tags.topic) or ""
+    canonical_speakers: list[str] = []
+    seen: set[str] = set()
+    for sp in raw_tags.speakers[:3]:
+        canon = catalog.lookup_or_add("speaker", sp)
+        if canon and canon not in seen:
+            seen.add(canon)
+            canonical_speakers.append(canon)
+    fmt = catalog.lookup_or_add("format", raw_tags.format) or ""
+    channel = catalog.lookup_or_add("channel", channel_name) or ""
+
+    return SummaryTags(
+        topic=topic,
+        speakers=tuple(canonical_speakers),
+        format=fmt,
+        channel=channel,
+    )
+
+
+def _normalize_channel_simple(channel_name: str) -> str:
+    """Fallback нормализация имени канала, если каталога нет."""
+    s = (channel_name or "").strip()
+    if not s:
+        return ""
+    s = "_".join(s.split())
+    return s[:1].upper() + s[1:]
 
 
 def _format_top_comment_line(top_comment: VideoComment, available_chars: int) -> str:
@@ -2471,10 +2587,14 @@ def _format_channel_post_caption(
         f'📰 <a href="{escape_html(cached.telegraph_url)}">Полный конспект</a>'
     )
 
+    tags_line = _format_tags_line(cached.tags_obj())
+
     # Реализуем «бюджет» по блокам и подгоняем overview под лимит.
     base_parts = [p for p in (channel_line, title_line) if p]
     base_text = "\n".join(base_parts)
     used = len(base_text) + 2 + len(telegraph_line) + 2  # +separators
+    if tags_line:
+        used += len(tags_line) + 2
 
     # Overview — берём столько, сколько помещается, оставляя запас на топ-коммент.
     top_comment_block = ""
@@ -2490,6 +2610,8 @@ def _format_channel_post_caption(
     if overview_block:
         parts.append(overview_block)
     parts.append(telegraph_line)
+    if tags_line:
+        parts.append(tags_line)
     if top_comment_block:
         parts.append(top_comment_block)
 
@@ -2818,6 +2940,10 @@ def _save_summary_to_cache(
             }
             for c in (top_comments or [])
         ],
+        tag_topic=summary.tags.topic,
+        tag_speakers=list(summary.tags.speakers),
+        tag_format=summary.tags.format,
+        tag_channel=summary.tags.channel,
     )
     services.summary_cache.put(entry)
 

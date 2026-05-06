@@ -28,7 +28,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from app.models import Chapter, Summary, VideoComment
+from app.models import Chapter, Summary, SummaryTags, VideoComment
 
 
 logger = logging.getLogger(__name__)
@@ -62,6 +62,12 @@ class CachedSummary:
     # of plain dicts so JSON-serialization is straightforward; reconstruct via
     # ``to_top_comments()`` when rendering.
     top_comments: list[dict] = field(default_factory=list)
+    # Hashtag bundle from canonicalized SummaryTags. Stored flat so JSON
+    # round-trip is trivial; reconstruct via ``tags_obj()``.
+    tag_topic: str = ""
+    tag_speakers: list[str] = field(default_factory=list)
+    tag_format: str = ""
+    tag_channel: str = ""
 
     def to_summary(self) -> Summary:
         """Reconstruct the in-memory Summary dataclass for downstream code."""
@@ -78,6 +84,16 @@ class CachedSummary:
                 if isinstance(ch, dict)
             ],
             raw_text=self.summary_raw_text,
+            tags=self.tags_obj(),
+        )
+
+    def tags_obj(self) -> SummaryTags:
+        """Reconstruct the SummaryTags dataclass from stored flat fields."""
+        return SummaryTags(
+            topic=self.tag_topic,
+            speakers=tuple(s for s in self.tag_speakers if s),
+            format=self.tag_format,
+            channel=self.tag_channel,
         )
 
     def to_top_comments(self) -> list[VideoComment]:
