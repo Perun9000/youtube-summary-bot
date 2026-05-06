@@ -65,6 +65,8 @@ class Settings:
     monitoring_llm_retry_interval_sec: int
     summary_cache_path: Path
     summary_cache_ttl_days: int
+    telegram_publish_channel_id: int | None
+    channel_posts_path: Path
 
     def effective_chunk_max_chars(self, active_model: str | None = None) -> int:
         """Pick the chunk size that best fits the LLM that will actually run.
@@ -132,6 +134,12 @@ def load_settings() -> Settings:
         os.getenv("SUMMARY_CACHE_PATH", str(data_dir / "summary_cache.json"))
     ).expanduser()
     summary_cache_ttl_days = int(os.getenv("SUMMARY_CACHE_TTL_DAYS", "100"))
+    telegram_publish_channel_id = _parse_optional_int(
+        os.getenv("TELEGRAM_PUBLISH_CHANNEL_ID", "")
+    )
+    channel_posts_path = Path(
+        os.getenv("CHANNEL_POSTS_PATH", str(data_dir / "channel_posts.json"))
+    ).expanduser()
 
     llm_provider = os.getenv("LLM_PROVIDER", "lmstudio").strip().lower() or "lmstudio"
     if llm_provider not in {"lmstudio", "openrouter"}:
@@ -275,4 +283,6 @@ def load_settings() -> Settings:
         monitoring_llm_retry_interval_sec=monitoring_llm_retry_interval_sec,
         summary_cache_path=summary_cache_path,
         summary_cache_ttl_days=summary_cache_ttl_days,
+        telegram_publish_channel_id=telegram_publish_channel_id,
+        channel_posts_path=channel_posts_path,
     )

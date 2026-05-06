@@ -151,9 +151,24 @@ class YouTubeService:
                 {
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": "mp3",
-                    "preferredquality": "64",
+                    # 32 kbps mono — sweet spot для разговорного контента:
+                    #  - voice intelligible на любом устройстве,
+                    #  - ~14 МБ/час (4-часовой марафон ≈ 56 МБ),
+                    #  - почти всегда умещается в 50 МБ Telegram-лимит
+                    #    без дополнительной перекомпрессии,
+                    #  - Whisper всё равно ресамплит к 16 kHz mono, так что
+                    #    более высокий битрейт для ASR избыточен.
+                    "preferredquality": "32",
                 }
             ],
+            # Принудительный mono на этапе перекодирования. YouTube часто
+            # отдаёт стерео-дорожку, где обе колонки идентичны (записанная
+            # речь), либо стереофонию, ничего не дающую разговорному ролику.
+            # Mono = тот же битрейт расходуется на одну дорожку → лучше
+            # звучит per канал, размер не растёт.
+            "postprocessor_args": {
+                "ffmpegextractaudio": ["-ac", "1"],
+            },
             "quiet": True,
             "no_warnings": True,
             "noprogress": True,

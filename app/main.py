@@ -18,6 +18,7 @@ from app.bot_handlers import Services, build_router, enqueue_scheduled_candidate
 from app.config import Settings, load_settings
 from app.groq_whisper_service import GroqWhisperService
 from app.llm_client import create_llm_client, health_check_with_reason
+from app.channel_posts_store import ChannelPostsStore
 from app.summary_cache import SummaryCache
 from app.monitoring_config import MonitoringConfig
 from app.monitoring_service import MonitoringService
@@ -124,6 +125,14 @@ async def main() -> None:
         summary_cache.size(),
         settings.summary_cache_ttl_days,
     )
+
+    channel_posts = ChannelPostsStore(settings.channel_posts_path)
+    logger.info(
+        "channel_posts.boot path=%s entries=%s publish_channel_id=%s",
+        settings.channel_posts_path,
+        channel_posts.size(),
+        settings.telegram_publish_channel_id,
+    )
     user_store = UserStore(
         settings.allowed_users_path,
         seed_user_ids=settings.allowed_user_ids,
@@ -168,6 +177,7 @@ async def main() -> None:
         transcription_worker_task=None,
         transcription_active_job=None,
         summary_cache=summary_cache,
+        channel_posts=channel_posts,
     )
 
     scheduler_task: asyncio.Task[None] | None = None

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from pathlib import Path
 
 import httpx
 
@@ -24,7 +25,18 @@ TRANSCRIPT_PAGE_JSON_BUDGET_BYTES = 60000
 class TelegraphService:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._access_token = settings.telegraph_access_token
+        # Token resolution priority (high → low):
+        #   1. Explicit env var ``TELEGRAPH_ACCESS_TOKEN`` (settings.telegraph_access_token).
+        #   2. ``data/telegraph_token.txt`` — persisted across container restarts;
+        #      this is what a freshly-created account gets stored as so that
+        #      ``editPage`` can target pages we created in previous sessions.
+        #   3. Auto-created on first publish() call (and saved to (2)).
+        self._access_token: str | None = settings.telegraph_access_token
+        if not self._access_token:
+            self._access_token = _load_persisted_token(self._token_file_path())
+
+    def _token_file_path(self) -> Path:
+        return self._settings.bot_data_dir / "telegraph_token.txt"
 
     async def publish(
         self,
@@ -66,6 +78,61 @@ class TelegraphService:
                 raise RuntimeError(data.get("error", "Telegra.ph createPage failed"))
             page_url = str(data["result"]["url"])
             logger.info("telegraph.publish.done duration_sec=%.1f url=%s", time.monotonic() - started, page_url)
+            return page_url
+
+    async def edit(
+        self,
+        page_url_or_path: str,
+        *,
+        title: str,
+        video_url: str,
+        summary: Summary,
+        transcript_url: str | None = None,
+        top_comments: list[VideoComment] | None = None,
+    ) -> str:
+        """Re-publish an existing summary page with updated content.
+
+        Used when serving a cached summary and we want to refresh the
+        "Топ-комментарии" section with current YouTube state. Returns the
+        same URL the page already has — Telegra.ph keeps the path stable.
+
+        Caveat: ``editPage`` works **only with the same access_token that
+        created the page**. Pages published by previous bot incarnations (with
+        a now-lost token) cannot be edited; the API will return
+        ``PAGE_ACCESS_DENIED`` in that case.
+        """
+        if not self._access_token:
+            self._access_token = await self._create_account()
+        page_path = _extract_telegraph_path(page_url_or_path)
+        started = time.monotonic()
+        logger.info(
+            "telegraph.edit.start path=%s comments=%s",
+            page_path, len(top_comments) if top_comments else 0,
+        )
+        content = _summary_to_nodes(
+            video_url, summary, transcript_url=transcript_url, top_comments=top_comments,
+        )
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                "https://api.telegra.ph/editPage",
+                data={
+                    "access_token": self._access_token,
+                    "path": page_path,
+                    "title": title[:255] or "YouTube summary",
+                    "author_name": self._settings.telegraph_author_name,
+                    "content": json.dumps(content, ensure_ascii=False),
+                    "return_content": "false",
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+            if not data.get("ok"):
+                raise RuntimeError(data.get("error", "Telegra.ph editPage failed"))
+            page_url = str(data["result"]["url"])
+            logger.info(
+                "telegraph.edit.done duration_sec=%.1f url=%s",
+                time.monotonic() - started, page_url,
+            )
             return page_url
 
     async def publish_transcript(
@@ -136,8 +203,11 @@ class TelegraphService:
             data = response.json()
             if not data.get("ok"):
                 raise RuntimeError(data.get("error", "Telegra.ph createAccount failed"))
-            logger.info("telegraph.account.create.done")
-            return str(data["result"]["access_token"])
+            token = str(data["result"]["access_token"])
+            # Persist so subsequent restarts can keep editing pages we created.
+            _persist_token(self._token_file_path(), token)
+            logger.info("telegraph.account.create.done token_persisted=true")
+            return token
 
 
 def _summary_to_nodes(
@@ -178,7 +248,8 @@ def _summary_to_nodes(
         for c in top_comments:
             # Header line with author + like count + pinned marker
             pinned = "📌 " if c.is_pinned else ""
-            header_text = f"{pinned}{c.author} · ❤ {c.like_count}".strip()
+            likes = _compact_count(c.like_count)
+            header_text = f"{pinned}{c.author} · ❤ {likes}".strip()
             nodes.append(
                 {"tag": "p", "children": [{"tag": "b", "children": [header_text]}]}
             )
@@ -187,6 +258,56 @@ def _summary_to_nodes(
             nodes.append({"tag": "blockquote", "children": [c.text]})
 
     return nodes
+
+
+def _load_persisted_token(path: Path) -> str | None:
+    """Load a Telegraph access_token saved in a previous run, or return None."""
+    try:
+        if path.exists():
+            token = path.read_text(encoding="utf-8").strip()
+            if token:
+                logger.info("telegraph.token.loaded path=%s", path)
+                return token
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("telegraph.token.load_failed path=%s error=%s", path, exc)
+    return None
+
+
+def _persist_token(path: Path, token: str) -> None:
+    """Save Telegraph access_token to disk (atomically). Best-effort, never raises."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(token, encoding="utf-8")
+        tmp.replace(path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("telegraph.token.save_failed path=%s error=%s", path, exc)
+
+
+def _extract_telegraph_path(page_url_or_path: str) -> str:
+    """Take last segment of telegra.ph URL or return path as-is.
+
+    Examples:
+        https://telegra.ph/Some-Title-04-26  → 'Some-Title-04-26'
+        Some-Title-04-26                     → 'Some-Title-04-26'
+    """
+    s = (page_url_or_path or "").strip().rstrip("/")
+    if "/" in s:
+        return s.rsplit("/", 1)[-1]
+    return s
+
+
+def _compact_count(count: int) -> str:
+    """Inline copy of bot_handlers._format_compact_count to avoid circular import."""
+    if count < 1000:
+        return str(count)
+    if count < 1_000_000:
+        if count < 10_000:
+            value = round(count / 1000, 1)
+            return f"{value:g}к"
+        return f"{count // 1000}к"
+    value = round(count / 1_000_000, 1)
+    return f"{value:g}м"
 
 
 def _transcript_to_nodes(

@@ -6,16 +6,24 @@ import datetime
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, TypeVar
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from app.config import Settings
+from app.channel_posts_store import ChannelPost, ChannelPostsStore
 from app.groq_whisper_service import GroqWhisperService, GroqWhisperUnavailable
 from app.llm_client import GenerationUsage, LLMClient, OpenRouterClient, health_check_with_reason
 from app.summary_cache import CachedSummary, SummaryCache
@@ -108,6 +116,23 @@ class Services:
     transcription_worker_task: asyncio.Task[None] | None = None
     transcription_active_job: SummaryJob | None = None
     summary_cache: "SummaryCache | None" = None
+    channel_posts: "ChannelPostsStore | None" = None
+    # Двухшаговые админ-команды («введи /user_add — бот спросит — ты отвечаешь
+    # данными в следующем сообщении»). Ключ — chat_id, значение —
+    # PendingAdminInput. Не персистится: после рестарта диалог теряется,
+    # пользователь просто начнёт заново.
+    pending_admin_inputs: dict[int, "PendingAdminInput"] = field(default_factory=dict)
+
+
+@dataclass
+class PendingAdminInput:
+    """Что бот ждёт от owner-а в следующем текстовом сообщении."""
+
+    action: str          # 'user_add' / 'user_remove'
+    started_at: float    # time.time(), для тайм-аута
+
+
+PENDING_ADMIN_TIMEOUT_SEC = 300  # 5 минут — за пределом окна сбрасываем
 
 
 def build_router(services: Services) -> Router:
@@ -140,8 +165,9 @@ def build_router(services: Services) -> Router:
         await message.answer(
             "Команды:\n"
             "/users - список пользователей\n\n"
-            "/user_add 123456789 Имя - добавить пользователя\n\n"
-            "/user_remove 123456789 - удалить пользователя\n\n"
+            "/user_add - добавить пользователя (бот спросит id и имя)\n\n"
+            "/user_remove - удалить пользователя (бот спросит id)\n\n"
+            "/cancel - отменить начатый диалог (например, /user_add)\n\n"
             "/reset - забыть текущий ролик\n\n"
             "/models - показать модели, доступные локальному LLM-серверу\n\n"
             "/model - показать модель, которую бот использует для summary и Q&A\n\n"
@@ -180,22 +206,23 @@ def build_router(services: Services) -> Router:
             await _answer_owner_only(message, services)
             return
 
-        parts = (message.text or "").split(maxsplit=2)
-        if len(parts) < 2:
-            await message.answer("Формат: /user_add 123456789 Имя")
+        # "/user_add 123 Имя" → сразу применяем.
+        # "/user_add" без аргументов → запоминаем pending state и просим ввод
+        # отдельным сообщением.
+        parts = (message.text or "").split(maxsplit=1)
+        raw_args = parts[1] if len(parts) > 1 else ""
+        if not raw_args.strip():
+            services.pending_admin_inputs[message.chat.id] = PendingAdminInput(
+                action="user_add", started_at=time.time(),
+            )
+            await message.answer(
+                "Введи Telegram-id и имя одной строкой — например:\n"
+                "<code>123456789 Иван</code>\n\n"
+                "Или /cancel чтобы отменить.",
+                parse_mode="HTML",
+            )
             return
-        try:
-            user_id = int(parts[1])
-        except ValueError:
-            await message.answer("Telegram user id должен быть числом.")
-            return
-
-        name = parts[2] if len(parts) > 2 else ""
-        added = services.users.add_user(user_id, name)
-        if added:
-            await message.answer(f"Пользователь {user_id} добавлен.")
-        else:
-            await message.answer(f"Пользователь {user_id} уже был в списке. Данные обновлены.")
+        await _apply_user_add(message, raw_args, services)
 
     @router.message(Command("user_remove"))
     async def user_remove(message: Message) -> None:
@@ -204,25 +231,29 @@ def build_router(services: Services) -> Router:
             return
 
         parts = (message.text or "").split(maxsplit=1)
-        if len(parts) < 2:
-            await message.answer("Формат: /user_remove 123456789")
+        raw_args = parts[1] if len(parts) > 1 else ""
+        if not raw_args.strip():
+            services.pending_admin_inputs[message.chat.id] = PendingAdminInput(
+                action="user_remove", started_at=time.time(),
+            )
+            await message.answer(
+                "Введи Telegram-id пользователя для удаления — например:\n"
+                "<code>123456789</code>\n\n"
+                "Или /cancel чтобы отменить.",
+                parse_mode="HTML",
+            )
             return
-        try:
-            user_id = int(parts[1])
-        except ValueError:
-            await message.answer("Telegram user id должен быть числом.")
-            return
+        await _apply_user_remove(message, raw_args, services)
 
-        try:
-            removed = services.users.remove_user(user_id)
-        except ValueError as exc:
-            await message.answer(str(exc))
+    @router.message(Command("cancel"))
+    async def cancel(message: Message) -> None:
+        if not _is_owner(message, services):
+            await _answer_owner_only(message, services)
             return
-
-        if removed:
-            await message.answer(f"Пользователь {user_id} удалён.")
+        if services.pending_admin_inputs.pop(message.chat.id, None) is not None:
+            await message.answer("Окей, отменил. Никаких действий не сделано.")
         else:
-            await message.answer(f"Пользователя {user_id} нет в списке.")
+            await message.answer("Сейчас нет активного диалога.")
 
     @router.message(Command("reset"))
     async def reset(message: Message) -> None:
@@ -363,10 +394,48 @@ def build_router(services: Services) -> Router:
         existing.cancel()
         await message.answer("Отменяю текущий скан...")
 
+    @router.callback_query(F.data.startswith("publish:"))
+    async def publish_to_channel_callback(callback: CallbackQuery) -> None:
+        if not services.users.is_owner(callback.from_user.id if callback.from_user else None):
+            await callback.answer("Эта кнопка доступна только владельцу.", show_alert=True)
+            return
+        if services.settings.telegram_publish_channel_id is None:
+            await callback.answer(
+                "Канал не настроен. Добавь TELEGRAM_PUBLISH_CHANNEL_ID в .env и пересоздай контейнер.",
+                show_alert=True,
+            )
+            return
+        video_id = (callback.data or "").removeprefix("publish:").strip()
+        if not video_id:
+            await callback.answer("Неверный callback_data — нет video_id.", show_alert=True)
+            return
+        # Подтверждаем нажатие сразу — иначе у Telegram спиннер крутится 30 сек.
+        await callback.answer("Публикую в канал...")
+        asyncio.create_task(_publish_to_channel(callback, video_id, services))
+
     @router.message(F.text)
     async def text_message(message: Message) -> None:
         if not _is_allowed(message, services):
             await message.answer("Этот бот закрыт для личного использования.")
+            return
+
+        # Если в этот чат недавно ввели команду без аргументов («/user_add»,
+        # «/user_remove»), мы запомнили action — следующий же текст owner'а
+        # принимаем как параметры команды.
+        pending = services.pending_admin_inputs.get(message.chat.id)
+        if pending is not None and _is_owner(message, services):
+            if time.time() - pending.started_at > PENDING_ADMIN_TIMEOUT_SEC:
+                services.pending_admin_inputs.pop(message.chat.id, None)
+                await message.answer(
+                    "Прошлый диалог уже устарел (5 мин таймаут). Запусти команду заново."
+                )
+                return
+            services.pending_admin_inputs.pop(message.chat.id, None)
+            raw = (message.text or "").strip()
+            if pending.action == "user_add":
+                await _apply_user_add(message, raw, services)
+            elif pending.action == "user_remove":
+                await _apply_user_remove(message, raw, services)
             return
 
         text = message.text or ""
@@ -1533,6 +1602,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             logger.warning("job.transcript.save_failed job_id=%s error=%s", job_id, exc)
 
         transcript_url: str | None = None
+        transcript_publish_task: asyncio.Task[str | None] | None = None
         if segments:
             transcript_publish_task = asyncio.create_task(
                 _publish_transcript_background(
@@ -1545,6 +1615,13 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                     source=transcript_source,
                 )
             )
+
+        # Тянем топ-комментарии параллельно с генерацией саммари. yt-dlp на
+        # comments-extractor'е тратит 5–15 секунд, и если запускать после LLM,
+        # это всё уходит в общий duration. Параллельный запуск экономит ровно
+        # это время — к моменту, когда саммари готов, комменты обычно уже на
+        # руках. Failure-mode тот же: ошибка/отключённые → пустой список.
+        comments_task = asyncio.create_task(_fetch_top_comments_background(services, url, job_id))
 
         usage = GenerationUsage()
         summary_progress = SummaryProgress()
@@ -1565,20 +1642,14 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             job=job,
         )
 
-        # Тащим топ-комментарии перед публикацией в Telegra.ph, чтобы они
-        # сразу попали в страницу одним вызовом createPage. Кейс «комментарии
-        # отключены» / yt-dlp упал на comments-extractor'е обрабатывается тихо:
-        # fetch_top_comments возвращает пустой список, summary отдаётся без
-        # секции комментариев.
-        await _set_service_status(services, message, "Тащу топ-комментарии...", job=job)
-        try:
-            top_comments = await asyncio.to_thread(services.youtube.fetch_top_comments, url)
-            logger.info(
-                "job.comments.done job_id=%s count=%s",
-                job_id, len(top_comments),
+        if not comments_task.done():
+            await _set_service_status(
+                services, message, "Дожидаюсь топ-комментариев...", job=job
             )
+        try:
+            top_comments = await comments_task
         except Exception:
-            logger.exception("job.comments.failed job_id=%s", job_id)
+            logger.exception("job.comments.await_failed job_id=%s", job_id)
             top_comments = []
 
         if transcript_publish_task is not None:
@@ -1670,6 +1741,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             services=services,
             job=job,
             text=summary_text,
+            video_id=video_id,
         )
         if show_service_info:
             _forget_service_status(services, chat_id)
@@ -1762,6 +1834,28 @@ async def _publish_transcript_background(
     except Exception:
         logger.exception("job.transcript.publish_failed job_id=%s", job_id)
         return None
+
+
+async def _fetch_top_comments_background(
+    services: Services,
+    url: str,
+    job_id: str,
+) -> list[VideoComment]:
+    """Background-friendly wrapper around YouTubeService.fetch_top_comments.
+
+    Same failure semantics as the inline version: log + return empty list,
+    so that parallel summary generation never breaks because of comments.
+    """
+    try:
+        comments = await asyncio.to_thread(services.youtube.fetch_top_comments, url)
+        logger.info("job.comments.done job_id=%s count=%s", job_id, len(comments))
+        return comments
+    except asyncio.CancelledError:
+        logger.info("job.comments.cancelled job_id=%s", job_id)
+        raise
+    except Exception:
+        logger.exception("job.comments.failed job_id=%s", job_id)
+        return []
 
 
 async def _cancel_task_safely(task: asyncio.Task) -> None:
@@ -2024,7 +2118,14 @@ def _fit_escaped_text(text: str, max_chars: int) -> str:
 
 
 def _format_likes(count: int) -> str:
-    """Render like count with proper Russian declension: '1 лайк' / '2 лайка' / '5 лайков'."""
+    """Render like count with proper Russian declension: '1 лайк' / '2 лайка' / '5 лайков'.
+
+    Once we cross a thousand, we collapse the number to a compact ``1.2к`` /
+    ``12к`` form because (a) it's easier on the eye in chat, and (b) once the
+    counter is big the exact number stops being interesting.
+    """
+    if count >= 1000:
+        return f"{_format_compact_count(count)} лайков"
     last_two = count % 100
     last = count % 10
     if 11 <= last_two <= 14:
@@ -2038,21 +2139,41 @@ def _format_likes(count: int) -> str:
     return f"{count} {word}"
 
 
+def _format_compact_count(count: int) -> str:
+    """Compact thousands/millions: 1500 → '1.5к', 12500 → '12к', 1_500_000 → '1.5м'."""
+    if count < 1000:
+        return str(count)
+    if count < 1_000_000:
+        if count < 10_000:
+            value = round(count / 1000, 1)
+            return f"{value:g}к"  # 1к, 1.2к, 9.9к
+        return f"{count // 1000}к"
+    value = round(count / 1_000_000, 1)
+    return f"{value:g}м"
+
+
 async def _send_summary_delivery(
     services: Services,
     job: SummaryJob,
     text: str,
+    video_id: str | None = None,
 ) -> None:
     """Send the final summary message to the user.
 
     Manual jobs reply to the original message. Scheduled jobs go through bot.send_message
     with disable_notification=True so the user isn't pinged overnight.
+
+    If ``video_id`` is provided, recipient is the bot's owner and a publish
+    channel is configured, we attach an inline button «Опубликовать в канал».
+    Friends/scheduled jobs get the same text without the button.
     """
+    reply_markup = _build_publish_button(job, services, video_id)
     if job.message is not None and not job.scheduled:
         await job.message.answer(
             text,
             parse_mode="HTML",
             disable_web_page_preview=True,
+            reply_markup=reply_markup,
         )
         return
 
@@ -2070,7 +2191,331 @@ async def _send_summary_delivery(
         parse_mode="HTML",
         disable_web_page_preview=True,
         disable_notification=job.disable_notification,
+        reply_markup=reply_markup,
     )
+
+
+def _build_publish_button(
+    job: SummaryJob, services: Services, video_id: str | None
+) -> InlineKeyboardMarkup | None:
+    """Owner-only «Опубликовать в канал». Returns None if channel isn't
+    configured, or if the recipient isn't the bot's owner, or video_id is
+    missing — in those cases the message goes out as plain text."""
+    if not video_id:
+        return None
+    if services.settings.telegram_publish_channel_id is None:
+        return None
+    if not _job_is_owner(job, services):
+        return None
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text="📢 Опубликовать в канал",
+                callback_data=f"publish:{video_id}",
+            )],
+        ]
+    )
+
+
+# Лимиты Telegram + размеры аудио, при которых имеет смысл что-то делать.
+TELEGRAM_AUDIO_MAX_BYTES = 49 * 1024 * 1024   # 50 МБ - 1 МБ запас
+TELEGRAM_AUDIO_CAPTION_LIMIT = 1024            # api/sendAudio caption limit
+CHANNEL_POST_TEXT_BUDGET = 950                 # ~80 chars запас под escapes
+
+
+async def _publish_to_channel(
+    callback: CallbackQuery,
+    video_id: str,
+    services: Services,
+) -> None:
+    """End-to-end публикации саммари в Telegram-канал.
+
+    Алгоритм:
+    1. Найти cached саммари по video_id (если нет — не из чего публиковать).
+    2. Освежить комменты (тот же refresh, что используется на cache hit).
+    3. Если для этого video_id уже есть запись в ChannelPostsStore →
+       editMessageCaption (обновляем текст; аудио менять не нужно).
+    4. Иначе — скачиваем аудио, дожимаем под лимит 50 МБ, send_audio в канал
+       с подписью. Сохраняем (video_id → message_id) в store.
+    5. Сообщаем owner-у в личку результат.
+    """
+    chat_id = callback.message.chat.id if callback.message else None
+    if chat_id is None:
+        return
+
+    cache = services.summary_cache
+    cached = cache.get(video_id) if cache is not None else None
+    if cached is None:
+        await services.bot.send_message(
+            chat_id=chat_id,
+            text="Не нашёл это саммари в кэше — возможно, оно было сгенерировано до фичи кэша.",
+        )
+        return
+
+    posts = services.channel_posts
+    target_channel_id = services.settings.telegram_publish_channel_id
+    if posts is None or target_channel_id is None or services.bot is None:
+        await services.bot.send_message(
+            chat_id=chat_id,
+            text="Канал публикации не настроен (TELEGRAM_PUBLISH_CHANNEL_ID).",
+        )
+        return
+
+    # Свежие комменты (с попыткой обновить кэш + Telegraph).
+    fresh_comments = await _refresh_cached_comments(
+        cached, services, source_label="channel-publish",
+    )
+
+    existing = posts.get(video_id)
+
+    if existing is not None and existing.chat_id == target_channel_id:
+        # Обновляем существующий пост в канале.
+        new_caption = _format_channel_post_caption(cached, fresh_comments)
+        try:
+            await services.bot.edit_message_caption(
+                chat_id=existing.chat_id,
+                message_id=existing.message_id,
+                caption=new_caption,
+                parse_mode="HTML",
+            )
+            await services.bot.send_message(
+                chat_id=chat_id,
+                text=f"Обновил пост в канале (комменты освежены).\nhttps://t.me/c/{_chat_id_to_link(existing.chat_id)}/{existing.message_id}",
+                disable_web_page_preview=True,
+            )
+            posts.put(ChannelPost(
+                video_id=video_id,
+                chat_id=existing.chat_id,
+                message_id=existing.message_id,
+                posted_at_unix=existing.posted_at_unix,
+                audio_attached=existing.audio_attached,
+            ))
+        except TelegramBadRequest as exc:
+            err_text = str(exc).lower()
+            if "message is not modified" in err_text:
+                await services.bot.send_message(
+                    chat_id=chat_id,
+                    text="Пост в канале уже содержит актуальные комменты — ничего не менял.",
+                )
+                return
+            logger.exception(
+                "channel.publish.edit_failed video_id=%s message_id=%s",
+                video_id, existing.message_id,
+            )
+            await services.bot.send_message(
+                chat_id=chat_id,
+                text=f"Не удалось обновить пост в канале: {exc}",
+            )
+        return
+
+    # Свежая публикация. Качаем + дожимаем аудио, send_audio с caption.
+    await services.bot.send_message(
+        chat_id=chat_id,
+        text="Скачиваю и готовлю аудио для канала...",
+    )
+    audio_path: Path | None = None
+    try:
+        audio_path = await asyncio.to_thread(services.youtube.download_audio, cached.url)
+        audio_path = await _ensure_audio_fits_telegram(audio_path)
+    except Exception as exc:
+        logger.exception("channel.publish.audio_failed video_id=%s", video_id)
+        await services.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"Не удалось получить аудио ({exc}). "
+                "Публикую без аудио, только текст."
+            ),
+        )
+        audio_path = None
+
+    caption = _format_channel_post_caption(cached, fresh_comments)
+    audio_attached = False
+    try:
+        if audio_path is not None and audio_path.exists():
+            sent = await services.bot.send_audio(
+                chat_id=target_channel_id,
+                audio=FSInputFile(str(audio_path)),
+                caption=caption,
+                parse_mode="HTML",
+                title=cached.title[:64] or "YouTube",
+                performer=cached.channel_name[:64] or "YouTube",
+            )
+            audio_attached = True
+        else:
+            sent = await services.bot.send_message(
+                chat_id=target_channel_id,
+                text=caption,
+                parse_mode="HTML",
+                disable_web_page_preview=False,
+            )
+    except Exception as exc:
+        logger.exception(
+            "channel.publish.send_failed video_id=%s channel=%s",
+            video_id, target_channel_id,
+        )
+        await services.bot.send_message(
+            chat_id=chat_id,
+            text=f"Не удалось опубликовать в канал: {exc}",
+        )
+        return
+
+    posts.put(ChannelPost(
+        video_id=video_id,
+        chat_id=target_channel_id,
+        message_id=sent.message_id,
+        posted_at_unix=time.time(),
+        audio_attached=audio_attached,
+    ))
+    audio_label = "с аудио" if audio_attached else "без аудио (не уложилось в лимиты)"
+    await services.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"Опубликовал в канале {audio_label}.\n"
+            f"https://t.me/c/{_chat_id_to_link(target_channel_id)}/{sent.message_id}"
+        ),
+        disable_web_page_preview=True,
+    )
+
+
+def _chat_id_to_link(chat_id: int) -> str:
+    """Convert ``-1001234567890`` channel id to the ``1234567890`` form used in
+    ``t.me/c/<id>/<message_id>`` deep links."""
+    s = str(chat_id)
+    if s.startswith("-100"):
+        return s[4:]
+    if s.startswith("-"):
+        return s[1:]
+    return s
+
+
+async def _ensure_audio_fits_telegram(audio_path: Path) -> Path:
+    """If audio file > Telegram limit, recompress aggressively.
+
+    Defaulту download_audio уже даёт 32kbps mono mp3 — это покрывает ролики
+    до ~3.5 часов в 50 МБ. Fallback нужен только для марафонов или если
+    YouTube/yt-dlp выдал большой исходник по какой-то причине. Дожимаем
+    до Whisper-grade 24kbps mono 16kHz (~11 МБ/час, лезет ~4.5 часа).
+    Если и это не помогло — поднимаем исключение, caller отправит без аудио.
+    """
+    try:
+        size = audio_path.stat().st_size
+    except OSError as exc:
+        raise RuntimeError(f"Не удалось проверить размер аудио: {exc}") from exc
+    if size <= TELEGRAM_AUDIO_MAX_BYTES:
+        logger.info(
+            "channel.audio.size_ok path=%s size_bytes=%s", audio_path, size,
+        )
+        return audio_path
+
+    output_path = audio_path.with_suffix(audio_path.suffix + ".tg.mp3")
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(audio_path),
+        "-vn",
+        "-ac", "1",                  # mono
+        "-ar", "16000",              # 16kHz — для речи достаточно
+        "-c:a", "libmp3lame",
+        "-b:a", "24k",               # ~11 МБ/час
+        str(output_path),
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        err = stderr.decode("utf-8", "replace")[:500] if stderr else ""
+        raise RuntimeError(f"ffmpeg.compress failed (rc={proc.returncode}): {err}")
+    new_size = output_path.stat().st_size
+    logger.info(
+        "channel.audio.compressed input=%s input_size=%s output=%s output_size=%s",
+        audio_path, size, output_path, new_size,
+    )
+    if new_size > TELEGRAM_AUDIO_MAX_BYTES:
+        output_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Аудио после компрессии всё равно {new_size / 1024 / 1024:.1f} МБ, "
+            f"превышает Telegram-лимит {TELEGRAM_AUDIO_MAX_BYTES / 1024 / 1024:.0f} МБ. "
+            "Видео слишком длинное для отправки одним файлом."
+        )
+    return output_path
+
+
+def _format_channel_post_caption(
+    cached: CachedSummary,
+    fresh_comments: list[VideoComment],
+) -> str:
+    """Render an HTML caption for the channel audio-post under 1024 chars.
+
+    Layout (priority order, will trim from the bottom if needed):
+      1. Канал/title (linked) — обязательно
+      2. Overview — урезаем до того, чтобы остальное вписалось
+      3. Telegra.ph link — обязательно
+      4. Top-комментарий — урезаем агрессивно или дропаем если не лезет
+    """
+    title_line = (
+        f'<b><a href="{escape_html(cached.url)}">{escape_html(cached.title)}</a></b>'
+    )
+    if cached.channel_name and cached.channel_url:
+        channel_line = (
+            f'<i><a href="{escape_html(cached.channel_url)}">'
+            f"{escape_html(cached.channel_name)}</a></i>"
+        )
+    elif cached.channel_name:
+        channel_line = f"<i>{escape_html(cached.channel_name)}</i>"
+    else:
+        channel_line = ""
+
+    telegraph_line = (
+        f'📰 <a href="{escape_html(cached.telegraph_url)}">Полный конспект</a>'
+    )
+
+    # Реализуем «бюджет» по блокам и подгоняем overview под лимит.
+    base_parts = [p for p in (channel_line, title_line) if p]
+    base_text = "\n".join(base_parts)
+    used = len(base_text) + 2 + len(telegraph_line) + 2  # +separators
+
+    # Overview — берём столько, сколько помещается, оставляя запас на топ-коммент.
+    top_comment_block = ""
+    if fresh_comments:
+        top_comment_block = _channel_top_comment_line(fresh_comments[0])
+    reserved_for_comment = len(top_comment_block) + 2 if top_comment_block else 0
+
+    overview_budget = max(0, TELEGRAM_AUDIO_CAPTION_LIMIT - used - reserved_for_comment - 20)
+    overview = _truncate_plain(cached.summary_overview, overview_budget)
+    overview_block = escape_html(overview)
+
+    parts = [base_text]
+    if overview_block:
+        parts.append(overview_block)
+    parts.append(telegraph_line)
+    if top_comment_block:
+        parts.append(top_comment_block)
+
+    caption = "\n\n".join(parts)
+    # Финальная гарантия: если что-то превышает лимит, режем агрессивно.
+    if len(caption) > TELEGRAM_AUDIO_CAPTION_LIMIT:
+        caption = caption[: TELEGRAM_AUDIO_CAPTION_LIMIT - 3].rstrip() + "..."
+    return caption
+
+
+def _channel_top_comment_line(c: VideoComment) -> str:
+    """One-line top comment under caption budget."""
+    likes_label = _format_likes(c.like_count)
+    snippet = c.text.replace("\n", " ").strip()
+    if len(snippet) > 200:
+        snippet = snippet[:197].rstrip() + "..."
+    return f"💬 <i>«{escape_html(snippet)}» — {likes_label}</i>"
+
+
+def _truncate_plain(text: str, max_chars: int) -> str:
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= 3:
+        return text[:max_chars]
+    return text[: max_chars - 1].rstrip() + "…"
 
 
 def _is_job_cacheable(job: SummaryJob) -> bool:
@@ -2095,14 +2540,23 @@ def _lookup_cached_summary(url: str, services: Services) -> CachedSummary | None
     return services.summary_cache.get(video_id)
 
 
-def _format_cached_summary_text(cached: CachedSummary) -> str:
+def _format_cached_summary_text(
+    cached: CachedSummary,
+    override_top_comments: list[VideoComment] | None = None,
+) -> str:
     """Render the cached summary identically to a fresh delivery — no header
     or "this is cached" marker. From the user's perspective, sending a link a
     second time should feel like a normal, fast response. Cache-hits are still
     visible in logs (``queue.cache.hit`` / ``job.cache.hit``) for diagnostics.
+
+    ``override_top_comments`` лет сделать так: «выдать саммари с комментами,
+    обновлёнными прямо сейчас», не меняя сам ``cached`` объект.
     """
     summary = cached.to_summary()
-    cached_comments = cached.to_top_comments()
+    if override_top_comments is not None:
+        comments = override_top_comments
+    else:
+        comments = cached.to_top_comments()
     return _format_telegram_summary(
         title=cached.title,
         video_url=cached.url,
@@ -2110,8 +2564,104 @@ def _format_cached_summary_text(cached: CachedSummary) -> str:
         telegraph_url=cached.telegraph_url,
         channel_name=cached.channel_name,
         channel_url=cached.channel_url,
-        top_comment=cached_comments[0] if cached_comments else None,
+        top_comment=comments[0] if comments else None,
     )
+
+
+async def _refresh_cached_comments(
+    cached: CachedSummary, services: Services, source_label: str
+) -> list[VideoComment]:
+    """Get fresh top-comments and, if they changed since the cache was made,
+    rewrite the cached entry + edit the existing Telegra.ph page so all
+    surfaces (Telegram, Telegraph) stay in sync.
+
+    Returns the list of comments to actually display. Falls back to the cached
+    ones on any failure — comments-refresh is opportunistic, not critical.
+    """
+    try:
+        fresh = await asyncio.to_thread(services.youtube.fetch_top_comments, cached.url)
+    except Exception:
+        logger.exception(
+            "cache.refresh_comments.failed source=%s video_id=%s",
+            source_label, cached.video_id,
+        )
+        return cached.to_top_comments()
+
+    cached_comments = cached.to_top_comments()
+    if _comments_equivalent(fresh, cached_comments):
+        logger.info(
+            "cache.refresh_comments.unchanged source=%s video_id=%s count=%s",
+            source_label, cached.video_id, len(fresh),
+        )
+        return cached_comments
+
+    logger.info(
+        "cache.refresh_comments.changed source=%s video_id=%s old=%s new=%s",
+        source_label, cached.video_id, len(cached_comments), len(fresh),
+    )
+
+    # Edit Telegra.ph first. If it succeeds — also update the cache so future
+    # cache hits stay consistent with the live page. If it fails (most common
+    # cause: ``editPage`` only works with the same access_token that originally
+    # created the page; pages from previous bot incarnations are read-only),
+    # we still hand the *fresh* comments to the Telegram delivery — that's the
+    # surface the user actually sees right now. Cache stays untouched in that
+    # case so we don't desync the cache from the read-only Telegraph page.
+    telegraph_updated = False
+    try:
+        await services.telegraph.edit(
+            cached.telegraph_url,
+            title=cached.title,
+            video_url=cached.url,
+            summary=cached.to_summary(),
+            transcript_url=cached.transcript_url,
+            top_comments=fresh,
+        )
+        telegraph_updated = True
+    except Exception:
+        logger.exception(
+            "cache.refresh_comments.telegraph_edit_failed video_id=%s",
+            cached.video_id,
+        )
+
+    if telegraph_updated and services.summary_cache is not None:
+        cached.top_comments = [
+            {
+                "text": c.text,
+                "author": c.author,
+                "like_count": c.like_count,
+                "is_pinned": c.is_pinned,
+            }
+            for c in fresh
+        ]
+        try:
+            services.summary_cache.put(cached)
+        except Exception:
+            logger.exception(
+                "cache.refresh_comments.cache_put_failed video_id=%s",
+                cached.video_id,
+            )
+
+    # Always return the fresh comments — even if Telegraph couldn't be
+    # updated, the user gets actual top-comment in their Telegram message.
+    return fresh
+
+
+def _comments_equivalent(a: list[VideoComment], b: list[VideoComment]) -> bool:
+    """True if two top-comment lists describe the same audience reaction.
+
+    Equality based on author + text identity (those don't change). Like counts
+    drift constantly; we accept ±10 wobble before deciding the page needs a
+    rewrite.
+    """
+    if len(a) != len(b):
+        return False
+    for ca, cb in zip(a, b):
+        if ca.author != cb.author or ca.text != cb.text:
+            return False
+        if abs(ca.like_count - cb.like_count) > 10:
+            return False
+    return True
 
 
 async def _send_cached_summary_to_chat(
@@ -2120,8 +2670,30 @@ async def _send_cached_summary_to_chat(
     services: Services,
 ) -> None:
     """Manual flow: respond to a user message with cached summary + restore Q&A."""
-    text = _format_cached_summary_text(cached)
-    await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+    fresh_comments = await _refresh_cached_comments(cached, services, source_label="manual")
+    text = _format_cached_summary_text(cached, override_top_comments=fresh_comments)
+    # Только owner получает кнопку публикации (как и при свежем саммари).
+    reply_markup: InlineKeyboardMarkup | None = None
+    user_id = _message_user_id(message)
+    if (
+        services.settings.telegram_publish_channel_id is not None
+        and user_id is not None
+        and services.users.is_owner(user_id)
+    ):
+        reply_markup = InlineKeyboardMarkup(
+            inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="📢 Опубликовать в канал",
+                    callback_data=f"publish:{cached.video_id}",
+                )
+            ]]
+        )
+    await message.answer(
+        text,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=reply_markup,
+    )
     _restore_qa_context_from_cache(message.chat.id, cached, services)
 
 
@@ -2133,8 +2705,11 @@ async def _deliver_cached_summary_for_job(
     """Job-level delivery: works for both manual (job.message != None) and
     scheduled (services.bot.send_message). Restores Q&A context only for
     interactive (manual) sessions."""
-    text = _format_cached_summary_text(cached)
-    await _send_summary_delivery(services=services, job=job, text=text)
+    fresh_comments = await _refresh_cached_comments(cached, services, source_label="job")
+    text = _format_cached_summary_text(cached, override_top_comments=fresh_comments)
+    await _send_summary_delivery(
+        services=services, job=job, text=text, video_id=cached.video_id
+    )
     if not job.scheduled and job.chat_id:
         _restore_qa_context_from_cache(job.chat_id, cached, services)
 
@@ -2371,6 +2946,51 @@ async def _answer_owner_only(message: Message, services: Services) -> None:
         await message.answer("Этот бот закрыт для личного использования.")
         return
     await message.answer("Эта команда доступна только владельцу бота.")
+
+
+async def _apply_user_add(message: Message, raw_args: str, services: Services) -> None:
+    """Parse a "<user_id> [name...]" string and add user. Used both inline
+    (``/user_add 123 Иван``) and via two-step pending dialog."""
+    parts = raw_args.strip().split(maxsplit=1)
+    if not parts:
+        await message.answer("Не понял ввод. Нужен Telegram-id и имя.")
+        return
+    try:
+        user_id = int(parts[0])
+    except ValueError:
+        await message.answer("Telegram user id должен быть числом.")
+        return
+
+    name = parts[1] if len(parts) > 1 else ""
+    added = services.users.add_user(user_id, name)
+    if added:
+        await message.answer(f"Пользователь {user_id} добавлен.")
+    else:
+        await message.answer(f"Пользователь {user_id} уже был в списке. Данные обновлены.")
+
+
+async def _apply_user_remove(message: Message, raw_args: str, services: Services) -> None:
+    """Parse a single user_id and remove that user. Used inline + pending dialog."""
+    cleaned = raw_args.strip().split()
+    if not cleaned:
+        await message.answer("Не понял ввод. Нужен Telegram-id.")
+        return
+    try:
+        user_id = int(cleaned[0])
+    except ValueError:
+        await message.answer("Telegram user id должен быть числом.")
+        return
+
+    try:
+        removed = services.users.remove_user(user_id)
+    except ValueError as exc:
+        await message.answer(str(exc))
+        return
+
+    if removed:
+        await message.answer(f"Пользователь {user_id} удалён.")
+    else:
+        await message.answer(f"Пользователя {user_id} нет в списке.")
 
 
 def _is_allowed(message: Message, services: Services) -> bool:
