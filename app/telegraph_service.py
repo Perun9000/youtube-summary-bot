@@ -227,12 +227,26 @@ def _summary_to_nodes(
 
     nodes: list[dict | str] = [
         {"tag": "p", "children": header_children},
+    ]
+
+    # Теги — отдельный <p><i>...</i></p> сразу после заголовочных ссылок,
+    # чтобы читатель сразу видел: «о чём это, кто и формат». Telegra.ph
+    # автоматически делает текст вида ``#тег`` некликабельным (это просто
+    # текст в браузере), но визуально читается как тег-блок.
+    tags_text = _tags_inline_for_telegraph(getattr(summary, "tags", None))
+    if tags_text:
+        nodes.append({
+            "tag": "p",
+            "children": [{"tag": "i", "children": [tags_text]}],
+        })
+
+    nodes.extend([
         {"tag": "h3", "children": ["Обзор"]},
         {"tag": "p", "children": [summary.overview]},
         {"tag": "h3", "children": ["Ключевые тезисы"]},
         {"tag": "ul", "children": [{"tag": "li", "children": [point]} for point in summary.key_points]},
         {"tag": "h3", "children": ["Тезисы подробно"]},
-    ]
+    ])
 
     for chapter in summary.chapters:
         heading = chapter.title.strip() or "Тезис"
@@ -295,6 +309,37 @@ def _extract_telegraph_path(page_url_or_path: str) -> str:
     if "/" in s:
         return s.rsplit("/", 1)[-1]
     return s
+
+
+def _tags_inline_for_telegraph(tags) -> str:
+    """Build the ``🏷 #тема #Гость #Ведущий #формат #Канал`` line for Telegra.ph.
+
+    Принимает ``SummaryTags | None``. Возвращает пустую строку, если тегов
+    вообще нет — caller тогда не добавляет блок в nodes. Tag-syntax тут
+    тот же, что в Telegram-сообщении (для визуальной согласованности),
+    хотя в Telegra.ph они не кликабельны.
+    """
+    if tags is None:
+        return ""
+    parts: list[str] = []
+    topic = getattr(tags, "topic", "")
+    if topic:
+        parts.append(f"#{topic}")
+    for sp in getattr(tags, "speakers", ()) or ():
+        if sp:
+            parts.append(f"#{sp}")
+    for host in getattr(tags, "hosts", ()) or ():
+        if host:
+            parts.append(f"#{host}")
+    fmt = getattr(tags, "format", "")
+    if fmt:
+        parts.append(f"#{fmt}")
+    channel = getattr(tags, "channel", "")
+    if channel:
+        parts.append(f"#{channel}")
+    if not parts:
+        return ""
+    return "🏷 " + " ".join(parts)
 
 
 def _compact_count(count: int) -> str:

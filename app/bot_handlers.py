@@ -1680,7 +1680,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
         usage = GenerationUsage()
         summary_progress = SummaryProgress()
         context_hint = _build_context_hint(job)
-        topic_hint, speaker_hint = _build_tags_hints(services)
+        topic_hint, speaker_hint, host_hint = _build_tags_hints(services)
         await _set_service_status(services, message, f"Генерирую summary через {services.llm.provider_name}...", job=job)
         summary = await _run_with_telegram_status(
             services=services,
@@ -1694,6 +1694,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                 context_hint=context_hint,
                 topic_hint=topic_hint,
                 speaker_hint=speaker_hint,
+                host_hint=host_hint,
             ),
             base_text=f"Генерирую summary через {services.llm.provider_name}...",
             job=job,
@@ -2153,10 +2154,10 @@ def _format_telegram_summary(
 
 
 def _format_tags_line(tags: SummaryTags) -> str:
-    """Render tags as a single Telegram line: ``🏷 #тема #Спикер #формат #Канал``.
+    """Render tags as a single line: ``🏷 #тема #Гость #Ведущий #формат #Канал``.
 
-    Empty / None tags просто пропускаются. Если ни одного тега нет — пустая
-    строка, чтобы caller её не добавлял в blocks.
+    Порядок логический: тема → гости → ведущие → формат → канал. Пустые поля
+    просто пропускаются. Если вообще ни одного тега нет — пустая строка.
     """
     parts: list[str] = []
     if tags.topic:
@@ -2164,6 +2165,9 @@ def _format_tags_line(tags: SummaryTags) -> str:
     for sp in tags.speakers:
         if sp:
             parts.append(f"#{sp}")
+    for host in tags.hosts:
+        if host:
+            parts.append(f"#{host}")
     if tags.format:
         parts.append(f"#{tags.format}")
     if tags.channel:
@@ -2174,27 +2178,31 @@ def _format_tags_line(tags: SummaryTags) -> str:
     return "🏷 " + " ".join(parts)
 
 
-def _build_tags_hints(services: Services) -> tuple[str, str]:
+def _build_tags_hints(services: Services) -> tuple[str, str, str]:
     """Build prompt hints for the LLM: existing tags it can reuse.
 
-    Returns ``(topic_hint, speaker_hint)``, formatted as inline strings ready
-    to interpolate into the JSON-schema prompt.
+    Returns ``(topic_hint, speaker_hint, host_hint)``, формат — inline
+    предложения, готовые к интерполяции в JSON-schema prompt.
     """
     catalog = services.tags_catalog
     if catalog is None:
-        return ("", "")
+        return ("", "", "")
     topics = catalog.all_tags("topic")
     speakers = catalog.all_tags("speaker")
+    hosts = catalog.all_tags("host")
     topic_hint = ""
     speaker_hint = ""
+    host_hint = ""
     if topics:
-        # Берём не больше 30 — длиннее раздувает промпт без пользы.
         sample = ", ".join(topics[:30])
         topic_hint = f" Уже использованные темы (предпочти их, если подходят): {sample}."
     if speakers:
         sample = ", ".join(speakers[:30])
-        speaker_hint = f" Уже использованные фамилии (предпочти их, если подходят): {sample}."
-    return (topic_hint, speaker_hint)
+        speaker_hint = f" Уже использованные фамилии гостей (предпочти их, если подходят): {sample}."
+    if hosts:
+        sample = ", ".join(hosts[:30])
+        host_hint = f" Уже использованные фамилии ведущих (предпочти их, если подходят): {sample}."
+    return (topic_hint, speaker_hint, host_hint)
 
 
 def _resolve_summary_tags(
@@ -2203,15 +2211,7 @@ def _resolve_summary_tags(
     channel_name: str,
     services: Services,
 ) -> SummaryTags:
-    """Take raw LLM tags + channel from metadata, produce canonical SummaryTags.
-
-    Logic:
-      - topic: lookup_or_add → canonical existing or new in catalog
-      - speakers: same, до 3 штук
-      - format: lookup_or_add (closed-set, fallback to 'новости')
-      - channel: lookup_or_add из metadata (LLM не отдаёт его)
-    Catalog отсутствует → возвращаем raw_tags как есть.
-    """
+    """Take raw LLM tags + channel from metadata, produce canonical SummaryTags."""
     catalog = services.tags_catalog
     if catalog is None:
         # Без каталога просто возвращаем то, что пришло, плюс канал.
@@ -2219,22 +2219,32 @@ def _resolve_summary_tags(
         return dataclasses.replace(raw_tags, channel=channel_tag)
 
     topic = catalog.lookup_or_add("topic", raw_tags.topic) or ""
-    canonical_speakers: list[str] = []
-    seen: set[str] = set()
-    for sp in raw_tags.speakers[:3]:
-        canon = catalog.lookup_or_add("speaker", sp)
-        if canon and canon not in seen:
-            seen.add(canon)
-            canonical_speakers.append(canon)
+    canonical_speakers = _canonicalize_names(catalog, "speaker", raw_tags.speakers, limit=3)
+    canonical_hosts = _canonicalize_names(catalog, "host", raw_tags.hosts, limit=5)
     fmt = catalog.lookup_or_add("format", raw_tags.format) or ""
     channel = catalog.lookup_or_add("channel", channel_name) or ""
 
     return SummaryTags(
         topic=topic,
         speakers=tuple(canonical_speakers),
+        hosts=tuple(canonical_hosts),
         format=fmt,
         channel=channel,
     )
+
+
+def _canonicalize_names(
+    catalog: TagsCatalog, category: str, raw: tuple[str, ...] | list[str], *, limit: int,
+) -> list[str]:
+    """Прогнать каждое имя через catalog.lookup_or_add, дропать дубликаты."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for name in list(raw)[:limit]:
+        canon = catalog.lookup_or_add(category, name)
+        if canon and canon not in seen:
+            seen.add(canon)
+            out.append(canon)
+    return out
 
 
 def _normalize_channel_simple(channel_name: str) -> str:
@@ -2993,6 +3003,7 @@ def _save_summary_to_cache(
         ],
         tag_topic=summary.tags.topic,
         tag_speakers=list(summary.tags.speakers),
+        tag_hosts=list(summary.tags.hosts),
         tag_format=summary.tags.format,
         tag_channel=summary.tags.channel,
     )

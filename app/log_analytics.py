@@ -361,7 +361,7 @@ def format_markdown(
 
     if tags_catalog is not None:
         lines.append("## Каталог тегов")
-        for cat in ("topic", "speaker", "format", "channel"):
+        for cat in ("topic", "speaker", "host", "format", "channel"):
             tags = tags_catalog.all_tags(cat)
             if tags:
                 shown = tags[:15]

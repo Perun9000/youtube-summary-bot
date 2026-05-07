@@ -66,6 +66,7 @@ class CachedSummary:
     # round-trip is trivial; reconstruct via ``tags_obj()``.
     tag_topic: str = ""
     tag_speakers: list[str] = field(default_factory=list)
+    tag_hosts: list[str] = field(default_factory=list)
     tag_format: str = ""
     tag_channel: str = ""
 
@@ -92,6 +93,7 @@ class CachedSummary:
         return SummaryTags(
             topic=self.tag_topic,
             speakers=tuple(s for s in self.tag_speakers if s),
+            hosts=tuple(h for h in self.tag_hosts if h),
             format=self.tag_format,
             channel=self.tag_channel,
         )

@@ -38,7 +38,9 @@ logger = logging.getLogger(__name__)
 
 
 TAG_SIMILARITY_THRESHOLD = 0.82
-KNOWN_CATEGORIES = ("topic", "speaker", "format", "channel")
+# host = ведущий / интервьюер / автор канала (тот, кто задаёт вопросы);
+# speaker = приглашённый гость / эксперт (тот, кто отвечает).
+KNOWN_CATEGORIES = ("topic", "speaker", "host", "format", "channel")
 CANONICAL_FORMATS = ("интервью", "расследование", "разбор", "новости", "дискуссия")
 
 
@@ -46,6 +48,7 @@ CANONICAL_FORMATS = ("интервью", "расследование", "разб
 class TagsCatalogState:
     topic: list[str] = field(default_factory=list)
     speaker: list[str] = field(default_factory=list)
+    host: list[str] = field(default_factory=list)
     format: list[str] = field(default_factory=list)
     channel: list[str] = field(default_factory=list)
 
@@ -166,7 +169,7 @@ def _normalize(raw: str, category: str) -> str:
     if not s:
         return ""
 
-    if category == "speaker":
+    if category in ("speaker", "host"):
         # Фамилия — только первая буква заглавная, остальные сохраняем как пришли.
         # Кейсы вроде "ВанДерБеллен" пользователь сам аккуратно введёт в каталог.
         return s[:1].upper() + s[1:].lower()
