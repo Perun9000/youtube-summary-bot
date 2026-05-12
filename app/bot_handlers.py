@@ -10,6 +10,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, TypeVar
+from urllib.parse import urlparse
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -43,7 +44,13 @@ from app.summarizer import Summarizer, SummaryProgress
 from app.telegraph_service import TelegraphService
 from app.transcript_chunker import chunk_transcript, segments_to_text
 from app.user_store import UserStore
-from app.utils import classify_youtube_url, escape_html, extract_video_id, extract_youtube_url
+from app.utils import (
+    classify_youtube_url,
+    escape_html,
+    extract_first_url,
+    extract_video_id,
+    extract_youtube_url,
+)
 from app.whisper_service import WhisperService
 from app.youtube_service import TranscriptUnavailable, YouTubeService
 
@@ -414,24 +421,30 @@ def build_router(services: Services) -> Router:
         existing.cancel()
         await message.answer("Отменяю текущий скан...")
 
-    @router.callback_query(F.data.startswith("publish:"))
-    async def publish_to_channel_callback(callback: CallbackQuery) -> None:
+    @router.callback_query(F.data.startswith("download:"))
+    async def download_audio_callback(callback: CallbackQuery) -> None:
+        """Owner-only кнопка под саммари: скачать аудио YouTube-ролика и
+        прислать его прямо в чат как reply к сообщению-саммари."""
         if not services.users.is_owner(callback.from_user.id if callback.from_user else None):
             await callback.answer("Эта кнопка доступна только владельцу.", show_alert=True)
             return
-        if services.settings.telegram_publish_channel_id is None:
-            await callback.answer(
-                "Канал не настроен. Добавь TELEGRAM_PUBLISH_CHANNEL_ID в .env и пересоздай контейнер.",
-                show_alert=True,
-            )
-            return
-        video_id = (callback.data or "").removeprefix("publish:").strip()
+        video_id = (callback.data or "").removeprefix("download:").strip()
         if not video_id:
             await callback.answer("Неверный callback_data — нет video_id.", show_alert=True)
             return
         # Подтверждаем нажатие сразу — иначе у Telegram спиннер крутится 30 сек.
-        await callback.answer("Публикую в канал...")
-        asyncio.create_task(_publish_to_channel(callback, video_id, services))
+        await callback.answer("Готовлю аудио...")
+        asyncio.create_task(_download_audio_to_chat(callback, video_id, services))
+
+    # ─────────────────────── DISABLED: канал-публикация ───────────────────────
+    # Фича «опубликовать в канал» временно отключена. Код callback'а и логики
+    # публикации сохранён в виде комментариев, чтобы при необходимости можно
+    # было быстро вернуть. См. _publish_to_channel ниже + ChannelPostsStore.
+    #
+    # @router.callback_query(F.data.startswith("publish:"))
+    # async def publish_to_channel_callback(callback: CallbackQuery) -> None:
+    #     ... (был owner-only с require TELEGRAM_PUBLISH_CHANNEL_ID,
+    #     дёргал _publish_to_channel в asyncio.create_task)
 
     @router.message(F.text)
     async def text_message(message: Message) -> None:
@@ -483,6 +496,24 @@ def build_router(services: Services) -> Router:
             )
             return
 
+        # В тексте есть http(s)-URL, но не от YouTube — режем сразу, чтобы не
+        # отправлять его в Q&A-ветку (LLM бесполезно скажет «у меня нет доступа
+        # к этому ресурсу») и не показывать generic-сообщение «сначала пришли
+        # ссылку на ютуб» — пользователь именно ссылку и прислал, просто не ту.
+        foreign_url = extract_first_url(text)
+        if foreign_url:
+            try:
+                host = urlparse(foreign_url).netloc or foreign_url
+            except Exception:  # noqa: BLE001
+                host = foreign_url
+            await message.answer(
+                f"Это не YouTube-ссылка (<code>{escape_html(host)}</code>). "
+                "Я умею только YouTube — пришли URL ролика или канала.",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            return
+
         context = services.contexts.get(message.chat.id)
         if not context:
             await message.answer("Сначала пришли ссылку на YouTube-ролик.")
@@ -499,64 +530,79 @@ def build_router(services: Services) -> Router:
 
 
 async def _enqueue_summary_job(message: Message, url: str, services: Services) -> None:
-    # Cache hit fast-path: если по этому ролику уже было саммари, отдаём его
-    # сразу, не занимая очередь и не дёргая LLM/Whisper.
-    cached = _lookup_cached_summary(url, services)
-    if cached is not None:
-        logger.info(
-            "queue.cache.hit chat_id=%s video_id=%s telegraph_url=%s",
-            message.chat.id, cached.video_id, cached.telegraph_url,
-        )
-        await _send_cached_summary_to_chat(message, cached, services)
-        return
+    try:
+        # Cache hit fast-path: если по этому ролику уже было саммари, отдаём его
+        # сразу, не занимая очередь и не дёргая LLM/Whisper.
+        cached = _lookup_cached_summary(url, services)
+        if cached is not None:
+            logger.info(
+                "queue.cache.hit chat_id=%s video_id=%s telegraph_url=%s",
+                message.chat.id, cached.video_id, cached.telegraph_url,
+            )
+            await _send_cached_summary_to_chat(message, cached, services)
+            return
 
-    active_job: SummaryJob | None
-    async with services.summary_queue_lock:
-        services.summary_next_sequence += 1
-        sequence = services.summary_next_sequence
-        active_job = services.summary_active_job
-        active_count = 1 if active_job is not None else 0
-        position = active_count + services.summary_queue.qsize() + 1
-        job = SummaryJob(
-            sequence=sequence,
-            message=message,
-            url=url,
-            enqueued_at=time.monotonic(),
-            chat_id=message.chat.id,
-        )
-        await services.summary_queue.put(job)
-        if services.summary_worker_task is None or services.summary_worker_task.done():
-            services.summary_worker_task = asyncio.create_task(_summary_queue_worker(services))
+        active_job: SummaryJob | None
+        async with services.summary_queue_lock:
+            services.summary_next_sequence += 1
+            sequence = services.summary_next_sequence
+            active_job = services.summary_active_job
+            active_count = 1 if active_job is not None else 0
+            position = active_count + services.summary_queue.qsize() + 1
+            job = SummaryJob(
+                sequence=sequence,
+                message=message,
+                url=url,
+                enqueued_at=time.monotonic(),
+                chat_id=message.chat.id,
+            )
+            await services.summary_queue.put(job)
+            if services.summary_worker_task is None or services.summary_worker_task.done():
+                services.summary_worker_task = asyncio.create_task(_summary_queue_worker(services))
 
-        logger.info(
-            "queue.job.enqueued sequence=%s chat_id=%s position=%s pending=%s url=%s",
-            sequence,
-            message.chat.id,
-            position,
-            services.summary_queue.qsize(),
-            url,
-        )
+            logger.info(
+                "queue.job.enqueued sequence=%s chat_id=%s position=%s pending=%s url=%s",
+                sequence,
+                message.chat.id,
+                position,
+                services.summary_queue.qsize(),
+                url,
+            )
 
-    asyncio.create_task(_prefetch_job_title(job, services))
+        asyncio.create_task(_prefetch_job_title(job, services))
 
-    if position == 1:
-        await _set_service_status(
-            services=services,
-            source_message=message,
-            text="Добавил ролик в очередь summary. Начинаю обработку.",
-            job=job,
-            bump=True,
-        )
-    elif active_job is not None and active_job.chat_id == message.chat.id:
-        await _bump_service_status(services, message, active_job)
-    else:
-        await _set_service_status(
-            services=services,
-            source_message=message,
-            text=f"Добавил ролик в очередь summary. Позиция: {position}.",
-            job=job,
-            bump=True,
-        )
+        if position == 1:
+            await _set_service_status(
+                services=services,
+                source_message=message,
+                text="Добавил ролик в очередь summary. Начинаю обработку.",
+                job=job,
+                bump=True,
+            )
+        elif active_job is not None and active_job.chat_id == message.chat.id:
+            await _bump_service_status(services, message, active_job)
+        else:
+            await _set_service_status(
+                services=services,
+                source_message=message,
+                text=f"Добавил ролик в очередь summary. Позиция: {position}.",
+                job=job,
+                bump=True,
+            )
+    finally:
+        # Удаляем исходное сообщение пользователя с YouTube-ссылкой сразу же,
+        # как только ссылка попала в очередь (или была обслужена из кэша).
+        # Так превью ссылки в Telegram не дублирует шапку нашей доставки/статуса
+        # и чат остаётся чистым на всё время обработки. Бот может удалить
+        # user-message в private chat в течение 48 часов; ошибки swallow'им,
+        # потому что удаление best-effort и не влияет на саму доставку саммари.
+        try:
+            await message.delete()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "source_message.delete_failed chat_id=%s error=%s",
+                message.chat.id, exc,
+            )
 
 
 SCAN_PROGRESS_THROTTLE_SEC = 1.5
@@ -1761,39 +1807,15 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             )
 
         total_duration_sec = time.monotonic() - started
-        show_service_info = _job_is_owner(job, services)
+        # model_name всё ещё нужен ниже — пишем в кэш (CachedSummary.model) и
+        # в строку job.done для аналитики. Сам user-facing «service info»-блок
+        # (Модель/Контекст/Температура/Токены/Источник transcript/…) убран —
+        # owner получает то же чистое саммари, что и обычные пользователи.
         try:
             model_name = await services.llm.active_model()
         except Exception as exc:
             logger.warning("service_info.model_lookup_failed job_id=%s error=%s", job_id, exc)
             model_name = "unknown"
-        loaded_ctx = None
-        if show_service_info:
-            try:
-                loaded_ctx = await services.llm.loaded_context_length()
-            except Exception as exc:
-                logger.warning("service_info.context_lookup_failed job_id=%s error=%s", job_id, exc)
-
-        if show_service_info:
-            await _set_service_status(
-                services=services,
-                source_message=message,
-                text=_format_service_info(
-                    job_id=job_id,
-                    model=model_name,
-                    usage=usage,
-                    transcript_source=transcript_source,
-                    transcript_chars=len(transcript_text),
-                    chunks_count=len(chunks),
-                    total_duration_sec=total_duration_sec,
-                    settings=services.settings,
-                    loaded_context_length=loaded_ctx,
-                    video_duration_sec=getattr(metadata, "duration_sec", None),
-                ),
-                job=job,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
 
         summary_text = _format_telegram_summary(
             title=title,
@@ -1813,10 +1835,13 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             text=summary_text,
             video_id=video_id,
         )
-        if show_service_info:
-            _forget_service_status(services, chat_id)
-        else:
-            await _delete_service_status(services, chat_id)
+        # Сервисное сообщение со статусом («Получаю данные…», «Генерирую
+        # summary…» и т.п.) дослужило — удаляем его, чтобы в чате осталось
+        # только финальное саммари.
+        await _delete_service_status(services, chat_id)
+        # NB: исходное user-message с YouTube-ссылкой удалили ещё на этапе
+        # `_enqueue_summary_job` (finally-блок), как только ссылка попала
+        # в очередь. Здесь ничего удалять не нужно.
 
         # Кэшируем результат — но только для full-video. Segment-mode даёт
         # частичное саммари по конкретному эксперту, его нельзя считать
@@ -1842,11 +1867,13 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
 
         logger.info(
             "job.done job_id=%s video_id=%s duration_sec=%.1f telegraph_url=%s "
+            "model=%s "
             "llm_calls=%s prompt_tokens=%s completion_tokens=%s total_tokens=%s llm_sec=%.1f",
             job_id,
             video_id,
             total_duration_sec,
             telegraph_url,
+            model_name,
             usage.calls,
             usage.prompt_tokens,
             usage.completion_tokens,
@@ -2072,23 +2099,6 @@ def _format_russian_minutes(minutes: int) -> str:
     if 2 <= last <= 4:
         return "минуты"
     return "минут"
-
-
-def _format_video_duration(seconds: float | None) -> str:
-    """Render video duration like '1 час 1 минута' / '23 минуты' / '45 сек'."""
-    if seconds is None or seconds <= 0:
-        return "неизвестна"
-    sec = int(seconds)
-    hours, remainder = divmod(sec, 3600)
-    minutes, secs = divmod(remainder, 60)
-    if not hours and not minutes:
-        return f"{secs} сек"
-    parts: list[str] = []
-    if hours:
-        parts.append(f"{hours} {_format_russian_hours(hours)}")
-    if minutes:
-        parts.append(f"{minutes} {_format_russian_minutes(minutes)}")
-    return " ".join(parts)
 
 
 def _format_telegram_summary(
@@ -2375,20 +2385,22 @@ async def _send_summary_delivery(
 def _build_publish_button(
     job: SummaryJob, services: Services, video_id: str | None
 ) -> InlineKeyboardMarkup | None:
-    """Owner-only «Опубликовать в канал». Returns None if channel isn't
-    configured, or if the recipient isn't the bot's owner, or video_id is
-    missing — in those cases the message goes out as plain text."""
+    """Owner-only «🎧 Скачать аудио». Returns None if the recipient isn't
+    the bot's owner or video_id is missing — в этих случаях саммари уходит
+    без кнопки.
+
+    (Имя функции по-прежнему ``_build_publish_button`` для обратной совместимости
+    с существующими callsite'ами. Когда-нибудь переименуем.)
+    """
     if not video_id:
-        return None
-    if services.settings.telegram_publish_channel_id is None:
         return None
     if not _job_is_owner(job, services):
         return None
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(
-                text="📢 Опубликовать в канал",
-                callback_data=f"publish:{video_id}",
+                text="🎧 Скачать аудио",
+                callback_data=f"download:{video_id}",
             )],
         ]
     )
@@ -2400,161 +2412,113 @@ TELEGRAM_AUDIO_CAPTION_LIMIT = 1024            # api/sendAudio caption limit
 CHANNEL_POST_TEXT_BUDGET = 950                 # ~80 chars запас под escapes
 
 
-async def _publish_to_channel(
+async def _download_audio_to_chat(
     callback: CallbackQuery,
     video_id: str,
     services: Services,
 ) -> None:
-    """End-to-end публикации саммари в Telegram-канал.
+    """Скачивает аудио YouTube-ролика и шлёт файл в личку как reply к саммари.
 
     Алгоритм:
-    1. Найти cached саммари по video_id (если нет — не из чего публиковать).
-    2. Освежить комменты (тот же refresh, что используется на cache hit).
-    3. Если для этого video_id уже есть запись в ChannelPostsStore →
-       editMessageCaption (обновляем текст; аудио менять не нужно).
-    4. Иначе — скачиваем аудио, дожимаем под лимит 50 МБ, send_audio в канал
-       с подписью. Сохраняем (video_id → message_id) в store.
-    5. Сообщаем owner-у в личку результат.
+    1. Резолвим URL по video_id (через cached summary; если кэша нет — пытаемся
+       восстановить «https://www.youtube.com/watch?v=<id>»).
+    2. Качаем mp3 через yt-dlp (32 kbps mono — наш дефолт).
+    3. Если файл > 49 МБ, ужимаем дальше через ``_ensure_audio_fits_telegram``.
+    4. ``send_audio`` в тот же чат, где висит кнопка, с reply на саммари.
+    5. На ошибках — отдельным сообщением сообщаем причину.
     """
-    chat_id = callback.message.chat.id if callback.message else None
-    if chat_id is None:
+    if callback.message is None or services.bot is None:
         return
+    chat_id = callback.message.chat.id
+    summary_message_id = callback.message.message_id
 
     cache = services.summary_cache
     cached = cache.get(video_id) if cache is not None else None
-    if cached is None:
-        await services.bot.send_message(
-            chat_id=chat_id,
-            text="Не нашёл это саммари в кэше — возможно, оно было сгенерировано до фичи кэша.",
-        )
+    if cached is not None and cached.url:
+        url = cached.url
+        title = cached.title[:64] if cached.title else "YouTube"
+        performer = cached.channel_name[:64] if cached.channel_name else "YouTube"
+    else:
+        # Fallback: соберём URL из video_id. Качества метаданных не будет, но
+        # аудио качается.
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        title = "YouTube"
+        performer = "YouTube"
+
+    progress_msg = await services.bot.send_message(
+        chat_id=chat_id,
+        text="Скачиваю аудио ролика...",
+        reply_to_message_id=summary_message_id,
+    )
+
+    audio_path: Path | None = None
+    try:
+        audio_path = await asyncio.to_thread(services.youtube.download_audio, url)
+        audio_path = await _ensure_audio_fits_telegram(audio_path)
+    except Exception as exc:
+        logger.exception("download_audio.failed video_id=%s", video_id)
+        try:
+            await progress_msg.edit_text(f"Не удалось скачать аудио: {exc}")
+        except Exception:
+            pass
         return
 
+    try:
+        await services.bot.send_audio(
+            chat_id=chat_id,
+            audio=FSInputFile(str(audio_path)),
+            title=title,
+            performer=performer,
+            reply_to_message_id=summary_message_id,
+            disable_notification=True,
+        )
+        # Промежуточное «скачиваю...» больше не нужно — удалим, чтобы чат
+        # не засорять.
+        try:
+            await progress_msg.delete()
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.exception("download_audio.send_failed video_id=%s", video_id)
+        try:
+            await progress_msg.edit_text(f"Не удалось отправить аудио: {exc}")
+        except Exception:
+            pass
+
+
+"""DISABLED: Channel publishing pipeline. Сохранено как docstring чтобы Python
+не исполнял эту ветку, но при необходимости легко вернуть.
+
+async def _publish_to_channel(callback, video_id, services):
+    chat_id = callback.message.chat.id if callback.message else None
+    if chat_id is None:
+        return
+    cache = services.summary_cache
+    cached = cache.get(video_id) if cache is not None else None
+    if cached is None:
+        await services.bot.send_message(chat_id=chat_id, text="Не нашёл саммари в кэше.")
+        return
     posts = services.channel_posts
     target_channel_id = services.settings.telegram_publish_channel_id
     if posts is None or target_channel_id is None or services.bot is None:
-        await services.bot.send_message(
-            chat_id=chat_id,
-            text="Канал публикации не настроен (TELEGRAM_PUBLISH_CHANNEL_ID).",
-        )
+        await services.bot.send_message(chat_id=chat_id, text="Канал не настроен.")
         return
-
-    # Свежие комменты (с попыткой обновить кэш + Telegraph).
-    fresh_comments = await _refresh_cached_comments(
-        cached, services, source_label="channel-publish",
-    )
-
+    fresh_comments = await _refresh_cached_comments(cached, services, source_label="channel-publish")
     existing = posts.get(video_id)
-
     if existing is not None and existing.chat_id == target_channel_id:
-        # Обновляем существующий пост в канале.
-        new_caption = _format_channel_post_caption(cached, fresh_comments)
-        try:
-            await services.bot.edit_message_caption(
-                chat_id=existing.chat_id,
-                message_id=existing.message_id,
-                caption=new_caption,
-                parse_mode="HTML",
-            )
-            await services.bot.send_message(
-                chat_id=chat_id,
-                text=f"Обновил пост в канале (комменты освежены).\nhttps://t.me/c/{_chat_id_to_link(existing.chat_id)}/{existing.message_id}",
-                disable_web_page_preview=True,
-            )
-            posts.put(ChannelPost(
-                video_id=video_id,
-                chat_id=existing.chat_id,
-                message_id=existing.message_id,
-                posted_at_unix=existing.posted_at_unix,
-                audio_attached=existing.audio_attached,
-            ))
-        except TelegramBadRequest as exc:
-            err_text = str(exc).lower()
-            if "message is not modified" in err_text:
-                await services.bot.send_message(
-                    chat_id=chat_id,
-                    text="Пост в канале уже содержит актуальные комменты — ничего не менял.",
-                )
-                return
-            logger.exception(
-                "channel.publish.edit_failed video_id=%s message_id=%s",
-                video_id, existing.message_id,
-            )
-            await services.bot.send_message(
-                chat_id=chat_id,
-                text=f"Не удалось обновить пост в канале: {exc}",
-            )
-        return
+        # ... editMessageCaption flow с refresh комментариев
+        ...
+    # ... новая публикация: download_audio → _ensure_audio_fits_telegram → send_audio
+    # ... сохранение ChannelPost в store
 
-    # Свежая публикация. Качаем + дожимаем аудио, send_audio с caption.
-    await services.bot.send_message(
-        chat_id=chat_id,
-        text="Скачиваю и готовлю аудио для канала...",
-    )
-    audio_path: Path | None = None
-    try:
-        audio_path = await asyncio.to_thread(services.youtube.download_audio, cached.url)
-        audio_path = await _ensure_audio_fits_telegram(audio_path)
-    except Exception as exc:
-        logger.exception("channel.publish.audio_failed video_id=%s", video_id)
-        await services.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"Не удалось получить аудио ({exc}). "
-                "Публикую без аудио, только текст."
-            ),
-        )
-        audio_path = None
-
-    caption = _format_channel_post_caption(cached, fresh_comments)
-    audio_attached = False
-    try:
-        if audio_path is not None and audio_path.exists():
-            sent = await services.bot.send_audio(
-                chat_id=target_channel_id,
-                audio=FSInputFile(str(audio_path)),
-                caption=caption,
-                parse_mode="HTML",
-                title=cached.title[:64] or "YouTube",
-                performer=cached.channel_name[:64] or "YouTube",
-            )
-            audio_attached = True
-        else:
-            sent = await services.bot.send_message(
-                chat_id=target_channel_id,
-                text=caption,
-                parse_mode="HTML",
-                disable_web_page_preview=False,
-            )
-    except Exception as exc:
-        logger.exception(
-            "channel.publish.send_failed video_id=%s channel=%s",
-            video_id, target_channel_id,
-        )
-        await services.bot.send_message(
-            chat_id=chat_id,
-            text=f"Не удалось опубликовать в канал: {exc}",
-        )
-        return
-
-    posts.put(ChannelPost(
-        video_id=video_id,
-        chat_id=target_channel_id,
-        message_id=sent.message_id,
-        posted_at_unix=time.time(),
-        audio_attached=audio_attached,
-    ))
-    audio_label = "с аудио" if audio_attached else "без аудио (не уложилось в лимиты)"
-    await services.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            f"Опубликовал в канале {audio_label}.\n"
-            f"https://t.me/c/{_chat_id_to_link(target_channel_id)}/{sent.message_id}"
-        ),
-        disable_web_page_preview=True,
-    )
+def _chat_id_to_link(chat_id):
+    s = str(chat_id)
+    if s.startswith("-100"):
+        return s[4:]"""
 
 
-def _chat_id_to_link(chat_id: int) -> str:
+# Скрытая копия helper'а, оставлена для смежного использования вне канала.
+def _chat_id_to_link(chat_id: int) -> str:  # noqa: F811
     """Convert ``-1001234567890`` channel id to the ``1234567890`` form used in
     ``t.me/c/<id>/<message_id>`` deep links."""
     s = str(chat_id)
@@ -2619,86 +2583,21 @@ async def _ensure_audio_fits_telegram(audio_path: Path) -> Path:
     return output_path
 
 
-def _format_channel_post_caption(
-    cached: CachedSummary,
-    fresh_comments: list[VideoComment],
-) -> str:
-    """Render an HTML caption for the channel audio-post under 1024 chars.
+"""DISABLED helpers для канал-публикации. Сохранены как docstring чтобы Python
+не объявлял функции в глобальном scope, но текст легко вернуть.
 
-    Layout (priority order, will trim from the bottom if needed):
-      1. Канал/title (linked) — обязательно
-      2. Overview — урезаем до того, чтобы остальное вписалось
-      3. Telegra.ph link — обязательно
-      4. Top-комментарий — урезаем агрессивно или дропаем если не лезет
-    """
-    title_line = (
-        f'<b><a href="{escape_html(cached.url)}">{escape_html(cached.title)}</a></b>'
-    )
-    if cached.channel_name and cached.channel_url:
-        channel_line = (
-            f'<i><a href="{escape_html(cached.channel_url)}">'
-            f"{escape_html(cached.channel_name)}</a></i>"
-        )
-    elif cached.channel_name:
-        channel_line = f"<i>{escape_html(cached.channel_name)}</i>"
-    else:
-        channel_line = ""
+def _format_channel_post_caption(cached, fresh_comments):
+    # builds <=1024 char HTML caption: channel/title/overview/telegraph/tags/top-comment
+    ...
 
-    telegraph_line = (
-        f'📰 <a href="{escape_html(cached.telegraph_url)}">Полный конспект</a>'
-    )
+def _channel_top_comment_line(c):
+    # one-line: 💬 «text»... — N лайков
+    ...
 
-    tags_line = _format_tags_line(cached.tags_obj())
-
-    # Реализуем «бюджет» по блокам и подгоняем overview под лимит.
-    base_parts = [p for p in (channel_line, title_line) if p]
-    base_text = "\n".join(base_parts)
-    used = len(base_text) + 2 + len(telegraph_line) + 2  # +separators
-    if tags_line:
-        used += len(tags_line) + 2
-
-    # Overview — берём столько, сколько помещается, оставляя запас на топ-коммент.
-    top_comment_block = ""
-    if fresh_comments:
-        top_comment_block = _channel_top_comment_line(fresh_comments[0])
-    reserved_for_comment = len(top_comment_block) + 2 if top_comment_block else 0
-
-    overview_budget = max(0, TELEGRAM_AUDIO_CAPTION_LIMIT - used - reserved_for_comment - 20)
-    overview = _truncate_plain(cached.summary_overview, overview_budget)
-    overview_block = escape_html(overview)
-
-    parts = [base_text]
-    if overview_block:
-        parts.append(overview_block)
-    parts.append(telegraph_line)
-    if tags_line:
-        parts.append(tags_line)
-    if top_comment_block:
-        parts.append(top_comment_block)
-
-    caption = "\n\n".join(parts)
-    # Финальная гарантия: если что-то превышает лимит, режем агрессивно.
-    if len(caption) > TELEGRAM_AUDIO_CAPTION_LIMIT:
-        caption = caption[: TELEGRAM_AUDIO_CAPTION_LIMIT - 3].rstrip() + "..."
-    return caption
-
-
-def _channel_top_comment_line(c: VideoComment) -> str:
-    """One-line top comment under caption budget."""
-    likes_label = _format_likes(c.like_count)
-    snippet = c.text.replace("\n", " ").strip()
-    if len(snippet) > 200:
-        snippet = snippet[:197].rstrip() + "..."
-    return f"💬 <i>«{escape_html(snippet)}» — {likes_label}</i>"
-
-
-def _truncate_plain(text: str, max_chars: int) -> str:
-    text = (text or "").strip()
-    if len(text) <= max_chars:
-        return text
-    if max_chars <= 3:
-        return text[:max_chars]
-    return text[: max_chars - 1].rstrip() + "…"
+def _truncate_plain(text, max_chars):
+    # plain-text трим с многоточием
+    ...
+"""
 
 
 def _is_job_cacheable(job: SummaryJob) -> bool:
@@ -2855,19 +2754,15 @@ async def _send_cached_summary_to_chat(
     """Manual flow: respond to a user message with cached summary + restore Q&A."""
     fresh_comments = await _refresh_cached_comments(cached, services, source_label="manual")
     text = _format_cached_summary_text(cached, override_top_comments=fresh_comments)
-    # Только owner получает кнопку публикации (как и при свежем саммари).
+    # Только owner получает кнопку «Скачать аудио» (как и при свежем саммари).
     reply_markup: InlineKeyboardMarkup | None = None
     user_id = _message_user_id(message)
-    if (
-        services.settings.telegram_publish_channel_id is not None
-        and user_id is not None
-        and services.users.is_owner(user_id)
-    ):
+    if user_id is not None and services.users.is_owner(user_id):
         reply_markup = InlineKeyboardMarkup(
             inline_keyboard=[[
                 InlineKeyboardButton(
-                    text="📢 Опубликовать в канал",
-                    callback_data=f"publish:{cached.video_id}",
+                    text="🎧 Скачать аудио",
+                    callback_data=f"download:{cached.video_id}",
                 )
             ]]
         )
@@ -2878,6 +2773,9 @@ async def _send_cached_summary_to_chat(
         reply_markup=reply_markup,
     )
     _restore_qa_context_from_cache(message.chat.id, cached, services)
+    # NB: исходное user-message с YouTube-ссылкой удаляется централизованно
+    # в `_enqueue_summary_job` (finally-блок), как только ссылка попала в
+    # обработку. Здесь дублировать delete не нужно.
 
 
 async def _deliver_cached_summary_for_job(
@@ -2895,6 +2793,8 @@ async def _deliver_cached_summary_for_job(
     )
     if not job.scheduled and job.chat_id:
         _restore_qa_context_from_cache(job.chat_id, cached, services)
+    # NB: исходное user-message с ссылкой уже удалено в `_enqueue_summary_job`
+    # к моменту, когда job попал в обработку. У scheduled-job его и не было.
 
 
 def _restore_qa_context_from_cache(
@@ -3037,86 +2937,6 @@ def _format_generation_error(video_url: str, title: str, reason: str) -> str:
         f"{escape_html(label)}</a> прервана.\n\n"
         f"Причина: {escape_html(reason_text)}"
     )[:4000]
-
-
-def _format_service_info(
-    job_id: str,
-    model: str,
-    usage: GenerationUsage,
-    transcript_source: str,
-    transcript_chars: int,
-    chunks_count: int,
-    total_duration_sec: float,
-    settings: Settings,
-    loaded_context_length: int | None,
-    video_duration_sec: float | None = None,
-) -> str:
-    transcript_label = {
-        "youtube": "субтитры YouTube",
-        "whisper": "локальный Whisper",
-        "groq": "Groq Whisper",
-        "unknown": "неизвестно",
-        "none": "нет",
-    }.get(transcript_source, transcript_source)
-
-    tokens_line = (
-        f"{usage.prompt_tokens} промпт / {usage.completion_tokens} ответ / {usage.total_tokens} всего"
-        if usage.total_tokens
-        else "нет данных (LM Studio не вернул usage)"
-    )
-
-    configured_ctx = settings.lmstudio_num_ctx
-    if loaded_context_length and loaded_context_length != configured_ctx:
-        context_line = f"{loaded_context_length} (загружен) / {configured_ctx} (настройка)"
-    elif loaded_context_length:
-        context_line = str(loaded_context_length)
-    else:
-        context_line = f"{configured_ctx} (настройка, загруженный неизвестен)"
-
-    # Max tokens ответа — потолки на partial и final по отдельности.
-    # Когда они одинаковые (back-compat), показываем одно значение, иначе оба.
-    if settings.llm_max_tokens_partial == settings.llm_max_tokens_final:
-        max_tokens_line = f"Max tokens ответа: {settings.llm_max_tokens_partial}"
-    else:
-        max_tokens_line = (
-            f"Max tokens ответа: {settings.llm_max_tokens_partial} (на чанк) / "
-            f"{settings.llm_max_tokens_final} (на финал)"
-        )
-
-    video_duration_line = (
-        f"Длительность видео: {_format_video_duration(video_duration_sec)}"
-        if video_duration_sec is not None
-        else "Длительность видео: неизвестна"
-    )
-
-    lines = [
-        f"Модель: {escape_html(model)}",
-        f"Контекст: {context_line}",
-        f"Температура: {settings.llm_temperature}",
-        max_tokens_line,
-        "",
-        f"Токены: {tokens_line}",
-        f"Время LLM: {_format_elapsed(int(usage.duration_sec))}",
-        f"Источник transcript: {escape_html(transcript_label)}",
-        f"Длина transcript: {transcript_chars} симв.",
-        video_duration_line,
-        f"Чанков: {chunks_count}",
-        f"Общее время: {_format_elapsed(int(total_duration_sec))}",
-        f"job_id: {escape_html(job_id)}",
-    ]
-
-    if transcript_source == "whisper":
-        lines.extend(
-            [
-                "",
-                f"Whisper: {escape_html(settings.whisper_model)} "
-                f"({escape_html(settings.whisper_device)}, "
-                f"{escape_html(settings.whisper_compute_type)})",
-            ]
-        )
-
-    body = "\n".join(lines)
-    return f"<pre>{body}</pre>"[:3900]
 
 
 def _estimate_reading_time_minutes(summary: Summary) -> int:

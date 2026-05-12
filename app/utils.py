@@ -8,12 +8,22 @@ from urllib.parse import parse_qs, urlparse
 YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
 
 
-def extract_youtube_url(text: str) -> str | None:
+def extract_first_url(text: str) -> str | None:
+    """Return the first http(s) URL found in *text*, stripped of trailing
+    punctuation. Domain/origin is **not** validated — caller decides what to
+    do with it. Returns ``None`` if no URL is present.
+    """
     match = re.search(r"https?://[^\s<>]+", text)
     if not match:
         return None
+    return match.group(0).rstrip(".,;)")
 
-    url = match.group(0).rstrip(".,;)")
+
+def extract_youtube_url(text: str) -> str | None:
+    url = extract_first_url(text)
+    if not url:
+        return None
+
     parsed = urlparse(url)
     host = parsed.netloc.lower()
     if host in YOUTUBE_HOSTS or host.endswith(".youtube.com"):

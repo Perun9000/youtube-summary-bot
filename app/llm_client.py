@@ -345,10 +345,22 @@ class OpenRouterClient:
                 await asyncio.sleep(delay)
 
         models_tried = ", ".join(chain)
+        # Если последняя ошибка — 402, это почти всегда дневной USD-cap
+        # OpenRouter free-tier (50 запросов/день без депозита, 1000/день с
+        # депозитом ≥ $10). Сброс — в 00:00 UTC. Подсказка пользователю это
+        # отдельной строкой.
+        last_err_str = str(last_error or "")
+        is_quota_402 = "402" in last_err_str or "spend limit exceeded" in last_err_str.lower()
+        suffix = (
+            "Дневной free-tier лимит OpenRouter исчерпан (сброс в 00:00 UTC, "
+            "= 03:00 МСК). Варианты: подождать, /llm_paid, или положить ≥ $10 "
+            "на OpenRouter (Settings → Credits) — поднимет cap до 1000 req/day."
+            if is_quota_402
+            else "Попробуй позже или переключись на платную через /llm_paid."
+        )
         raise RuntimeError(
             f"OpenRouter: все free-модели в цепочке отказались отвечать за {passes} проходов "
-            f"({models_tried}). Последняя ошибка: {last_error}. "
-            "Попробуй позже или переключись на платную через /llm_paid."
+            f"({models_tried}). Последняя ошибка: {last_error}. {suffix}"
         )
 
     async def _generate_with_retries(
@@ -435,14 +447,22 @@ class OpenRouterClient:
                 raise _OpenRouterRetriable(f"http_error:{type(exc).__name__}", exc) from exc
 
             status = response.status_code
-            if status == 429 or 500 <= status < 600:
+            # Retriable statuses:
+            # - 429: rate-limit от самого OpenRouter
+            # - 402: «Payment Required» от провайдера. На free-моделях
+            #   OpenRouter возвращает его, когда даунстрим-провайдер (Venice,
+            #   Chutes, DeepInfra) упёрся в свой суточный USD-cap для free-trafic.
+            #   У разных моделей в цепочке — разные провайдеры, поэтому
+            #   следующая в chain'е может ответить нормально.
+            # - 5xx: серверные сбои.
+            if status == 429 or status == 402 or 500 <= status < 600:
                 detail = response.text.strip().replace("\n", " ")[:300]
                 exc = RuntimeError(f"OpenRouter HTTP {status}: {detail}")
                 raise _OpenRouterRetriable(f"http_{status}", exc)
             try:
                 _raise_for_status(response, "OpenRouter")
             except RuntimeError as exc:
-                # Non-retriable: 401, 402, 403, 404, 4xx (except 429), etc.
+                # Non-retriable: 401, 403, 404, 4xx (кроме 429/402), etc.
                 raise
 
             data = response.json()
