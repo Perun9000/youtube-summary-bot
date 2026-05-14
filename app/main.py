@@ -16,6 +16,7 @@ from aiogram.types import (
 
 from app.bot_handlers import Services, build_router, enqueue_scheduled_candidate
 from app.config import Settings, load_settings
+from app.digest_service import DigestStore
 from app.groq_whisper_service import GroqWhisperService
 from app.llm_client import create_llm_client, health_check_with_reason
 from app.channel_posts_store import ChannelPostsStore
@@ -148,6 +149,15 @@ async def main() -> None:
         len(tags_catalog.all_tags("format")),
         len(tags_catalog.all_tags("channel")),
     )
+
+    digest_store = DigestStore(
+        digests_path=settings.digests_path,
+        pins_path=settings.digest_pins_path,
+    )
+    logger.info(
+        "digests.boot digests_path=%s pins_path=%s",
+        settings.digests_path, settings.digest_pins_path,
+    )
     user_store = UserStore(
         settings.allowed_users_path,
         seed_user_ids=settings.allowed_user_ids,
@@ -194,6 +204,7 @@ async def main() -> None:
         summary_cache=summary_cache,
         channel_posts=channel_posts,
         tags_catalog=tags_catalog,
+        digests=digest_store,
     )
 
     scheduler_task: asyncio.Task[None] | None = None

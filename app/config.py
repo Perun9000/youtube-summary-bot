@@ -68,6 +68,8 @@ class Settings:
     telegram_publish_channel_id: int | None
     channel_posts_path: Path
     tags_catalog_path: Path
+    digests_path: Path
+    digest_pins_path: Path
 
     def effective_chunk_max_chars(self, active_model: str | None = None) -> int:
         """Pick the chunk size that best fits the LLM that will actually run.
@@ -143,6 +145,12 @@ def load_settings() -> Settings:
     ).expanduser()
     tags_catalog_path = Path(
         os.getenv("TAGS_CATALOG_PATH", str(data_dir / "tags_catalog.json"))
+    ).expanduser()
+    digests_path = Path(
+        os.getenv("DIGESTS_PATH", str(data_dir / "digests.json"))
+    ).expanduser()
+    digest_pins_path = Path(
+        os.getenv("DIGEST_PINS_PATH", str(data_dir / "digest_pins.json"))
     ).expanduser()
 
     llm_provider = os.getenv("LLM_PROVIDER", "lmstudio").strip().lower() or "lmstudio"
@@ -290,4 +298,6 @@ def load_settings() -> Settings:
         telegram_publish_channel_id=telegram_publish_channel_id,
         channel_posts_path=channel_posts_path,
         tags_catalog_path=tags_catalog_path,
+        digests_path=digests_path,
+        digest_pins_path=digest_pins_path,
     )

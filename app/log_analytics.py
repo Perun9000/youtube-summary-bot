@@ -159,6 +159,11 @@ class Stats:
 
     # Errors
     errors: int = 0
+    # Распределение ERROR-строк по источнику. Ключ — "<logger>/<event.name>"
+    # (например, "app.bot_handlers/job.comments.failed"). Это нужно чтобы в
+    # /stats показать «откуда идут» 90% ошибок, а не просто общее число —
+    # иначе цифра выглядит пугающей и непонятно что делать.
+    errors_by_source: dict[str, int] = field(default_factory=lambda: defaultdict(int))
 
 
 def aggregate(events: Iterable[LogEvent]) -> Stats:
@@ -174,6 +179,12 @@ def aggregate(events: Iterable[LogEvent]) -> Stats:
 def _ingest(s: Stats, ev: LogEvent) -> None:
     if ev.level == "ERROR":
         s.errors += 1
+        # ``ev.name`` это первое слово сообщения (например "job.comments.failed"
+        # или просто "Traceback" если строка — это часть стектрейса). Для
+        # стектрейсов получится мусорный ключ — это OK, они и должны попасть
+        # в «other», в топе их видно не будет.
+        source = f"{ev.logger}/{ev.name}" if ev.name else ev.logger
+        s.errors_by_source[source] += 1
 
     name = ev.name
     kv = ev.kv
@@ -370,7 +381,13 @@ def format_markdown(
         lines.append("")
 
     if s.errors:
-        lines.append(f"## Ошибки\n- ERROR-строк в логах: {s.errors}")
+        lines.append("## Ошибки")
+        lines.append(f"- ERROR-строк в логах: {s.errors}")
+        if s.errors_by_source:
+            lines.append("\n**Топ источников:**")
+            top = sorted(s.errors_by_source.items(), key=lambda x: x[1], reverse=True)[:10]
+            for source, n in top:
+                lines.append(f"- {source}: {n}")
         lines.append("")
 
     return "\n".join(lines)
@@ -469,7 +486,12 @@ def format_telegram(
             parts.append("\n".join(ch_lines))
 
     if s.errors:
-        parts.append(f"\n<b>⚠ Ошибок:</b> {s.errors}")
+        err_lines = [f"\n<b>⚠ Ошибок:</b> {s.errors}"]
+        if s.errors_by_source:
+            top = sorted(s.errors_by_source.items(), key=lambda x: x[1], reverse=True)[:3]
+            for source, n in top:
+                err_lines.append(f"  {source}: {n}")
+        parts.append("\n".join(err_lines))
 
     text = "\n".join(parts)
     if len(text) > 4000:

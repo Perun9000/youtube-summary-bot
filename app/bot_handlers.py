@@ -26,6 +26,7 @@ from aiogram.types import (
 
 from app.config import Settings
 from app.channel_posts_store import ChannelPost, ChannelPostsStore
+from app.digest_service import DigestEntry, DigestStore, update_pin_for_user
 from app.groq_whisper_service import GroqWhisperService, GroqWhisperUnavailable
 from app import log_analytics
 from app.llm_client import GenerationUsage, LLMClient, OpenRouterClient, health_check_with_reason
@@ -128,6 +129,7 @@ class Services:
     summary_cache: "SummaryCache | None" = None
     channel_posts: "ChannelPostsStore | None" = None
     tags_catalog: "TagsCatalog | None" = None
+    digests: "DigestStore | None" = None
     # Двухшаговые админ-команды («введи /user_add — бот спросит — ты отвечаешь
     # данными в следующем сообщении»). Ключ — chat_id, значение —
     # PendingAdminInput. Не персистится: после рестарта диалог теряется,
@@ -1764,8 +1766,10 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             )
         try:
             top_comments = await comments_task
-        except Exception:
-            logger.exception("job.comments.await_failed job_id=%s", job_id)
+        except Exception as exc:  # noqa: BLE001
+            # Не ERROR: для роликов без комментариев / с отключёнными комментами
+            # это ожидаемый кейс. Идём дальше без top-комментария.
+            logger.warning("job.comments.await_failed job_id=%s error=%s", job_id, exc)
             top_comments = []
 
         if transcript_publish_task is not None:
@@ -1839,6 +1843,23 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
         # summary…» и т.п.) дослужило — удаляем его, чтобы в чате осталось
         # только финальное саммари.
         await _delete_service_status(services, chat_id)
+
+        # Обновляем закреплённый дайджест последних саммари у пользователя
+        # (или у owner'а — для scheduled-job'ов из monitoring). Ошибки тут
+        # глушатся внутри хелпера — доставка саммари важнее, чем закреп.
+        target = _resolve_digest_target(services, message, job)
+        if target is not None:
+            user_id, digest_chat_id = target
+            await _update_user_digest_safely(
+                services,
+                user_id=user_id,
+                chat_id=digest_chat_id,
+                video_id=video_id,
+                title=title,
+                telegraph_url=telegraph_url,
+                channel_name=getattr(metadata, "channel_name", "") or "",
+                created_at_unix=time.time(),
+            )
         # NB: исходное user-message с YouTube-ссылкой удалили ещё на этапе
         # `_enqueue_summary_job` (finally-блок), как только ссылка попала
         # в очередь. Здесь ничего удалять не нужно.
@@ -1950,8 +1971,12 @@ async def _fetch_top_comments_background(
     except asyncio.CancelledError:
         logger.info("job.comments.cancelled job_id=%s", job_id)
         raise
-    except Exception:
-        logger.exception("job.comments.failed job_id=%s", job_id)
+    except Exception as exc:  # noqa: BLE001
+        # Не ERROR: yt-dlp на comments-extractor'е регулярно падает на роликах
+        # с отключёнными / залоченными комментами. Это ожидаемый failure-mode,
+        # пользователю он не виден (саммари всё равно публикуется), так что
+        # пусть будет WARNING, чтобы не портить error-counter в /stats.
+        logger.warning("job.comments.failed job_id=%s error=%s", job_id, exc)
         return []
 
 
@@ -2777,6 +2802,23 @@ async def _send_cached_summary_to_chat(
     # в `_enqueue_summary_job` (finally-блок), как только ссылка попала в
     # обработку. Здесь дублировать delete не нужно.
 
+    # Обновляем pinned digest пользователя — даже на cache-hit это полезно:
+    # запись переедет наверх (last-accessed-first), пользователь увидит, что
+    # ролик «свежий». Ошибки глушатся внутри хелпера.
+    target = _resolve_digest_target(services, message, None)
+    if target is not None:
+        user_id, digest_chat_id = target
+        await _update_user_digest_safely(
+            services,
+            user_id=user_id,
+            chat_id=digest_chat_id,
+            video_id=cached.video_id,
+            title=cached.title,
+            telegraph_url=cached.telegraph_url,
+            channel_name=cached.channel_name or "",
+            created_at_unix=cached.created_at_unix or time.time(),
+        )
+
 
 async def _deliver_cached_summary_for_job(
     job: SummaryJob,
@@ -2795,6 +2837,21 @@ async def _deliver_cached_summary_for_job(
         _restore_qa_context_from_cache(job.chat_id, cached, services)
     # NB: исходное user-message с ссылкой уже удалено в `_enqueue_summary_job`
     # к моменту, когда job попал в обработку. У scheduled-job его и не было.
+
+    # Обновляем pinned digest. Для scheduled-job (monitoring) кладём в owner.
+    target = _resolve_digest_target(services, job.message, job)
+    if target is not None:
+        user_id, digest_chat_id = target
+        await _update_user_digest_safely(
+            services,
+            user_id=user_id,
+            chat_id=digest_chat_id,
+            video_id=cached.video_id,
+            title=cached.title,
+            telegraph_url=cached.telegraph_url,
+            channel_name=cached.channel_name or "",
+            created_at_unix=cached.created_at_unix or time.time(),
+        )
 
 
 def _restore_qa_context_from_cache(
@@ -3017,3 +3074,71 @@ def _job_is_owner(job: SummaryJob, services: Services) -> bool:
 
 def _message_user_id(message: Message) -> int | None:
     return message.from_user.id if message.from_user else None
+
+
+def _resolve_digest_target(
+    services: Services,
+    message: Message | None,
+    job: SummaryJob | None = None,
+) -> tuple[int, int] | None:
+    """Return (user_id, chat_id) for pinning a digest, or None to skip.
+
+    Manual flow → берём from_user.id и message.chat.id.
+    Scheduled flow (job.message is None / from monitoring) → owner_user_id
+    в его private-чате с ботом (chat_id == owner_user_id). Если owner не
+    настроен — пропускаем (некому показывать).
+    """
+    if message is not None and message.from_user is not None:
+        return message.from_user.id, message.chat.id
+    owner = services.settings.owner_user_id
+    if owner is None:
+        return None
+    return owner, owner
+
+
+async def _update_user_digest_safely(
+    services: Services,
+    user_id: int,
+    chat_id: int,
+    *,
+    video_id: str,
+    title: str,
+    telegraph_url: str,
+    channel_name: str,
+    created_at_unix: float,
+) -> None:
+    """Fire-and-forget обёртка над update_pin_for_user.
+
+    Никогда не падает — ошибки логирует и проглатывает. Вызывается из путей
+    доставки саммари, и обновление дайджеста не должно блокировать или ронять
+    доставку. Если digest_store не подключен (`services.digests is None`) или
+    бот ещё не инициализирован — тоже тихо выходим.
+    """
+    digests = services.digests
+    bot = services.bot
+    if digests is None or bot is None:
+        return
+    if not telegraph_url:
+        # Без Telegra.ph-ссылки тапать в дайджесте будет некуда —
+        # такая запись бесполезна. Пропускаем.
+        return
+    entry = DigestEntry(
+        video_id=video_id,
+        title=title or video_id,
+        telegraph_url=telegraph_url,
+        channel_name=channel_name or "",
+        created_at_unix=created_at_unix or time.time(),
+    )
+    try:
+        await update_pin_for_user(
+            store=digests,
+            bot=bot,
+            user_id=user_id,
+            chat_id=chat_id,
+            entry=entry,
+        )
+    except Exception:
+        logger.exception(
+            "digests.update_failed user_id=%s chat_id=%s video_id=%s",
+            user_id, chat_id, video_id,
+        )
