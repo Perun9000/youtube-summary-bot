@@ -26,7 +26,7 @@ from aiogram.types import (
 
 from app.config import Settings
 from app.channel_posts_store import ChannelPost, ChannelPostsStore
-from app.digest_service import DigestEntry, DigestStore, update_pin_for_user
+from app.digest_service import DigestEntry, DigestStore, render_digest_html, update_pin_for_user
 from app.groq_whisper_service import GroqWhisperService, GroqWhisperUnavailable
 from app import log_analytics
 from app.llm_client import GenerationUsage, LLMClient, OpenRouterClient, health_check_with_reason
@@ -169,7 +169,8 @@ def build_router(services: Services) -> Router:
             await message.answer(
                 "Доступные команды:\n"
                 "/start - начать работу\n"
-                "/help - помощь\n\n"
+                "/help - помощь\n"
+                "/last - последние 20 саммари\n\n"
                 "Пришли ссылку на YouTube-ролик — я верну краткое summary здесь "
                 "и полный конспект в Telegra.ph. После обработки можно задавать "
                 "вопросы по ролику в этом же чате."
@@ -177,6 +178,7 @@ def build_router(services: Services) -> Router:
             return
         await message.answer(
             "Команды:\n"
+            "/last - последние 20 саммари\n\n"
             "/users - список пользователей\n\n"
             "/user_add - добавить пользователя (бот спросит id и имя)\n\n"
             "/user_remove - удалить пользователя (бот спросит id)\n\n"
@@ -192,6 +194,32 @@ def build_router(services: Services) -> Router:
             "/llm_paid - переключить OpenRouter между paid и free (тоггл)\n\n"
             "После обработки ролика можно задавать вопросы по нему в этом же чате. "
             "Контекст хранится в памяти контейнера до рестарта."
+        )
+
+    @router.message(Command("last"))
+    async def last_command(message: Message) -> None:
+        if not _is_allowed(message, services):
+            await message.answer("Этот бот закрыт для личного использования.")
+            return
+        user_id = _message_user_id(message)
+        if user_id is None:
+            await message.answer(
+                "Не получилось определить твой Telegram-id. Перезапусти диалог через /start."
+            )
+            return
+        if services.digests is None:
+            await message.answer(
+                "Архив саммари сейчас не активен (DigestStore не подключён)."
+            )
+            return
+        entries = services.digests.list(user_id)
+        # Тот же рендер, что и у закреплённого digest'а — список одинаков,
+        # просто отправляется свежим сообщением (без pin'а).
+        text = render_digest_html(entries)
+        await message.answer(
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
         )
 
     @router.message(Command("users"))

@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 PUBLIC_BOT_COMMANDS: list[BotCommand] = [
     BotCommand(command="start", description="Начать работу"),
     BotCommand(command="help", description="Что умеет бот"),
+    BotCommand(command="last", description="Последние 20 саммари"),
 ]
 
 OWNER_BOT_COMMANDS: list[BotCommand] = [
