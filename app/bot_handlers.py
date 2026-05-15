@@ -1101,7 +1101,21 @@ async def _process_transcription_job(job: SummaryJob, services: Services) -> Non
     )
 
     download_started = time.monotonic()
-    audio_path = await asyncio.to_thread(services.youtube.download_audio, job.url)
+    try:
+        audio_path = await asyncio.to_thread(services.youtube.download_audio, job.url)
+    except Exception as exc:
+        # Самые частые кейсы: members-only, Private, geo-block, age-gate,
+        # ролик удалён, идущая прямая трансляция. В лог пишем как WARNING
+        # (это не баг бота — мы физически не имеем доступа к ролику),
+        # пользователю шлём человеческую причину.
+        reason = _classify_youtube_download_error(exc)
+        download_duration = time.monotonic() - download_started
+        logger.warning(
+            "transcription_queue.audio_download.failed sequence=%s url=%s duration_sec=%.1f reason=%r error=%s",
+            job.sequence, job.url, download_duration, reason, exc,
+        )
+        await _send_transcription_failure(services, job, reason)
+        return
     download_duration = time.monotonic() - download_started
     logger.info(
         "transcription_queue.audio_download.done sequence=%s path=%s duration_sec=%.1f",
@@ -1179,7 +1193,12 @@ def _cleanup_audio_file(audio_path) -> None:
 
 
 async def _send_transcription_failure(services: Services, job: SummaryJob, reason: str) -> None:
-    """Tell the user the job died in transcription; don't re-enqueue."""
+    """Tell the user the job died in transcription; don't re-enqueue.
+
+    После доставки финального сообщения чистим зависший status («Скачиваю
+    аудио…» / «Распознаю…») — иначе у пользователя в чате висят сразу два
+    сообщения: бесполезный статус и наш текст с причиной.
+    """
     text = (
         f"Не удалось получить транскрипт ролика.\n\n"
         f"Причина: {reason}\n\n"
@@ -1198,6 +1217,92 @@ async def _send_transcription_failure(services: Services, job: SummaryJob, reaso
         logger.exception(
             "transcription_queue.failure_delivery_failed sequence=%s", job.sequence
         )
+    # Чистим service-status: пользователь только что увидел финальный текст
+    # с причиной, status-сообщение «Скачиваю аудио…» больше не нужно.
+    if job.chat_id:
+        await _delete_service_status(services, job.chat_id)
+
+
+# Подстроки → человеческая причина. Сравнение case-insensitive, на сообщении
+# исключения. Если ничего не подошло — отдадим первые 200 символов исходной
+# ошибки, чтобы не молчать.
+_YT_DLP_ERROR_HINTS: tuple[tuple[str, str], ...] = (
+    (
+        "members-only",
+        "Видео доступно только подписчикам канала (members-only). "
+        "Без аутентификации бот его не обработает.",
+    ),
+    (
+        "join this channel to get access",
+        "Видео доступно только подписчикам канала (members-only). "
+        "Без аутентификации бот его не обработает.",
+    ),
+    (
+        "private video",
+        "Ролик помечен как Private. Доступен только тем, у кого есть прямая ссылка-приглашение от автора.",
+    ),
+    (
+        "video unavailable",
+        "Ролик недоступен (удалён автором, заблокирован правообладателем или скрыт в этом регионе).",
+    ),
+    (
+        "removed by the uploader",
+        "Ролик удалён автором.",
+    ),
+    (
+        "this video has been removed",
+        "Ролик удалён с YouTube.",
+    ),
+    (
+        "sign in to confirm your age",
+        "Ролик с возрастным ограничением — YouTube требует логин. Бот его не обработает.",
+    ),
+    (
+        "sign in to confirm you",
+        "YouTube требует логин для просмотра (anti-bot или возрастная проверка). Бот не пройдёт.",
+    ),
+    (
+        "geo restricted",
+        "Ролик заблокирован в регионе, из которого работает бот.",
+    ),
+    (
+        "blocked it in your country",
+        "Ролик заблокирован правообладателем в регионе бота.",
+    ),
+    (
+        "live event",
+        "Это идущая прямая трансляция — её нельзя суммаризировать, пока не закончится.",
+    ),
+    (
+        "premiere",
+        "Это премьера, которая ещё не началась — ролика как такового пока нет.",
+    ),
+    (
+        "this live stream recording is not available",
+        "Запись прямой трансляции недоступна.",
+    ),
+)
+
+
+def _classify_youtube_download_error(exc: Exception) -> str:
+    """Map a yt-dlp exception to a friendly Russian reason for the user.
+
+    yt-dlp валит сразу в две слоя: ``ExtractorError`` (отказ на этапе
+    разбора метаданных, например ``raise_no_formats``) и ``DownloadError``
+    (обёртка над ним и над сетевыми сбоями). Сообщения у них в основном
+    одинаковые, поэтому сравниваем именно текст по подстрокам.
+    """
+    raw = str(exc) or exc.__class__.__name__
+    lowered = raw.lower()
+    for needle, hint in _YT_DLP_ERROR_HINTS:
+        if needle in lowered:
+            return hint
+    # Никакой known-pattern не подошёл — отдадим обрезанный raw, всё-таки
+    # это сообщение от yt-dlp, обычно осмысленное.
+    snippet = raw.strip().replace("\n", " ")
+    if len(snippet) > 200:
+        snippet = snippet[:197].rstrip() + "..."
+    return f"yt-dlp не смог скачать аудио: {snippet}"
 
 
 async def _stop_summary_queue(message: Message, services: Services) -> None:
