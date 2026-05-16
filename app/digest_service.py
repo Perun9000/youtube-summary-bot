@@ -234,6 +234,13 @@ def render_digest_html(entries: list[DigestEntry]) -> str:
 
     Each line gets a short date for orientation and the channel name as
     suffix (when known). Title acts as the hyperlink to the Telegra.ph page.
+
+    Безопасность относительно Telegram'овского лимита (4096 char): строим
+    список построчно, на каждой итерации проверяем «влезет ли». Как только
+    добавление следующей записи перевалит ``MAX_DIGEST_CHARS`` — стопаем
+    и кладём «и ещё N» хвостом. Так html остаётся валидным (каждая строка —
+    целое ``<a>…</a>``), без риска поймать ``can't parse entities: Unclosed
+    start tag``.
     """
     if not entries:
         return (
@@ -242,7 +249,15 @@ def render_digest_html(entries: list[DigestEntry]) -> str:
         )
 
     head = "📚 <b>Последние саммари</b>\n"
-    lines: list[str] = [head]
+    # Резерв под хвост «и ещё N» — берём щедро, чтобы тройной заход
+    # ('и ещё 99…') гарантированно влез.
+    tail_reserve = 40
+    budget = MAX_DIGEST_CHARS - tail_reserve
+
+    rendered_lines: list[str] = [head]
+    used = len(head)
+    skipped = 0
+
     for e in entries:
         date_label = _format_short_date(e.created_at_unix)
         title = escape_html(e.title or e.video_id)
@@ -251,16 +266,18 @@ def render_digest_html(entries: list[DigestEntry]) -> str:
         channel = (e.channel_name or "").strip()
         if channel:
             suffix = f" · {escape_html(channel)}"
-        lines.append(
-            f"{date_label} — 🎬 <a href=\"{url}\">{title}</a>{suffix}"
-        )
-    body = "\n".join(lines)
-    if len(body) <= MAX_DIGEST_CHARS:
-        return body
-    # Hard cap — режем хвост. На 20 записей не должно случиться,
-    # но если у кого-то будут аномально длинные заголовки/каналы —
-    # лучше показать половину, чем 400 от Telegram'а.
-    return body[: MAX_DIGEST_CHARS - 3].rstrip() + "…"
+        line = f"{date_label} — 🎬 <a href=\"{url}\">{title}</a>{suffix}"
+        # +1 за разделитель ``\n`` между строками.
+        cost = len(line) + 1
+        if used + cost > budget:
+            skipped = len(entries) - (len(rendered_lines) - 1)
+            break
+        rendered_lines.append(line)
+        used += cost
+
+    if skipped:
+        rendered_lines.append(f"\n<i>… и ещё {skipped}</i>")
+    return "\n".join(rendered_lines)
 
 
 def _format_short_date(unix_ts: float) -> str:
