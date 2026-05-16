@@ -32,7 +32,6 @@ import asyncio
 import json
 import logging
 import threading
-import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -225,22 +224,27 @@ class DigestStore:
 def render_digest_html(entries: list[DigestEntry]) -> str:
     """Render the digest body for Telegram (HTML parse-mode).
 
-    Layout:
+    Layout (top → bottom = oldest → newest, чтобы свежее саммари визуально
+    оказывалось ближе к низу сообщения, по логике чата):
+
         📚 <b>Последние саммари</b>
 
-        13.05 — 🎬 <a href="https://telegra.ph/...">Заголовок ролика</a>
-        12.05 — 🎬 <a href="...">Другой заголовок</a> · Канал
-        ...
+        • <a href="https://telegra.ph/...">Старый заголовок</a> · Канал
+        • <a href="...">…</a>
+        • <a href="https://telegra.ph/...">Самый свежий заголовок</a>
 
-    Each line gets a short date for orientation and the channel name as
-    suffix (when known). Title acts as the hyperlink to the Telegra.ph page.
+    Each entry — буллит + title-как-гиперссылка на Telegra.ph + опциональный
+    суффикс « · Канал ».
 
-    Безопасность относительно Telegram'овского лимита (4096 char): строим
-    список построчно, на каждой итерации проверяем «влезет ли». Как только
-    добавление следующей записи перевалит ``MAX_DIGEST_CHARS`` — стопаем
-    и кладём «и ещё N» хвостом. Так html остаётся валидным (каждая строка —
-    целое ``<a>…</a>``), без риска поймать ``can't parse entities: Unclosed
-    start tag``.
+    Безопасность относительно Telegram'овского лимита (4096 char):
+    идём по списку **сверху** (новейшие первыми, как хранит DigestStore)
+    и складываем строки, пока влезает. Когда упёрлись в бюджет — молча
+    стопаемся. В видимый набор всегда попадают самые свежие записи,
+    обрезаются самые старые (без какого-либо «… ещё N» индикатора —
+    пользователь просто видит ровно столько роликов, сколько помещается).
+    Затем переворачиваем порядок (oldest at top, newest at bottom).
+    HTML всегда валиден (каждая строка — целое ``<a>…</a>``), 400-ка от
+    Telegram'а нам не грозит даже на длинных заголовках.
     """
     if not entries:
         return (
@@ -248,46 +252,28 @@ def render_digest_html(entries: list[DigestEntry]) -> str:
             "<i>Пока пусто. Пришли YouTube-ссылку — и здесь появится первая запись.</i>"
         )
 
-    head = "📚 <b>Последние саммари</b>\n"
-    # Резерв под хвост «и ещё N» — берём щедро, чтобы тройной заход
-    # ('и ещё 99…') гарантированно влез.
-    tail_reserve = 40
-    budget = MAX_DIGEST_CHARS - tail_reserve
+    head = "📚 <b>Последние саммари</b>"
+    budget = MAX_DIGEST_CHARS
 
-    rendered_lines: list[str] = [head]
-    used = len(head)
-    skipped = 0
+    included: list[str] = []
+    # +2 — head + пустая строка после head.
+    used = len(head) + 2
 
-    for e in entries:
-        date_label = _format_short_date(e.created_at_unix)
+    for e in entries:  # хранилище отдаёт newest-first
         title = escape_html(e.title or e.video_id)
         url = escape_html(e.telegraph_url)
-        suffix = ""
         channel = (e.channel_name or "").strip()
-        if channel:
-            suffix = f" · {escape_html(channel)}"
-        line = f"{date_label} — 🎬 <a href=\"{url}\">{title}</a>{suffix}"
-        # +1 за разделитель ``\n`` между строками.
-        cost = len(line) + 1
+        suffix = f" · {escape_html(channel)}" if channel else ""
+        line = f"• <a href=\"{url}\">{title}</a>{suffix}"
+        cost = len(line) + 1  # +1 за разделитель «\n»
         if used + cost > budget:
-            skipped = len(entries) - (len(rendered_lines) - 1)
             break
-        rendered_lines.append(line)
+        included.append(line)
         used += cost
 
-    if skipped:
-        rendered_lines.append(f"\n<i>… и ещё {skipped}</i>")
-    return "\n".join(rendered_lines)
-
-
-def _format_short_date(unix_ts: float) -> str:
-    if not unix_ts:
-        return "  —  "
-    try:
-        t = time.localtime(unix_ts)
-        return time.strftime("%d.%m", t)
-    except Exception:  # noqa: BLE001
-        return "  —  "
+    # Переворачиваем: старые наверху, новые внизу.
+    included.reverse()
+    return "\n".join([head, "", *included])
 
 
 # ──────────────────────────── pin update ────────────────────────────
