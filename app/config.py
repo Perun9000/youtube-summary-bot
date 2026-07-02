@@ -70,6 +70,7 @@ class Settings:
     tags_catalog_path: Path
     digests_path: Path
     digest_pins_path: Path
+    system_prompt_path: Path
 
     def effective_chunk_max_chars(self, active_model: str | None = None) -> int:
         """Pick the chunk size that best fits the LLM that will actually run.
@@ -145,6 +146,9 @@ def load_settings() -> Settings:
     ).expanduser()
     tags_catalog_path = Path(
         os.getenv("TAGS_CATALOG_PATH", str(data_dir / "tags_catalog.json"))
+    ).expanduser()
+    system_prompt_path = Path(
+        os.getenv("SYSTEM_PROMPT_PATH", str(data_dir / "system_prompt.txt"))
     ).expanduser()
     digests_path = Path(
         os.getenv("DIGESTS_PATH", str(data_dir / "digests.json"))
@@ -300,4 +304,5 @@ def load_settings() -> Settings:
         tags_catalog_path=tags_catalog_path,
         digests_path=digests_path,
         digest_pins_path=digest_pins_path,
+        system_prompt_path=system_prompt_path,
     )

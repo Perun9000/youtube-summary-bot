@@ -240,12 +240,12 @@ def _summary_to_nodes(
             "children": [{"tag": "i", "children": [tags_text]}],
         })
 
+    # Executive summary + подробный разбор тезисов. Блока с короткими
+    # тезисами-буллетами больше нет.
     nodes.extend([
-        {"tag": "h3", "children": ["Обзор"]},
+        {"tag": "h3", "children": ["Executive summary"]},
         {"tag": "p", "children": [summary.overview]},
         {"tag": "h3", "children": ["Ключевые тезисы"]},
-        {"tag": "ul", "children": [{"tag": "li", "children": [point]} for point in summary.key_points]},
-        {"tag": "h3", "children": ["Тезисы подробно"]},
     ])
 
     for chapter in summary.chapters:
@@ -255,6 +255,8 @@ def _summary_to_nodes(
             nodes.append({"tag": "p", "children": [paragraph]})
 
     if not summary.chapters:
+        # Если модель почему-то не отдала chapters — не оставляем пустой раздел,
+        # показываем сырой ответ как fallback.
         nodes.append({"tag": "p", "children": [summary.raw_text]})
 
     if top_comments:

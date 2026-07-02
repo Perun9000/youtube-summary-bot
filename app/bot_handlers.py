@@ -42,6 +42,7 @@ from app.monitoring_service import (
 )
 from app.qa_service import QAService
 from app.summarizer import Summarizer, SummaryProgress
+from app.system_prompt_store import SystemPromptStore
 from app.telegraph_service import TelegraphService
 from app.transcript_chunker import chunk_transcript, segments_to_text
 from app.user_store import UserStore
@@ -61,6 +62,11 @@ T = TypeVar("T")
 MAX_TELEGRAM_MESSAGE_CHARS = 4000
 TOP_COMMENT_MAX_CHARS = 2200
 TRANSCRIPTS_SUBDIR = "transcripts"
+
+# Формат YouTube video_id: ровно 11 символов из base64url-алфавита.
+# Используется в /start deep-link'ах от browser-extension'а.
+import re as _re  # локальный alias, чтобы не светить re по всему модулю
+_YOUTUBE_VIDEO_ID_RE = _re.compile(r"[A-Za-z0-9_-]{11}")
 
 
 def _save_transcript_to_file(data_dir: Path, video_id: str, transcript_text: str) -> Path:
@@ -130,6 +136,7 @@ class Services:
     channel_posts: "ChannelPostsStore | None" = None
     tags_catalog: "TagsCatalog | None" = None
     digests: "DigestStore | None" = None
+    system_prompts: "SystemPromptStore | None" = None
     # Двухшаговые админ-команды («введи /user_add — бот спросит — ты отвечаешь
     # данными в следующем сообщении»). Ключ — chat_id, значение —
     # PendingAdminInput. Не персистится: после рестарта диалог теряется,
@@ -141,7 +148,7 @@ class Services:
 class PendingAdminInput:
     """Что бот ждёт от owner-а в следующем текстовом сообщении."""
 
-    action: str          # 'user_add' / 'user_remove'
+    action: str          # 'user_add' / 'user_remove' / 'prompt_set' / 'cache_drop'
     started_at: float    # time.time(), для тайм-аута
 
 
@@ -155,6 +162,33 @@ def build_router(services: Services) -> Router:
     async def start(message: Message) -> None:
         if not _is_allowed(message, services):
             await message.answer("Этот бот закрыт для личного использования.")
+            return
+        # Telegram передаёт payload deep-link'а как второй токен команды:
+        # "/start <video_id>". Используется browser-extension'ом — кнопка
+        # «Summary» внутри UI YouTube открывает https://t.me/<bot>?start=<id>,
+        # Telegram-клиент сам отправляет /start <id>, мы парсим и enqueue'им.
+        payload = ""
+        text = (message.text or "").strip()
+        if text.startswith("/start"):
+            tokens = text.split(maxsplit=1)
+            if len(tokens) == 2:
+                payload = tokens[1].strip()
+        if payload and _YOUTUBE_VIDEO_ID_RE.fullmatch(payload):
+            url = f"https://www.youtube.com/watch?v={payload}"
+            logger.info(
+                "deep_link.start chat_id=%s video_id=%s source=browser_button",
+                message.chat.id, payload,
+            )
+            await _enqueue_summary_job(message, url, services)
+            return
+        if payload:
+            # Что-то пришло, но не video_id. Не молчим — пользователь скорее
+            # всего открыл криво сформированную ссылку из старой версии
+            # extension'а или playlist-страницу.
+            await message.answer(
+                "Не разобрал параметр в ссылке. Открой ролик YouTube и нажми кнопку «Summary» ещё раз — "
+                "она должна слать 11-символьный video_id."
+            )
             return
         await message.answer(
             "Пришли ссылку на YouTube-ролик. Я верну краткое summary здесь и полный конспект в Telegra.ph."
@@ -192,6 +226,10 @@ def build_router(services: Services) -> Router:
             "/scan_stop - прервать запущенный мониторинговый скан\n\n"
             "/llm_mode - показать активный LLM-провайдер и режим (free/paid)\n\n"
             "/llm_paid - переключить OpenRouter между paid и free (тоггл)\n\n"
+            "/cache_drop - убрать ролик из кэша саммари (аргумент — video_id или URL)\n\n"
+            "/prompt_set - задать кастомный системный промпт для саммари (бот ждёт текст 5 мин)\n\n"
+            "/prompt_show - показать текущий системный промпт\n\n"
+            "/prompt_reset - вернуть системный промпт к дефолту\n\n"
             "После обработки ролика можно задавать вопросы по нему в этом же чате. "
             "Контекст хранится в памяти контейнера до рестарта."
         )
@@ -285,6 +323,103 @@ def build_router(services: Services) -> Router:
             )
             return
         await _apply_user_remove(message, raw_args, services)
+
+    @router.message(Command("prompt_set"))
+    async def prompt_set(message: Message) -> None:
+        if not _is_owner(message, services):
+            await _answer_owner_only(message, services)
+            return
+        if services.system_prompts is None:
+            await message.answer("System prompt store не подключён — команда недоступна.")
+            return
+        services.pending_admin_inputs[message.chat.id] = PendingAdminInput(
+            action="prompt_set", started_at=time.time(),
+        )
+        current_chars = len(services.system_prompts.current())
+        state = "кастомный" if services.system_prompts.is_custom() else "дефолт"
+        await message.answer(
+            f"Сейчас активен {state} системный промпт ({current_chars} симв).\n\n"
+            "Пришли следующим сообщением новый текст системного промпта — "
+            "он полностью заменит текущий. Один Telegram-сообщение = "
+            "до 4096 символов. У тебя 5 минут.\n\n"
+            "Или /cancel чтобы отменить, "
+            "/prompt_show чтобы увидеть текущий, "
+            "/prompt_reset чтобы вернуть дефолт.",
+        )
+
+    @router.message(Command("prompt_show"))
+    async def prompt_show(message: Message) -> None:
+        if not _is_owner(message, services):
+            await _answer_owner_only(message, services)
+            return
+        if services.system_prompts is None:
+            await message.answer("System prompt store не подключён — команда недоступна.")
+            return
+        prompt_text = services.system_prompts.current()
+        state = "кастомный" if services.system_prompts.is_custom() else "дефолт"
+        header = f"Активен {state} системный промпт ({len(prompt_text)} симв):\n\n"
+        # Telegram-лимит на сообщение — 4096 символов. Промпт может быть длиннее
+        # (дефолт близок к 3000), плюс header. Если не влезает — режем и
+        # предупреждаем, что показали превью.
+        budget = MAX_TELEGRAM_MESSAGE_CHARS - len(header) - 32  # запас на "..."
+        if len(prompt_text) <= budget:
+            body = f"<pre>{escape_html(prompt_text)}</pre>"
+            await message.answer(header + body, parse_mode="HTML")
+            return
+        preview = prompt_text[:budget].rstrip()
+        body = f"<pre>{escape_html(preview)}</pre>\n\n… (обрезано, полный текст — {len(prompt_text)} симв)"
+        await message.answer(header + body, parse_mode="HTML")
+
+    @router.message(Command("cache_drop"))
+    async def cache_drop(message: Message) -> None:
+        if not _is_owner(message, services):
+            await _answer_owner_only(message, services)
+            return
+        if services.summary_cache is None:
+            await message.answer("Кэш саммари не подключён.")
+            return
+        # "/cache_drop <id/url>" → применяем сразу.
+        # "/cache_drop" без аргументов → 5-минутный pending: следующее сообщение
+        # трактуем как id/URL (как у /user_add).
+        parts = (message.text or "").split(maxsplit=1)
+        raw_args = parts[1].strip() if len(parts) > 1 else ""
+        if not raw_args:
+            services.pending_admin_inputs[message.chat.id] = PendingAdminInput(
+                action="cache_drop", started_at=time.time(),
+            )
+            await message.answer(
+                "Пришли video_id или YouTube-URL ролика, который нужно убрать из кэша.\n\n"
+                "Примеры:\n"
+                "• <code>wy8ddeBYucY</code>\n"
+                "• <code>https://youtu.be/wy8ddeBYucY</code>\n"
+                "• <code>https://www.youtube.com/watch?v=wy8ddeBYucY</code>\n\n"
+                "У тебя 5 минут. Отмена — /cancel.",
+                parse_mode="HTML",
+            )
+            return
+        await _apply_cache_drop(message, raw_args, services)
+
+    @router.message(Command("prompt_reset"))
+    async def prompt_reset(message: Message) -> None:
+        if not _is_owner(message, services):
+            await _answer_owner_only(message, services)
+            return
+        if services.system_prompts is None:
+            await message.answer("System prompt store не подключён — команда недоступна.")
+            return
+        # /prompt_reset может отменять любой висящий pending — иначе, если owner
+        # набрал /prompt_set и передумал, ему пришлось бы дополнительно
+        # /cancel'ить перед следующим запуском саммари.
+        services.pending_admin_inputs.pop(message.chat.id, None)
+        was_custom = services.system_prompts.reset()
+        if was_custom:
+            await message.answer(
+                "Системный промпт сброшен на дефолт "
+                f"({len(services.system_prompts.current())} симв). "
+                "Следующее саммари уже пойдёт с ним."
+            )
+        else:
+            await message.answer("Уже был дефолтный — ничего не менял.")
 
     @router.message(Command("cancel"))
     async def cancel(message: Message) -> None:
@@ -499,6 +634,10 @@ def build_router(services: Services) -> Router:
                 await _apply_user_add(message, raw, services)
             elif pending.action == "user_remove":
                 await _apply_user_remove(message, raw, services)
+            elif pending.action == "prompt_set":
+                await _apply_prompt_set(message, message.text or "", services)
+            elif pending.action == "cache_drop":
+                await _apply_cache_drop(message, raw, services)
             return
 
         text = message.text or ""
@@ -1971,6 +2110,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             job=job,
             text=summary_text,
             video_id=video_id,
+            telegraph_url=telegraph_url,
         )
         # Сервисное сообщение со статусом («Получаю данные…», «Генерирую
         # summary…» и т.п.) дослужило — удаляем его, чтобы в чате осталось
@@ -2141,7 +2281,7 @@ async def _run_with_telegram_status(
             lines = [
                 base_text,
                 "",
-                f"Прошло с момента ссылки: {_format_elapsed_minutes(elapsed)}",
+                f"Время генерации: {_format_elapsed_minutes(elapsed)}",
             ]
             progress_text = _format_job_progress(job, elapsed)
             if progress_text:
@@ -2183,16 +2323,39 @@ def _format_elapsed_minutes(seconds: int) -> str:
     return "меньше минуты"
 
 
+_PROGRESS_BAR_CELLS = 10
+_PROGRESS_BAR_FULL = "▰"
+_PROGRESS_BAR_EMPTY = "▱"
+
+
 def _format_job_progress(job: SummaryJob, elapsed_sec: int) -> str:
     if job.progress_estimate_sec is None or job.progress_estimate_sec <= 0:
         return ""
 
-    raw_percent = (max(0, elapsed_sec) / job.progress_estimate_sec) * 100
-    rounded = int(round(raw_percent / 10) * 10)
-    if elapsed_sec > 0 and rounded == 0:
-        rounded = 10
-    rounded = max(0, min(90, rounded))
-    return f"Прогресс: ~{rounded}% (оценка)"
+    elapsed = max(0, elapsed_sec)
+    est = job.progress_estimate_sec
+
+    # До достижения оценки — линейно 0 → 90%.
+    # После оценки — асимптотически ползём от 90 к 95%: бар продолжает
+    # заметно двигаться, но не соврёт про «100%» до реального завершения.
+    # 95% — потолок, чтобы явно сигналить «пока не готово».
+    if elapsed <= est:
+        raw_percent = (elapsed / est) * 90.0
+    else:
+        overrun_ratio = min(1.0, (elapsed - est) / (est * 2))
+        raw_percent = 90.0 + 5.0 * overrun_ratio
+
+    percent = int(round(raw_percent))
+    if elapsed > 0 and percent == 0:
+        percent = 1
+    percent = max(0, min(95, percent))
+
+    # Псевдо-progress-bar: 10 ячеек, каждая = 10%. Округляем ВНИЗ, чтобы бар не
+    # опережал числовой процент (например, 34% → 3 закрашенных ячейки, не 4).
+    filled = min(_PROGRESS_BAR_CELLS, percent // 10)
+    empty = _PROGRESS_BAR_CELLS - filled
+    bar = _PROGRESS_BAR_FULL * filled + _PROGRESS_BAR_EMPTY * empty
+    return f"Прогресс: [{bar}] {percent}%"
 
 
 def _estimate_job_total_seconds(
@@ -2296,15 +2459,14 @@ def _format_telegram_summary(
             segment_line = f"<i>Фрагмент ролика: {escape_html(spans_text)}</i>"
 
     overview_line = f"<b>О чем видео:</b>\n{escape_html(summary.overview)}"
-    telegraph_line = (
-        f'Саммари — <a href="{escape_html(telegraph_url)}">{escape_html(telegraph_url)}</a>'
-    )
     reading_line = f"Время чтения: {_estimate_reading_time_minutes(summary)} мин"
 
+    # Ссылка на Telegra.ph уехала в inline-кнопку — см. _build_summary_keyboard.
+    # В теле сообщения её больше нет, чтобы не дублировать и не занимать место.
     blocks = [channel_line, title_line]
     if segment_line:
         blocks.append(segment_line)
-    blocks.extend([overview_line, telegraph_line, reading_line])
+    blocks.extend([overview_line, reading_line])
 
     tags_line = _format_tags_line(summary.tags)
     if tags_line:
@@ -2502,17 +2664,22 @@ async def _send_summary_delivery(
     job: SummaryJob,
     text: str,
     video_id: str | None = None,
+    telegraph_url: str | None = None,
 ) -> None:
     """Send the final summary message to the user.
 
     Manual jobs reply to the original message. Scheduled jobs go through bot.send_message
     with disable_notification=True so the user isn't pinged overnight.
 
-    If ``video_id`` is provided, recipient is the bot's owner and a publish
-    channel is configured, we attach an inline button «Опубликовать в канал».
-    Friends/scheduled jobs get the same text without the button.
+    Attaches an inline keyboard:
+      • «📄 Саммари» → Telegra.ph URL (visible to everyone if telegraph_url is set),
+      • «🎧 Скачать аудио» → owner-only callback (visible only when recipient is owner).
     """
-    reply_markup = _build_publish_button(job, services, video_id)
+    reply_markup = _build_summary_keyboard(
+        telegraph_url=telegraph_url,
+        video_id=video_id,
+        is_owner=_job_is_owner(job, services),
+    )
     if job.message is not None and not job.scheduled:
         await job.message.answer(
             text,
@@ -2540,28 +2707,36 @@ async def _send_summary_delivery(
     )
 
 
-def _build_publish_button(
-    job: SummaryJob, services: Services, video_id: str | None
+def _build_summary_keyboard(
+    *,
+    telegraph_url: str | None,
+    video_id: str | None,
+    is_owner: bool,
 ) -> InlineKeyboardMarkup | None:
-    """Owner-only «🎧 Скачать аудио». Returns None if the recipient isn't
-    the bot's owner or video_id is missing — в этих случаях саммари уходит
-    без кнопки.
+    """Собрать inline-клавиатуру под финальным саммари.
 
-    (Имя функции по-прежнему ``_build_publish_button`` для обратной совместимости
-    с существующими callsite'ами. Когда-нибудь переименуем.)
+    Обе кнопки идут в один ряд (Telegram сам сожмёт по ширине экрана):
+      1. «🔮 подробное саммари» — ссылка на Telegra.ph. Видна всем.
+      2. «🎧 Скачать аудио» — owner-only, callback на транскрипцию/отправку файла.
+
+    Возвращаем None, если ни одна кнопка не применима (нет telegraph_url и
+    получатель не owner) — тогда саммари уходит вообще без клавиатуры.
     """
-    if not video_id:
-        return None
-    if not _job_is_owner(job, services):
-        return None
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(
+    row: list[InlineKeyboardButton] = []
+    if telegraph_url:
+        row.append(
+            InlineKeyboardButton(text="🔮 подробное саммари", url=telegraph_url)
+        )
+    if is_owner and video_id:
+        row.append(
+            InlineKeyboardButton(
                 text="🎧 Скачать аудио",
                 callback_data=f"download:{video_id}",
-            )],
-        ]
-    )
+            )
+        )
+    if not row:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[row])
 
 
 # Лимиты Telegram + размеры аудио, при которых имеет смысл что-то делать.
@@ -2580,7 +2755,7 @@ async def _download_audio_to_chat(
     Алгоритм:
     1. Резолвим URL по video_id (через cached summary; если кэша нет — пытаемся
        восстановить «https://www.youtube.com/watch?v=<id>»).
-    2. Качаем mp3 через yt-dlp (32 kbps mono — наш дефолт).
+    2. Качаем mp3 через yt-dlp (64 kbps mono — наш дефолт).
     3. Если файл > 49 МБ, ужимаем дальше через ``_ensure_audio_fits_telegram``.
     4. ``send_audio`` в тот же чат, где висит кнопка, с reply на саммари.
     5. На ошибках — отдельным сообщением сообщаем причину.
@@ -2912,18 +3087,12 @@ async def _send_cached_summary_to_chat(
     """Manual flow: respond to a user message with cached summary + restore Q&A."""
     fresh_comments = await _refresh_cached_comments(cached, services, source_label="manual")
     text = _format_cached_summary_text(cached, override_top_comments=fresh_comments)
-    # Только owner получает кнопку «Скачать аудио» (как и при свежем саммари).
-    reply_markup: InlineKeyboardMarkup | None = None
     user_id = _message_user_id(message)
-    if user_id is not None and services.users.is_owner(user_id):
-        reply_markup = InlineKeyboardMarkup(
-            inline_keyboard=[[
-                InlineKeyboardButton(
-                    text="🎧 Скачать аудио",
-                    callback_data=f"download:{cached.video_id}",
-                )
-            ]]
-        )
+    reply_markup = _build_summary_keyboard(
+        telegraph_url=cached.telegraph_url,
+        video_id=cached.video_id,
+        is_owner=user_id is not None and services.users.is_owner(user_id),
+    )
     await message.answer(
         text,
         parse_mode="HTML",
@@ -2964,7 +3133,11 @@ async def _deliver_cached_summary_for_job(
     fresh_comments = await _refresh_cached_comments(cached, services, source_label="job")
     text = _format_cached_summary_text(cached, override_top_comments=fresh_comments)
     await _send_summary_delivery(
-        services=services, job=job, text=text, video_id=cached.video_id
+        services=services,
+        job=job,
+        text=text,
+        video_id=cached.video_id,
+        telegraph_url=cached.telegraph_url,
     )
     if not job.scheduled and job.chat_id:
         _restore_qa_context_from_cache(job.chat_id, cached, services)
@@ -3189,6 +3362,84 @@ async def _apply_user_remove(message: Message, raw_args: str, services: Services
         await message.answer(f"Пользователь {user_id} удалён.")
     else:
         await message.answer(f"Пользователя {user_id} нет в списке.")
+
+
+async def _apply_cache_drop(message: Message, raw_args: str, services: Services) -> None:
+    """Parse a video_id or YouTube URL and drop the corresponding cache entry.
+
+    Общий helper для двух путей: инлайн-аргументы у ``/cache_drop <id/url>`` и
+    двухшаговый pending-диалог.
+    """
+    if services.summary_cache is None:
+        await message.answer("Кэш саммари не подключён.")
+        return
+    raw = raw_args.strip()
+    if not raw:
+        await message.answer(
+            "Пустой ввод. Пришли video_id или URL, либо /cancel."
+        )
+        return
+    try:
+        video_id = extract_video_id(raw)
+    except Exception:
+        # extract_video_id умеет и «голый» 11-символьный id, и разные формы URL.
+        # Если он не разобрал — используем ввод как есть, дальше проверим формат.
+        video_id = raw
+    if not _YOUTUBE_VIDEO_ID_RE.fullmatch(video_id or ""):
+        await message.answer(
+            f"«{escape_html(raw)}» не похоже на video_id или YouTube-URL. "
+            "video_id — ровно 11 символов из [A-Za-z0-9_-].",
+            parse_mode="HTML",
+        )
+        return
+    removed = services.summary_cache.delete(video_id)
+    if removed:
+        await message.answer(
+            f"Убрал <code>{video_id}</code> из кэша. Следующая ссылка на этот ролик "
+            "пойдёт через свежую генерацию.",
+            parse_mode="HTML",
+        )
+    else:
+        await message.answer(
+            f"<code>{video_id}</code> в кэше не найден — уже отсутствует или id неверный.",
+            parse_mode="HTML",
+        )
+
+
+async def _apply_prompt_set(message: Message, raw_text: str, services: Services) -> None:
+    """Save the follow-up message text as the new custom system prompt.
+
+    Called from the pending-dialog branch of the text handler when the owner
+    types ``/prompt_set`` (no args) and then sends the prompt in the next
+    message. We preserve internal newlines/whitespace of the prompt — only
+    trim the outer edges — and warn if the message looks empty or is another
+    command the user might have fired by accident.
+    """
+    if services.system_prompts is None:
+        await message.answer("System prompt store не подключён — нечего сохранять.")
+        return
+
+    prompt_text = raw_text.strip()
+    if not prompt_text:
+        await message.answer(
+            "Пустой текст — не сохраняю. Запусти /prompt_set заново и пришли текст промпта."
+        )
+        return
+    # Если owner случайно прислал команду вместо текста промпта — не хотим
+    # запечь "/models" как system prompt.
+    if prompt_text.startswith("/"):
+        await message.answer(
+            "Первый символ — «/», похоже на команду, а не на промпт. "
+            "Не сохраняю. Запусти /prompt_set заново и пришли именно текст промпта."
+        )
+        return
+
+    services.system_prompts.set(prompt_text)
+    await message.answer(
+        f"Сохранил новый системный промпт ({len(prompt_text)} симв). "
+        "Следующее саммари уйдёт уже с ним. "
+        "Откатить — /prompt_reset."
+    )
 
 
 def _is_allowed(message: Message, services: Services) -> bool:

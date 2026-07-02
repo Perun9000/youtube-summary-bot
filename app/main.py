@@ -27,7 +27,8 @@ from app.monitoring_service import MonitoringService
 from app.monitoring_state import MonitoringState
 from app.qa_service import QAService
 from app.scheduler_service import run_monitoring_scheduler
-from app.summarizer import Summarizer
+from app.summarizer import SUMMARY_SYSTEM_PROMPT, Summarizer
+from app.system_prompt_store import SystemPromptStore
 from app.telegraph_service import TelegraphService
 from app.user_store import UserStore
 from app.whisper_service import WhisperService
@@ -58,6 +59,10 @@ OWNER_BOT_COMMANDS: list[BotCommand] = [
     BotCommand(command="llm_mode", description="LLM-провайдер: статус"),
     BotCommand(command="llm_paid", description="LLM: тоггл paid/free"),
     BotCommand(command="stats", description="Статистика бота за 30 дней"),
+    BotCommand(command="cache_drop", description="Убрать ролик из кэша саммари"),
+    BotCommand(command="prompt_set", description="Задать системный промпт"),
+    BotCommand(command="prompt_show", description="Показать системный промпт"),
+    BotCommand(command="prompt_reset", description="Сбросить системный промпт"),
 ]
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
@@ -171,6 +176,17 @@ async def main() -> None:
         settings.owner_user_id,
     )
 
+    system_prompt_store = SystemPromptStore(
+        settings.system_prompt_path,
+        default_prompt=SUMMARY_SYSTEM_PROMPT,
+    )
+    logger.info(
+        "system_prompt.boot path=%s custom=%s chars=%s",
+        settings.system_prompt_path,
+        system_prompt_store.is_custom(),
+        len(system_prompt_store.current()),
+    )
+
     services = Services(
         settings=settings,
         users=user_store,
@@ -183,6 +199,7 @@ async def main() -> None:
             group_size=settings.synthesis_group_size,
             partial_max_tokens=settings.llm_max_tokens_partial,
             final_max_tokens=settings.llm_max_tokens_final,
+            system_prompt_provider=system_prompt_store.current,
         ),
         qa=QAService(llm),
         telegraph=TelegraphService(settings),
@@ -206,6 +223,7 @@ async def main() -> None:
         channel_posts=channel_posts,
         tags_catalog=tags_catalog,
         digests=digest_store,
+        system_prompts=system_prompt_store,
     )
 
     scheduler_task: asyncio.Task[None] | None = None
