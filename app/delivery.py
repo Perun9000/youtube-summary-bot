@@ -13,6 +13,7 @@ from aiogram.types import (
 )
 
 from app.digest_service import DigestEntry, update_pin_for_user
+from app.morning_digest import MorningDigestItem
 from app.summary_cache import CachedSummary
 from app.tags_catalog import TagsCatalog
 from app.models import Summary, SummaryTags, VideoComment
@@ -506,15 +507,29 @@ async def _deliver_cached_summary_for_job(
 ) -> None:
     """Job-level delivery: works for both manual (job.message != None) and
     scheduled (services.bot.send_message)."""
-    fresh_comments = await _refresh_cached_comments(cached, services, source_label="job")
-    text = _format_cached_summary_text(cached, override_top_comments=fresh_comments)
-    await _send_summary_delivery(
-        services=services,
-        job=job,
-        text=text,
-        video_id=cached.video_id,
-        telegraph_url=cached.telegraph_url,
-    )
+    if job.scheduled and services.morning_digest is not None:
+        # Cache-hit на scheduled-job — тоже не шлём отдельным сообщением,
+        # кладём в тот же дайджест-батч, что и свежесгенерированные саммари.
+        services.morning_digest.add(MorningDigestItem(
+            video_id=cached.video_id,
+            title=cached.title,
+            channel_name=cached.channel_name or "",
+            telegraph_url=cached.telegraph_url or "",
+            overview=cached.summary_overview,
+            tags_line=_format_tags_line(cached.tags_obj()),
+            duration_sec=0.0,
+            created_at_unix=time.time(),
+        ))
+    else:
+        fresh_comments = await _refresh_cached_comments(cached, services, source_label="job")
+        text = _format_cached_summary_text(cached, override_top_comments=fresh_comments)
+        await _send_summary_delivery(
+            services=services,
+            job=job,
+            text=text,
+            video_id=cached.video_id,
+            telegraph_url=cached.telegraph_url,
+        )
     # NB: исходное user-message с ссылкой уже удалено в `_enqueue_summary_job`
     # к моменту, когда job попал в обработку. У scheduled-job его и не было.
 

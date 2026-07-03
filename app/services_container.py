@@ -14,6 +14,7 @@ from app.digest_service import DigestStore
 from app.groq_whisper_service import GroqWhisperService
 from app.job_store import JobStore
 from app.llm_client import LLMClient
+from app.morning_digest import MorningDigestStore
 from app.summary_cache import SummaryCache
 from app.tags_catalog import TagsCatalog
 from app.models import TranscriptSegment, VideoMetadata
@@ -97,6 +98,7 @@ class Services:
     system_prompts: "SystemPromptStore | None" = None
     db: "Database | None" = None
     job_store: "JobStore | None" = None
+    morning_digest: "MorningDigestStore | None" = None
     # Двухшаговые админ-команды («введи /user_add — бот спросит — ты отвечаешь
     # данными в следующем сообщении»). Ключ — chat_id, значение —
     # PendingAdminInput. Не персистится: после рестарта диалог теряется,

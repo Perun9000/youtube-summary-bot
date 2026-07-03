@@ -27,6 +27,7 @@ from app.groq_whisper_service import GroqWhisperService
 from app.job_store import JobStore
 from app.llm_client import create_llm_client, health_check_with_reason
 from app.channel_posts_store import ChannelPostsStore
+from app.morning_digest import MorningDigestStore, maybe_send_morning_digest
 from app.summary_cache import SummaryCache
 from app.tags_catalog import TagsCatalog
 from app.monitoring_config import MonitoringConfig
@@ -232,6 +233,7 @@ async def main() -> None:
         system_prompts=system_prompt_store,
         db=db,
         job_store=JobStore(db),
+        morning_digest=MorningDigestStore(db),
     )
 
     scheduler_task: asyncio.Task[None] | None = None
@@ -279,6 +281,10 @@ async def main() -> None:
 
     await configure_bot_commands(bot, settings)
     await restore_pending_jobs(services)
+    try:
+        await maybe_send_morning_digest(services)
+    except Exception:
+        logger.exception("morning_digest.startup_check_failed")
     dispatcher = Dispatcher()
     dispatcher.include_router(build_router(services))
     try:

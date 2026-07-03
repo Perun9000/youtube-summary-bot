@@ -14,6 +14,7 @@ from app.groq_whisper_service import GroqWhisperUnavailable
 from app.llm_client import GenerationUsage
 from app.models import VideoComment
 from app.monitoring_service import filter_segments_by_spans, format_spans_for_humans
+from app.morning_digest import MorningDigestItem
 from app.summarizer import SummaryProgress
 from app.transcript_chunker import chunk_transcript, segments_to_text
 from app.utils import extract_video_id
@@ -31,6 +32,7 @@ from app.delivery import (
     _build_tags_hints,
     _deliver_cached_summary_for_job,
     _format_generation_error,
+    _format_tags_line,
     _format_telegram_summary,
     _is_job_cacheable,
     _lookup_cached_summary,
@@ -285,25 +287,39 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             logger.warning("service_info.model_lookup_failed job_id=%s error=%s", job_id, exc)
             model_name = "unknown"
 
-        summary_text = _format_telegram_summary(
-            title=title,
-            video_url=url,
-            summary=summary,
-            telegraph_url=telegraph_url,
-            channel_name=metadata.channel_name,
-            channel_url=metadata.channel_url,
-            scheduled=job.scheduled,
-            segment_spans=job.segment_spans,
-            expert_matches=job.expert_matches,
-            top_comment=top_comments[0] if top_comments else None,
-        )
-        await _send_summary_delivery(
-            services=services,
-            job=job,
-            text=summary_text,
-            video_id=video_id,
-            telegraph_url=telegraph_url or None,
-        )
+        if job.scheduled and services.morning_digest is not None:
+            # Scheduled-саммари не шлём отдельным сообщением — оно уйдёт
+            # одной строкой утреннего дайджеста после разбора всей пачки.
+            services.morning_digest.add(MorningDigestItem(
+                video_id=video_id,
+                title=title,
+                channel_name=getattr(metadata, "channel_name", "") or "",
+                telegraph_url=telegraph_url or "",
+                overview=summary.overview,
+                tags_line=_format_tags_line(summary.tags),
+                duration_sec=metadata.duration_sec or 0.0,
+                created_at_unix=time.time(),
+            ))
+        else:
+            summary_text = _format_telegram_summary(
+                title=title,
+                video_url=url,
+                summary=summary,
+                telegraph_url=telegraph_url,
+                channel_name=metadata.channel_name,
+                channel_url=metadata.channel_url,
+                scheduled=job.scheduled,
+                segment_spans=job.segment_spans,
+                expert_matches=job.expert_matches,
+                top_comment=top_comments[0] if top_comments else None,
+            )
+            await _send_summary_delivery(
+                services=services,
+                job=job,
+                text=summary_text,
+                video_id=video_id,
+                telegraph_url=telegraph_url or None,
+            )
         # Сервисное сообщение со статусом («Получаю данные…», «Генерирую
         # summary…» и т.п.) дослужило — удаляем его, чтобы в чате осталось
         # только финальное саммари.

@@ -7,6 +7,7 @@ import time
 from aiogram.types import Message
 
 from app.monitoring_service import ScheduledCandidate
+from app.morning_digest import maybe_send_morning_digest
 
 from app.services_container import Services, SummaryJob
 from app.status_messages import (
@@ -286,6 +287,12 @@ async def _summary_queue_worker(services: Services) -> None:
                     if services.summary_queue.empty():
                         services.summary_next_sequence = 0
                 services.summary_queue.task_done()
+
+            if job.scheduled:
+                try:
+                    await maybe_send_morning_digest(services)
+                except Exception:
+                    logger.exception("morning_digest.trigger_failed")
     except asyncio.CancelledError:
         logger.info("queue.worker.cancelled")
         async with services.summary_queue_lock:
