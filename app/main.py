@@ -116,7 +116,7 @@ async def main() -> None:
 
     db = Database(settings.database_path)
 
-    llm = create_llm_client(settings)
+    llm = create_llm_client(settings, db)
     bot = Bot(token=settings.telegram_bot_token)
     groq_whisper = GroqWhisperService(settings)
     if groq_whisper.enabled:
@@ -158,8 +158,9 @@ async def main() -> None:
     )
 
     digest_store = DigestStore(
-        digests_path=settings.digests_path,
-        pins_path=settings.digest_pins_path,
+        db,
+        legacy_digests_path=settings.digests_path,
+        legacy_pins_path=settings.digest_pins_path,
     )
     logger.info(
         "digests.boot digests_path=%s pins_path=%s",
@@ -230,8 +231,7 @@ async def main() -> None:
     if settings.monitoring_enabled:
         monitoring_config = MonitoringConfig(settings.monitoring_config_path)
         monitoring_config.load()
-        monitoring_state = MonitoringState(settings.monitoring_state_path)
-        monitoring_state.load()
+        monitoring_state = MonitoringState(db, legacy_json_path=settings.monitoring_state_path)
 
         async def _enqueue(candidate, channel):
             await enqueue_scheduled_candidate(candidate, channel, services)

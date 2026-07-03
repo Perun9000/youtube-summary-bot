@@ -105,7 +105,6 @@ class MonitoringService:
                 self._state.prime_channel(
                     channel.channel_id, [entry.video_id for entry in entries]
                 )
-                self._state.save()
 
         return channel, added
 
@@ -153,7 +152,6 @@ class MonitoringService:
                             "monitoring.scan.channel_failed channel_id=%s",
                             channel.channel_id,
                         )
-            self._state.save()
             logger.info("monitoring.scan.done enqueued=%s", candidates_enqueued)
 
             if progress is not None:
