@@ -40,6 +40,7 @@ class MonitoringRules:
     shows_blacklist: list[str] = field(default_factory=list)
     experts_whitelist: list[str] = field(default_factory=list)
     experts_blacklist: list[str] = field(default_factory=list)
+    interests: list[str] = field(default_factory=list)
     min_duration_sec: int = DEFAULT_MIN_DURATION_SEC
     scan_time: str = DEFAULT_SCAN_TIME
     scan_tz: str = DEFAULT_SCAN_TZ
@@ -59,6 +60,7 @@ class MonitoringRules:
                 "whitelist": list(self.experts_whitelist),
                 "blacklist": list(self.experts_blacklist),
             },
+            "interests": list(self.interests),
             "min_duration_sec": self.min_duration_sec,
             "scan_time": self.scan_time,
             "scan_tz": self.scan_tz,
@@ -89,6 +91,9 @@ shows:
 experts:
   whitelist: []    # имена/фамилии гостей, которых хотим ловить (можно разные склонения и оригиналы)
   blacklist: []    # имена, при совпадении которых видео пропускается
+
+# Темы, которые вам интересны — используются для ранжирования утреннего дайджеста.
+interests: []
 
 # Минимальная длительность ролика в секундах. Шортсы и короткие новости отсекаются.
 min_duration_sec: 300
@@ -197,6 +202,7 @@ def _parse_rules(data: dict[str, Any]) -> MonitoringRules:
         shows_blacklist=_string_list(shows.get("blacklist")),
         experts_whitelist=_string_list(experts.get("whitelist")),
         experts_blacklist=_string_list(experts.get("blacklist")),
+        interests=_string_list(data.get("interests")),
         min_duration_sec=int(data.get("min_duration_sec", DEFAULT_MIN_DURATION_SEC)),
         scan_time=str(data.get("scan_time", DEFAULT_SCAN_TIME)).strip() or DEFAULT_SCAN_TIME,
         scan_tz=str(data.get("scan_tz", DEFAULT_SCAN_TZ)).strip() or DEFAULT_SCAN_TZ,

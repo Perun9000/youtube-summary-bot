@@ -62,17 +62,6 @@ class Summary:
 
 
 @dataclass(frozen=True)
-class VideoContext:
-    url: str
-    video_id: str
-    title: str
-    transcript_text: str
-    chunks: list[str]
-    summary: Summary
-    telegraph_url: str
-
-
-@dataclass(frozen=True)
 class VideoComment:
     text: str
     author: str

@@ -3,8 +3,9 @@
 When a user re-sends an already-processed link, the bot returns the saved
 summary instantly — no LLM round-trips, no transcription, no re-publishing
 to Telegra.ph (we already have the page URL). The cache stores enough
-structure (overview, key_points, chapters) to also recover the Q&A
-``VideoContext`` later, paired with the on-disk transcript file.
+structure (overview, key_points, chapters) to reconstruct the summary
+later. The transcript itself is never persisted — it lives in memory only
+for the duration of summary generation.
 
 Storage layout: a single ``data/summary_cache.json`` mapping
 ``video_id -> dict``. Atomic write via ``tmp + replace``. Concurrent
@@ -23,11 +24,11 @@ from __future__ import annotations
 
 import json
 import logging
-import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from app.db import Database, retire_legacy_json
 from app.models import Chapter, Summary, SummaryTags, VideoComment
 
 
@@ -52,6 +53,9 @@ class CachedSummary:
     summary_chapters: list[dict]   # serialized Chapter list (start/title/notes)
     summary_raw_text: str
     telegraph_url: str
+    # Back-compat only: old cache entries may still have a Telegra.ph
+    # transcript-page URL here. New entries always write None — transcript
+    # pages are no longer published.
     transcript_url: str | None
     transcript_source: str           # "youtube" / "groq" / "whisper" / "none"
     model: str
@@ -119,136 +123,86 @@ class CachedSummary:
 
 
 class SummaryCache:
-    def __init__(self, path: Path, ttl_days: int = 100) -> None:
-        """
-        :param path: путь к JSON-файлу кэша
-        :param ttl_days: срок жизни записи в днях. 0 — TTL выключен (кэш бессрочный).
-        """
-        self._path = path
+    """Кэш готовых саммари поверх SQLite (таблица ``summary_cache``).
+
+    Запись хранится как JSON-payload (asdict(CachedSummary)) — схема записи
+    остаётся гибкой, отдельная колонка только у created_at_unix для TTL-чисток
+    на SQL-уровне.
+    """
+
+    def __init__(self, db: Database, ttl_days: int = 100, legacy_json_path: Path | None = None) -> None:
+        self._db = db
         self._ttl_seconds = _seconds_in_days(ttl_days)
-        self._lock = threading.Lock()
-        self._entries: dict[str, CachedSummary] = {}
-        self._load()
-        # Подметаем устаревшие записи на старте — это и место сэкономит,
-        # и устранит риск отдать пользователю саммари 6-месячной давности.
+        if legacy_json_path is not None:
+            self._migrate_legacy(legacy_json_path)
         self._cleanup_expired_at_startup()
 
     @property
     def ttl_seconds(self) -> int:
         return self._ttl_seconds
 
-    def _is_expired(self, entry: CachedSummary, now: float | None = None) -> bool:
-        if self._ttl_seconds <= 0:
-            return False
-        now = now if now is not None else time.time()
-        return (now - entry.created_at_unix) > self._ttl_seconds
-
-    def _cleanup_expired_at_startup(self) -> None:
-        """Однократная чистка при загрузке: убираем все, у кого истёк TTL."""
-        if self._ttl_seconds <= 0:
+    def _migrate_legacy(self, path: Path) -> None:
+        if not path.exists():
             return
-        now = time.time()
-        with self._lock:
-            stale_ids = [
-                vid for vid, entry in self._entries.items()
-                if self._is_expired(entry, now)
-            ]
-            if not stale_ids:
-                return
-            for vid in stale_ids:
-                del self._entries[vid]
-            self._save_locked()
-        logger.info(
-            "summary_cache.cleanup_expired removed=%s remaining=%s ttl_days=%s",
-            len(stale_ids), len(self._entries), self._ttl_seconds // 86400,
-        )
-
-    @property
-    def path(self) -> Path:
-        return self._path
-
-    def _load(self) -> None:
-        if not self._path.exists():
+        row = self._db.query_one("SELECT COUNT(*) AS n FROM summary_cache")
+        if row and int(row["n"]) > 0:
             return
         try:
-            raw = json.loads(self._path.read_text(encoding="utf-8"))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "summary_cache.load_failed path=%s error=%s", self._path, exc
-            )
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.exception("summary_cache.migrate.load_failed path=%s", path)
             return
         if not isinstance(raw, dict):
             return
-        entries: dict[str, CachedSummary] = {}
+        imported = 0
         for vid, body in raw.items():
             if not isinstance(body, dict):
                 continue
             try:
-                entries[str(vid)] = CachedSummary(**body)
+                entry = CachedSummary(**body)
             except (TypeError, KeyError) as exc:
-                logger.warning(
-                    "summary_cache.skip_entry video_id=%s error=%s", vid, exc
-                )
+                logger.warning("summary_cache.migrate.skip video_id=%s error=%s", vid, exc)
                 continue
-        with self._lock:
-            self._entries = entries
-        logger.info(
-            "summary_cache.loaded path=%s entries=%s", self._path, len(entries)
-        )
+            self.put(entry)
+            imported += 1
+        retire_legacy_json(path)
+        logger.info("summary_cache.migrated entries=%s", imported)
 
-    def _save_locked(self) -> None:
-        """Persist to disk. Must be called under self._lock."""
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {vid: asdict(entry) for vid, entry in self._entries.items()}
-            tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-            tmp.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            tmp.replace(self._path)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "summary_cache.save_failed path=%s error=%s", self._path, exc
-            )
+    def _cleanup_expired_at_startup(self) -> None:
+        if self._ttl_seconds <= 0:
+            return
+        cutoff = time.time() - self._ttl_seconds
+        self._db.execute("DELETE FROM summary_cache WHERE created_at_unix < ?", (cutoff,))
 
     def get(self, video_id: str) -> CachedSummary | None:
-        """Lazy expiry: если запись устарела по TTL — удаляем и отдаём None.
-
-        Это значит, что протухшие записи естественно отсыпаются при доступе,
-        даже между запусками контейнера (помимо стартовой чистки).
-        """
-        with self._lock:
-            entry = self._entries.get(video_id)
-            if entry is None:
-                return None
-            if self._is_expired(entry):
-                age_days = int((time.time() - entry.created_at_unix) / 86400)
-                logger.info(
-                    "summary_cache.expired video_id=%s age_days=%s ttl_days=%s",
-                    video_id, age_days, self._ttl_seconds // 86400,
-                )
-                del self._entries[video_id]
-                self._save_locked()
-                return None
-            return entry
+        row = self._db.query_one(
+            "SELECT payload, created_at_unix FROM summary_cache WHERE video_id = ?", (video_id,)
+        )
+        if row is None:
+            return None
+        if self._ttl_seconds > 0 and (time.time() - row["created_at_unix"]) > self._ttl_seconds:
+            self._db.execute("DELETE FROM summary_cache WHERE video_id = ?", (video_id,))
+            logger.info("summary_cache.expired video_id=%s", video_id)
+            return None
+        try:
+            return CachedSummary(**json.loads(row["payload"]))
+        except (TypeError, KeyError, json.JSONDecodeError) as exc:
+            logger.warning("summary_cache.corrupt_entry video_id=%s error=%s", video_id, exc)
+            return None
 
     def put(self, entry: CachedSummary) -> None:
-        with self._lock:
-            self._entries[entry.video_id] = entry
-            self._save_locked()
-        logger.info(
-            "summary_cache.stored video_id=%s telegraph_url=%s entries=%s",
-            entry.video_id, entry.telegraph_url, len(self._entries),
+        self._db.execute(
+            "INSERT OR REPLACE INTO summary_cache(video_id, payload, created_at_unix) VALUES (?, ?, ?)",
+            (entry.video_id, json.dumps(asdict(entry), ensure_ascii=False), entry.created_at_unix),
         )
+        logger.info("summary_cache.stored video_id=%s telegraph_url=%s", entry.video_id, entry.telegraph_url)
 
     def delete(self, video_id: str) -> bool:
-        with self._lock:
-            if video_id in self._entries:
-                del self._entries[video_id]
-                self._save_locked()
-                return True
-            return False
+        exists = self._db.query_one("SELECT 1 FROM summary_cache WHERE video_id = ?", (video_id,)) is not None
+        if exists:
+            self._db.execute("DELETE FROM summary_cache WHERE video_id = ?", (video_id,))
+        return exists
 
     def size(self) -> int:
-        with self._lock:
-            return len(self._entries)
+        row = self._db.query_one("SELECT COUNT(*) AS n FROM summary_cache")
+        return int(row["n"]) if row else 0

@@ -31,6 +31,7 @@ class ScheduledCandidate:
 
 
 EnqueueCallback = Callable[[ScheduledCandidate, MonitoredChannel], Awaitable[None]]
+SkipCallback = Callable[[str, str], Awaitable[None]]
 
 
 @dataclass
@@ -54,11 +55,13 @@ class MonitoringService:
         state: MonitoringState,
         youtube: YouTubeService,
         enqueue: EnqueueCallback,
+        on_skip: SkipCallback | None = None,
     ) -> None:
         self._config = config
         self._state = state
         self._youtube = youtube
         self._enqueue = enqueue
+        self._on_skip = on_skip
         self._scan_lock = asyncio.Lock()
 
     @property
@@ -105,7 +108,6 @@ class MonitoringService:
                 self._state.prime_channel(
                     channel.channel_id, [entry.video_id for entry in entries]
                 )
-                self._state.save()
 
         return channel, added
 
@@ -153,7 +155,6 @@ class MonitoringService:
                             "monitoring.scan.channel_failed channel_id=%s",
                             channel.channel_id,
                         )
-            self._state.save()
             logger.info("monitoring.scan.done enqueued=%s", candidates_enqueued)
 
             if progress is not None:
@@ -338,6 +339,16 @@ class MonitoringService:
                     entry.video_id,
                     expert_matches,
                 )
+                if self._on_skip is not None:
+                    try:
+                        await self._on_skip(
+                            entry.title,
+                            "нашёл эксперта ({}), но не смог выделить фрагмент с ним".format(
+                                ", ".join(expert_matches)
+                            ),
+                        )
+                    except Exception:
+                        logger.exception("monitoring.on_skip_failed video_id=%s", entry.video_id)
                 return None, False
 
         logger.info(

@@ -18,13 +18,9 @@ and channels). So the digest's hyperlinks point to **Telegra.ph** — every
 summary already has a Telegraph page with the full body, and the user gets
 to the same content either way.
 
-Persistence layout:
-  ``data/digests.json``       — ``{user_id: [DigestEntry, ...]}``
-  ``data/digest_pins.json``   — ``{user_id: {chat_id, message_id}}``
-
-Both files are written atomically via tmp + replace; concurrent access is
-guarded by a process-local ``threading.Lock``. Async network calls (the
-Telegram bot API ones) run outside the lock to avoid holding it across IO.
+Persistence: SQLite tables ``digests`` and ``digest_pins`` (see ``app.db``).
+Legacy JSON files (``data/digests.json`` / ``data/digest_pins.json``) are
+migrated in on first boot, then renamed to ``*.migrated``.
 """
 from __future__ import annotations
 
@@ -32,10 +28,11 @@ import asyncio
 import json
 import logging
 import threading
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from app.db import Database, retire_legacy_json
 from app.utils import escape_html
 
 if TYPE_CHECKING:
@@ -68,150 +65,116 @@ class DigestEntry:
 
 
 class DigestStore:
-    """Per-user digest list + pinned-message tracking, JSON-persisted."""
+    """Per-user digest list + pinned-message tracking поверх SQLite."""
 
-    def __init__(self, digests_path: Path, pins_path: Path, limit: int = DIGEST_LIMIT) -> None:
-        self._digests_path = digests_path
-        self._pins_path = pins_path
+    def __init__(
+        self,
+        db: Database,
+        limit: int = DIGEST_LIMIT,
+        legacy_digests_path: Path | None = None,
+        legacy_pins_path: Path | None = None,
+    ) -> None:
+        self._db = db
         self._limit = limit
-        self._lock = threading.Lock()
-        # user_id -> list[DigestEntry], в порядке most-recent-first.
-        self._digests: dict[int, list[DigestEntry]] = {}
-        # user_id -> {"chat_id": int, "message_id": int}.
-        self._pins: dict[int, dict[str, int]] = {}
-        # Защищаем pin-update от гонки: если на одного пользователя за секунду
-        # прилетят два саммари (cache-hit + scheduled), параллельные edit'ы
-        # друг друга затрут, и Telegram нам отдаст 400 на стороне второго.
-        # Lock per-user, ленивая инициализация.
         self._pin_update_locks: dict[int, asyncio.Lock] = {}
-        self._load()
+        self._pin_locks_guard = threading.Lock()
+        if legacy_digests_path is not None:
+            self._migrate_digests(legacy_digests_path)
+        if legacy_pins_path is not None:
+            self._migrate_pins(legacy_pins_path)
 
-    # ── persistence ───────────────────────────────────────────────────
-
-    def _load(self) -> None:
-        digests = self._load_json(self._digests_path)
-        if isinstance(digests, dict):
-            parsed: dict[int, list[DigestEntry]] = {}
-            for raw_uid, raw_entries in digests.items():
+    def _migrate_digests(self, path: Path) -> None:
+        if not path.exists():
+            return
+        row = self._db.query_one("SELECT COUNT(*) AS n FROM digests")
+        if row and int(row["n"]) > 0:
+            return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.exception("digests.migrate.load_failed path=%s", path)
+            return
+        if isinstance(raw, dict):
+            for raw_uid, raw_entries in raw.items():
                 try:
                     user_id = int(raw_uid)
                 except (TypeError, ValueError):
                     continue
                 if not isinstance(raw_entries, list):
                     continue
-                entries: list[DigestEntry] = []
                 for body in raw_entries:
-                    if not isinstance(body, dict):
-                        continue
-                    try:
-                        entries.append(DigestEntry(**body))
-                    except (TypeError, KeyError) as exc:
-                        logger.warning(
-                            "digests.skip_entry user_id=%s error=%s", user_id, exc
-                        )
-                parsed[user_id] = entries[: self._limit]
-            self._digests = parsed
+                    if isinstance(body, dict):
+                        try:
+                            self._insert(user_id, DigestEntry(**body))
+                        except (TypeError, KeyError):
+                            continue
+        retire_legacy_json(path)
 
-        pins = self._load_json(self._pins_path)
-        if isinstance(pins, dict):
-            parsed_pins: dict[int, dict[str, int]] = {}
-            for raw_uid, body in pins.items():
+    def _migrate_pins(self, path: Path) -> None:
+        if not path.exists():
+            return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.exception("digests.migrate.pins_load_failed path=%s", path)
+            return
+        if isinstance(raw, dict):
+            for raw_uid, body in raw.items():
                 try:
-                    user_id = int(raw_uid)
-                except (TypeError, ValueError):
+                    self.set_pin(int(raw_uid), int(body["chat_id"]), int(body["message_id"]))
+                except (TypeError, KeyError, ValueError):
                     continue
-                if not isinstance(body, dict):
-                    continue
-                try:
-                    parsed_pins[user_id] = {
-                        "chat_id": int(body["chat_id"]),
-                        "message_id": int(body["message_id"]),
-                    }
-                except (KeyError, TypeError, ValueError):
-                    continue
-            self._pins = parsed_pins
+        retire_legacy_json(path)
 
-        logger.info(
-            "digests.loaded users=%s pins=%s digests_path=%s pins_path=%s",
-            len(self._digests), len(self._pins),
-            self._digests_path, self._pins_path,
+    def _insert(self, user_id: int, entry: DigestEntry) -> None:
+        self._db.execute(
+            "INSERT OR REPLACE INTO digests(user_id, video_id, title, telegraph_url, channel_name, created_at_unix) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, entry.video_id, entry.title, entry.telegraph_url, entry.channel_name, entry.created_at_unix),
         )
 
-    def _load_json(self, path: Path):
-        if not path.exists():
-            return None
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("digests.load_failed path=%s error=%s", path, exc)
-            return None
-
-    def _save_digests_locked(self) -> None:
-        payload = {
-            str(uid): [asdict(e) for e in entries]
-            for uid, entries in self._digests.items()
-        }
-        self._atomic_write(self._digests_path, payload)
-
-    def _save_pins_locked(self) -> None:
-        payload = {str(uid): dict(body) for uid, body in self._pins.items()}
-        self._atomic_write(self._pins_path, payload)
-
-    def _atomic_write(self, path: Path, payload) -> None:
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            tmp.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            tmp.replace(path)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("digests.save_failed path=%s error=%s", path, exc)
-
-    # ── digest list ───────────────────────────────────────────────────
-
     def add(self, user_id: int, entry: DigestEntry) -> list[DigestEntry]:
-        """Insert entry at the top of user's digest, dedup'd by ``video_id``.
-
-        If the user already has this video — old position is dropped, new
-        version (with potentially refreshed title/created_at) is placed at top.
-        Returns the post-mutation list (caller renders it).
-        """
-        with self._lock:
-            existing = self._digests.get(user_id, [])
-            filtered = [e for e in existing if e.video_id != entry.video_id]
-            filtered.insert(0, entry)
-            filtered = filtered[: self._limit]
-            self._digests[user_id] = filtered
-            self._save_digests_locked()
-            return list(filtered)
+        self._insert(user_id, entry)
+        # Подрезаем хвост за limit — старые записи наружу не отдаются, так что
+        # можно чистить сразу на записи. rowid DESC — tie-breaker при равных
+        # created_at_unix (порядок вставки).
+        self._db.execute(
+            "DELETE FROM digests WHERE user_id = ? AND video_id NOT IN ("
+            "  SELECT video_id FROM digests WHERE user_id = ? "
+            "  ORDER BY created_at_unix DESC, rowid DESC LIMIT ?)",
+            (user_id, user_id, self._limit),
+        )
+        return self.list(user_id)
 
     def list(self, user_id: int) -> list[DigestEntry]:
-        with self._lock:
-            return list(self._digests.get(user_id, []))
-
-    # ── pin tracking ──────────────────────────────────────────────────
+        rows = self._db.query(
+            "SELECT video_id, title, telegraph_url, channel_name, created_at_unix "
+            "FROM digests WHERE user_id = ? ORDER BY created_at_unix DESC, rowid DESC LIMIT ?",
+            (user_id, self._limit),
+        )
+        return [
+            DigestEntry(
+                video_id=r["video_id"], title=r["title"], telegraph_url=r["telegraph_url"],
+                channel_name=r["channel_name"], created_at_unix=r["created_at_unix"],
+            )
+            for r in rows
+        ]
 
     def get_pin(self, user_id: int) -> tuple[int, int] | None:
-        with self._lock:
-            body = self._pins.get(user_id)
-            if body is None:
-                return None
-            return body["chat_id"], body["message_id"]
+        row = self._db.query_one("SELECT chat_id, message_id FROM digest_pins WHERE user_id = ?", (user_id,))
+        return (row["chat_id"], row["message_id"]) if row else None
 
     def set_pin(self, user_id: int, chat_id: int, message_id: int) -> None:
-        with self._lock:
-            self._pins[user_id] = {"chat_id": chat_id, "message_id": message_id}
-            self._save_pins_locked()
+        self._db.execute(
+            "INSERT OR REPLACE INTO digest_pins(user_id, chat_id, message_id) VALUES (?, ?, ?)",
+            (user_id, chat_id, message_id),
+        )
 
     def clear_pin(self, user_id: int) -> None:
-        with self._lock:
-            if user_id in self._pins:
-                del self._pins[user_id]
-                self._save_pins_locked()
+        self._db.execute("DELETE FROM digest_pins WHERE user_id = ?", (user_id,))
 
     def _get_or_create_pin_lock(self, user_id: int) -> asyncio.Lock:
-        with self._lock:
+        with self._pin_locks_guard:
             lock = self._pin_update_locks.get(user_id)
             if lock is None:
                 lock = asyncio.Lock()

@@ -13,6 +13,7 @@ from typing import Protocol
 import httpx
 
 from app.config import Settings
+from app.db import Database, retire_legacy_json
 
 
 logger = logging.getLogger(__name__)
@@ -20,6 +21,46 @@ LLM_GENERATE_TIMEOUT_SEC = 1200
 LLM_GENERATE_MAX_ATTEMPTS = 2
 LLM_GENERATE_RETRY_DELAY_SEC = 15
 OPENROUTER_BUDGET_EXCEEDED_MARKER = "OPENROUTER_BUDGET_EXCEEDED"
+
+
+class CircuitBreaker:
+    """Предохранитель от бесполезных полных проходов fallback-цепочки.
+
+    Если OpenRouter лёг целиком (N подряд задач исчерпали все модели цепочки),
+    каждая следующая задача без предохранителя ждала бы 4–6 минут таймаутов.
+    После ``threshold`` подряд неудач открываемся на ``cooldown_sec`` — задачи
+    в этот период падают мгновенно с понятной причиной.
+    """
+
+    def __init__(self, threshold: int = 2, cooldown_sec: float = 600.0) -> None:
+        self._threshold = threshold
+        self._cooldown_sec = cooldown_sec
+        self._consecutive_failures = 0
+        self._opened_at: float | None = None
+
+    def is_open(self) -> bool:
+        if self._opened_at is None:
+            return False
+        if time.monotonic() - self._opened_at >= self._cooldown_sec:
+            # Кулдаун истёк — half-open: даём следующей задаче попробовать.
+            self._opened_at = None
+            self._consecutive_failures = 0
+            return False
+        return True
+
+    def remaining_sec(self) -> float:
+        if self._opened_at is None:
+            return 0.0
+        return max(0.0, self._cooldown_sec - (time.monotonic() - self._opened_at))
+
+    def record_failure(self) -> None:
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self._threshold:
+            self._opened_at = time.monotonic()
+
+    def record_success(self) -> None:
+        self._consecutive_failures = 0
+        self._opened_at = None
 
 
 @dataclass
@@ -70,9 +111,9 @@ class LLMClient(Protocol):
         ...
 
 
-def create_llm_client(settings: Settings) -> LLMClient:
+def create_llm_client(settings: Settings, db: Database) -> LLMClient:
     if settings.llm_provider == "openrouter":
-        return OpenRouterClient(settings)
+        return OpenRouterClient(settings, db)
     return LMStudioClient(settings)
 
 
@@ -99,36 +140,60 @@ class OpenRouterBudget:
     """Persistent daily budget tracker for OpenRouter calls.
 
     Stores ``{"date": "YYYY-MM-DD", "spent_usd": ..., "request_count": ...}``
-    in a JSON file. Resets on the first call of a new local day.
-    Thread-safe; safe across multiple asyncio tasks since updates go through
-    a process-local lock and a tiny critical section.
+    as JSON under the ``openrouter_budget`` key of the ``kv`` SQLite table.
+    Resets on the first call of a new local day. Thread-safe; safe across
+    multiple asyncio tasks since updates go through a process-local lock and
+    a tiny critical section (the ``Database`` itself also serializes access).
     """
+
+    _KV_KEY = "openrouter_budget"
 
     def __init__(
         self,
-        path: Path,
+        db: Database,
         *,
         daily_budget_usd: float,
         daily_request_limit: int,
+        legacy_json_path: Path | None = None,
     ) -> None:
-        self._path = path
+        self._db = db
         self._daily_budget_usd = max(0.0, daily_budget_usd)
         self._daily_request_limit = max(0, daily_request_limit)
         self._lock = threading.Lock()
         self._state = {"date": "", "spent_usd": 0.0, "request_count": 0}
-        self._load()
+        self._load(legacy_json_path)
 
     def _today(self) -> str:
         return dt.date.today().isoformat()
 
-    def _load(self) -> None:
-        if not self._path.exists():
-            self._state = {"date": self._today(), "spent_usd": 0.0, "request_count": 0}
+    def _load(self, legacy_json_path: Path | None) -> None:
+        row = self._db.query_one("SELECT value FROM kv WHERE key = ?", (self._KV_KEY,))
+        data: dict | None = None
+        if row is not None:
+            try:
+                data = json.loads(row["value"])
+            except Exception as exc:
+                logger.warning("openrouter.budget.load_failed key=%s error=%s", self._KV_KEY, exc)
+                data = None
+        elif legacy_json_path is not None and legacy_json_path.exists():
+            try:
+                data = json.loads(legacy_json_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                logger.warning(
+                    "openrouter.budget.legacy_load_failed path=%s error=%s", legacy_json_path, exc
+                )
+                data = None
+            if data is not None:
+                self._state = {
+                    "date": str(data.get("date") or self._today()),
+                    "spent_usd": float(data.get("spent_usd") or 0.0),
+                    "request_count": int(data.get("request_count") or 0),
+                }
+                self._save()
+            retire_legacy_json(legacy_json_path)
             return
-        try:
-            data = json.loads(self._path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            logger.warning("openrouter.budget.load_failed path=%s error=%s", self._path, exc)
+
+        if data is None:
             self._state = {"date": self._today(), "spent_usd": 0.0, "request_count": 0}
             return
 
@@ -144,12 +209,12 @@ class OpenRouterBudget:
 
     def _save(self) -> None:
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-            tmp.write_text(json.dumps(self._state, ensure_ascii=False, indent=2), encoding="utf-8")
-            tmp.replace(self._path)
+            self._db.execute(
+                "INSERT OR REPLACE INTO kv(key, value) VALUES (?, ?)",
+                (self._KV_KEY, json.dumps(self._state, ensure_ascii=False)),
+            )
         except Exception as exc:
-            logger.warning("openrouter.budget.save_failed path=%s error=%s", self._path, exc)
+            logger.warning("openrouter.budget.save_failed key=%s error=%s", self._KV_KEY, exc)
 
     def _rollover_if_needed(self) -> None:
         if self._state.get("date") != self._today():
@@ -204,30 +269,38 @@ class OpenRouterRuntimeState:
     add more runtime-tunable LLM knobs without breaking storage shape.
     """
 
-    def __init__(self, path: Path) -> None:
-        self._path = path
+    _KV_KEY = "openrouter_paid_mode"
+
+    def __init__(self, db: Database, legacy_json_path: Path | None = None) -> None:
+        self._db = db
         self._lock = threading.Lock()
         self._paid_mode = False
-        self._load()
+        self._load(legacy_json_path)
 
-    def _load(self) -> None:
-        if not self._path.exists():
+    def _load(self, legacy_json_path: Path | None) -> None:
+        row = self._db.query_one("SELECT value FROM kv WHERE key = ?", (self._KV_KEY,))
+        if row is not None:
+            self._paid_mode = row["value"] == "true"
             return
-        try:
-            data = json.loads(self._path.read_text(encoding="utf-8"))
-            self._paid_mode = bool(data.get("paid_mode", False))
-        except Exception as exc:
-            logger.warning("openrouter.runtime.load_failed path=%s error=%s", self._path, exc)
+        if legacy_json_path is not None and legacy_json_path.exists():
+            try:
+                data = json.loads(legacy_json_path.read_text(encoding="utf-8"))
+                self._paid_mode = bool(data.get("paid_mode", False))
+                self._save()
+            except Exception as exc:
+                logger.warning(
+                    "openrouter.runtime.legacy_load_failed path=%s error=%s", legacy_json_path, exc
+                )
+            retire_legacy_json(legacy_json_path)
 
     def _save(self) -> None:
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {"paid_mode": self._paid_mode}
-            tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            tmp.replace(self._path)
+            self._db.execute(
+                "INSERT OR REPLACE INTO kv(key, value) VALUES (?, ?)",
+                (self._KV_KEY, "true" if self._paid_mode else "false"),
+            )
         except Exception as exc:
-            logger.warning("openrouter.runtime.save_failed path=%s error=%s", self._path, exc)
+            logger.warning("openrouter.runtime.save_failed key=%s error=%s", self._KV_KEY, exc)
 
     def is_paid_mode(self) -> bool:
         with self._lock:
@@ -260,15 +333,17 @@ class OpenRouterClient:
     - ``OPENROUTER_DAILY_REQUEST_LIMIT`` — soft request count cap.
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, db: Database) -> None:
         self._settings = settings
         self._budget = OpenRouterBudget(
-            path=settings.openrouter_budget_state_path,
+            db,
             daily_budget_usd=settings.openrouter_daily_budget_usd,
             daily_request_limit=settings.openrouter_daily_request_limit,
+            legacy_json_path=settings.openrouter_budget_state_path,
         )
-        self._runtime = OpenRouterRuntimeState(settings.openrouter_runtime_state_path)
+        self._runtime = OpenRouterRuntimeState(db, legacy_json_path=settings.openrouter_runtime_state_path)
         self._cached_context_length: dict[str, int] = {}
+        self._breaker = CircuitBreaker()
 
     @property
     def provider_name(self) -> str:
@@ -310,14 +385,22 @@ class OpenRouterClient:
             logger.warning("llm.generate.budget_block provider=openrouter reason=%s", reason)
             raise RuntimeError(f"{OPENROUTER_BUDGET_EXCEEDED_MARKER}: {reason}")
 
+        if self._breaker.is_open():
+            raise RuntimeError(
+                "OpenRouter временно недоступен (circuit breaker), "
+                f"следующая попытка через ~{int(self._breaker.remaining_sec() / 60) + 1} мин."
+            )
+
         chain = self.current_chain()
         if not chain:
             raise RuntimeError("OpenRouter: список моделей пуст. Проверь .env.")
 
         if self.is_paid_mode():
-            return await self._generate_with_retries(
+            result = await self._generate_with_retries(
                 chain[0], prompt, system, usage, max_tokens
             )
+            self._breaker.record_success()
+            return result
 
         # Free mode — cycle through the chain, then sleep + retry full chain.
         passes = self._settings.openrouter_fallback_retry_passes + 1
@@ -326,9 +409,11 @@ class OpenRouterClient:
         for pass_idx in range(passes):
             for model in chain:
                 try:
-                    return await self._generate_one_attempt(
+                    result = await self._generate_one_attempt(
                         model, prompt, system, usage, max_tokens
                     )
+                    self._breaker.record_success()
+                    return result
                 except _OpenRouterRetriable as exc:
                     last_error = exc.cause
                     logger.warning(
@@ -358,6 +443,7 @@ class OpenRouterClient:
             if is_quota_402
             else "Попробуй позже или переключись на платную через /llm_paid."
         )
+        self._breaker.record_failure()
         raise RuntimeError(
             f"OpenRouter: все free-модели в цепочке отказались отвечать за {passes} проходов "
             f"({models_tried}). Последняя ошибка: {last_error}. {suffix}"
@@ -384,6 +470,7 @@ class OpenRouterClient:
             except _OpenRouterRetriable as exc:
                 last_exc = exc.cause
                 if attempt >= LLM_GENERATE_MAX_ATTEMPTS:
+                    self._breaker.record_failure()
                     raise RuntimeError(
                         f"OpenRouter ({model}) не ответил после {attempt} попыток: "
                         f"{exc.short_reason}"
@@ -396,7 +483,9 @@ class OpenRouterClient:
                 )
                 await asyncio.sleep(LLM_GENERATE_RETRY_DELAY_SEC)
         if last_exc is not None:
+            self._breaker.record_failure()
             raise RuntimeError(f"OpenRouter ({model}) не ответил.") from last_exc
+        self._breaker.record_failure()
         raise RuntimeError(f"OpenRouter ({model}) не ответил.")
 
     async def _generate_one_attempt(

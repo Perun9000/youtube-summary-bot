@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
-import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from app.db import Database, retire_legacy_json
 
 
 logger = logging.getLogger(__name__)
@@ -20,29 +21,71 @@ class AllowedUser:
 
 
 class UserStore:
-    """Persistent allow-list for Telegram users.
+    """Persistent allow-list поверх SQLite (таблица ``users``).
 
-    ``ALLOWED_USER_IDS`` is only a bootstrap seed for the first run. After
-    ``users.json`` exists, it is the live source of truth.
+    ``ALLOWED_USER_IDS`` — только seed при первом запуске (пустая таблица).
+    ``legacy_json_path`` — путь к старому users.json: если таблица пуста,
+    а файл есть — импортируем и переименовываем в .migrated.
     """
 
     def __init__(
         self,
-        path: Path,
+        db: Database,
         seed_user_ids: set[int],
         owner_user_id: int | None,
+        legacy_json_path: Path | None = None,
     ) -> None:
-        self._path = path
+        self._db = db
         self._owner_user_id = owner_user_id
-        self._lock = threading.Lock()
-        self._users: dict[int, AllowedUser] = {}
+        if self._count() == 0:
+            migrated = legacy_json_path is not None and self._migrate_legacy(legacy_json_path)
+            if not migrated:
+                self._seed(seed_user_ids)
+        self._ensure_owner()
 
-        file_exists = self._path.exists()
-        self._load()
-        if file_exists:
-            self._ensure_owner()
-        else:
-            self._seed(seed_user_ids)
+    def _count(self) -> int:
+        row = self._db.query_one("SELECT COUNT(*) AS n FROM users")
+        return int(row["n"]) if row else 0
+
+    def _migrate_legacy(self, path: Path) -> bool:
+        if not path.exists():
+            return False
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.exception("users.migrate.load_failed path=%s", path)
+            return False
+        users = raw.get("users", []) if isinstance(raw, dict) else []
+        rows = []
+        for item in users:
+            user = _parse_user(item)
+            if user is not None:
+                rows.append((user.user_id, user.name, user.added_at))
+        if rows:
+            self._db.executemany(
+                "INSERT OR REPLACE INTO users(user_id, name, added_at) VALUES (?, ?, ?)", rows
+            )
+        retire_legacy_json(path)
+        logger.info("users.migrated count=%s", len(rows))
+        return True
+
+    def _seed(self, seed_user_ids: set[int]) -> None:
+        seed_ids = set(seed_user_ids)
+        if self._owner_user_id is not None:
+            seed_ids.add(self._owner_user_id)
+        for user_id in seed_ids:
+            self._db.execute(
+                "INSERT OR IGNORE INTO users(user_id, name, added_at) VALUES (?, ?, ?)",
+                (user_id, "owner" if user_id == self._owner_user_id else "", _now_iso()),
+            )
+
+    def _ensure_owner(self) -> None:
+        if self._owner_user_id is None:
+            return
+        self._db.execute(
+            "INSERT OR IGNORE INTO users(user_id, name, added_at) VALUES (?, 'owner', ?)",
+            (self._owner_user_id, _now_iso()),
+        )
 
     @property
     def owner_user_id(self) -> int | None:
@@ -60,108 +103,35 @@ class UserStore:
             return False
         if self.is_owner(user_id):
             return True
-        with self._lock:
-            if not self._users and self._owner_user_id is None:
-                return True
-            return user_id in self._users
+        if self._owner_user_id is None and self._count() == 0:
+            return True
+        return self._db.query_one("SELECT 1 FROM users WHERE user_id = ?", (user_id,)) is not None
 
     def list_users(self) -> list[AllowedUser]:
-        with self._lock:
-            return sorted(self._users.values(), key=lambda user: user.user_id)
+        rows = self._db.query("SELECT user_id, name, added_at FROM users ORDER BY user_id")
+        return [AllowedUser(user_id=r["user_id"], name=r["name"], added_at=r["added_at"]) for r in rows]
 
     def add_user(self, user_id: int, name: str = "") -> bool:
         name = name.strip()
-        with self._lock:
-            existing = self._users.get(user_id)
-            if existing is not None and existing.name == name:
-                return False
-
-            self._users[user_id] = AllowedUser(
-                user_id=user_id,
-                name=name,
-                added_at=existing.added_at if existing else _now_iso(),
+        existing = self._db.query_one("SELECT name FROM users WHERE user_id = ?", (user_id,))
+        if existing is not None and existing["name"] == name:
+            return False
+        if existing is None:
+            self._db.execute(
+                "INSERT INTO users(user_id, name, added_at) VALUES (?, ?, ?)",
+                (user_id, name, _now_iso()),
             )
-            self._save_locked()
-            return existing is None
+            return True
+        self._db.execute("UPDATE users SET name = ? WHERE user_id = ?", (name, user_id))
+        return False
 
     def remove_user(self, user_id: int) -> bool:
         if self.is_owner(user_id):
             raise ValueError("Нельзя удалить владельца бота.")
-
-        with self._lock:
-            if user_id not in self._users:
-                return False
-            del self._users[user_id]
-            self._save_locked()
-            return True
-
-    def _load(self) -> None:
-        if not self._path.exists():
-            return
-        try:
-            raw = json.loads(self._path.read_text(encoding="utf-8"))
-            users = raw.get("users", []) if isinstance(raw, dict) else []
-            loaded: dict[int, AllowedUser] = {}
-            for item in users:
-                user = _parse_user(item)
-                if user is not None:
-                    loaded[user.user_id] = user
-            self._users = loaded
-            logger.info("users.load.done path=%s count=%s", self._path, len(loaded))
-        except Exception:
-            logger.exception("users.load.failed path=%s", self._path)
-
-    def _seed(self, seed_user_ids: set[int]) -> None:
-        should_save = False
-        seed_ids = set(seed_user_ids)
-        if self._owner_user_id is not None:
-            seed_ids.add(self._owner_user_id)
-
-        with self._lock:
-            for user_id in seed_ids:
-                if user_id not in self._users:
-                    self._users[user_id] = AllowedUser(
-                        user_id=user_id,
-                        name="owner" if user_id == self._owner_user_id else "",
-                        added_at=_now_iso(),
-                    )
-                    should_save = True
-            if should_save or not self._path.exists():
-                self._save_locked()
-
-    def _ensure_owner(self) -> None:
-        if self._owner_user_id is None:
-            return
-
-        with self._lock:
-            if self._owner_user_id in self._users:
-                return
-            self._users[self._owner_user_id] = AllowedUser(
-                user_id=self._owner_user_id,
-                name="owner",
-                added_at=_now_iso(),
-            )
-            self._save_locked()
-
-    def _save_locked(self) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "users": [
-                {
-                    "id": user.user_id,
-                    "name": user.name,
-                    "added_at": user.added_at,
-                }
-                for user in sorted(self._users.values(), key=lambda item: item.user_id)
-            ]
-        }
-        tmp_path = self._path.with_suffix(self._path.suffix + ".tmp")
-        tmp_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        tmp_path.replace(self._path)
-        logger.info("users.save.done path=%s count=%s", self._path, len(self._users))
+        if self._db.query_one("SELECT 1 FROM users WHERE user_id = ?", (user_id,)) is None:
+            return False
+        self._db.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+        return True
 
 
 def _parse_user(item: Any) -> AllowedUser | None:

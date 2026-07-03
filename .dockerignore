@@ -1,9 +1,13 @@
 .env
-.venv
+.venv/
 __pycache__
 *.pyc
 .pytest_cache
 data/audio
 data/tmp
 data/*.cookies.txt
+tests/
+docs/
+.superpowers/
+browser-extension/
 

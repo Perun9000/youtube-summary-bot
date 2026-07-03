@@ -14,24 +14,30 @@ from aiogram.types import (
     MenuButtonCommands,
 )
 
-from app.bot_handlers import Services, build_router, enqueue_scheduled_candidate
+from app.bot_handlers import (
+    Services,
+    build_router,
+    enqueue_scheduled_candidate,
+    restore_pending_jobs,
+)
 from app.config import Settings, load_settings
+from app.db import Database
 from app.digest_service import DigestStore
 from app.groq_whisper_service import GroqWhisperService
+from app.job_store import JobStore
 from app.llm_client import create_llm_client, health_check_with_reason
 from app.channel_posts_store import ChannelPostsStore
+from app.morning_digest import MorningDigestStore, maybe_send_morning_digest
 from app.summary_cache import SummaryCache
 from app.tags_catalog import TagsCatalog
 from app.monitoring_config import MonitoringConfig
 from app.monitoring_service import MonitoringService
 from app.monitoring_state import MonitoringState
-from app.qa_service import QAService
 from app.scheduler_service import run_monitoring_scheduler
 from app.summarizer import SUMMARY_SYSTEM_PROMPT, Summarizer
 from app.system_prompt_store import SystemPromptStore
 from app.telegraph_service import TelegraphService
 from app.user_store import UserStore
-from app.whisper_service import WhisperService
 from app.youtube_service import YouTubeService
 
 
@@ -49,7 +55,6 @@ OWNER_BOT_COMMANDS: list[BotCommand] = [
     BotCommand(command="users", description="Список пользователей"),
     BotCommand(command="user_add", description="Добавить пользователя"),
     BotCommand(command="user_remove", description="Удалить пользователя"),
-    BotCommand(command="reset", description="Забыть текущий ролик"),
     BotCommand(command="models", description="Доступные LLM-модели"),
     BotCommand(command="model", description="Текущая модель бота"),
     BotCommand(command="queue", description="Очередь summary"),
@@ -116,7 +121,9 @@ async def main() -> None:
     settings.bot_data_dir.mkdir(parents=True, exist_ok=True)
     configure_logging(settings.bot_data_dir)
 
-    llm = create_llm_client(settings)
+    db = Database(settings.database_path)
+
+    llm = create_llm_client(settings, db)
     bot = Bot(token=settings.telegram_bot_token)
     groq_whisper = GroqWhisperService(settings)
     if groq_whisper.enabled:
@@ -128,8 +135,9 @@ async def main() -> None:
         logger.info("groq.boot enabled=false reason=no_api_key")
 
     summary_cache = SummaryCache(
-        settings.summary_cache_path,
+        db,
         ttl_days=settings.summary_cache_ttl_days,
+        legacy_json_path=settings.summary_cache_path,
     )
     logger.info(
         "summary_cache.boot path=%s entries=%s ttl_days=%s",
@@ -157,17 +165,19 @@ async def main() -> None:
     )
 
     digest_store = DigestStore(
-        digests_path=settings.digests_path,
-        pins_path=settings.digest_pins_path,
+        db,
+        legacy_digests_path=settings.digests_path,
+        legacy_pins_path=settings.digest_pins_path,
     )
     logger.info(
         "digests.boot digests_path=%s pins_path=%s",
         settings.digests_path, settings.digest_pins_path,
     )
     user_store = UserStore(
-        settings.allowed_users_path,
+        db,
         seed_user_ids=settings.allowed_user_ids,
         owner_user_id=settings.owner_user_id,
+        legacy_json_path=settings.allowed_users_path,
     )
     logger.info(
         "users.boot path=%s count=%s owner_user_id=%s",
@@ -192,7 +202,6 @@ async def main() -> None:
         users=user_store,
         llm=llm,
         youtube=YouTubeService(settings),
-        whisper=WhisperService(settings),
         summarizer=Summarizer(
             llm,
             hierarchy_threshold=settings.synthesis_hierarchy_threshold,
@@ -201,9 +210,7 @@ async def main() -> None:
             final_max_tokens=settings.llm_max_tokens_final,
             system_prompt_provider=system_prompt_store.current,
         ),
-        qa=QAService(llm),
         telegraph=TelegraphService(settings),
-        contexts={},
         summary_queue=asyncio.Queue(),
         summary_queue_lock=asyncio.Lock(),
         summary_worker_task=None,
@@ -224,17 +231,29 @@ async def main() -> None:
         tags_catalog=tags_catalog,
         digests=digest_store,
         system_prompts=system_prompt_store,
+        db=db,
+        job_store=JobStore(db),
+        morning_digest=MorningDigestStore(db),
     )
 
     scheduler_task: asyncio.Task[None] | None = None
     if settings.monitoring_enabled:
         monitoring_config = MonitoringConfig(settings.monitoring_config_path)
         monitoring_config.load()
-        monitoring_state = MonitoringState(settings.monitoring_state_path)
-        monitoring_state.load()
+        monitoring_state = MonitoringState(db, legacy_json_path=settings.monitoring_state_path)
 
         async def _enqueue(candidate, channel):
             await enqueue_scheduled_candidate(candidate, channel, services)
+
+        async def _notify_skip(title: str, reason: str) -> None:
+            owner = settings.owner_user_id
+            if owner is None:
+                return
+            await bot.send_message(
+                chat_id=owner,
+                text=f"Мониторинг пропустил видео «{title}»: {reason}.",
+                disable_notification=True,
+            )
 
         async def _check_llm() -> tuple[bool, str]:
             return await health_check_with_reason(services.llm)
@@ -244,6 +263,7 @@ async def main() -> None:
             state=monitoring_state,
             youtube=services.youtube,
             enqueue=_enqueue,
+            on_skip=_notify_skip,
         )
         scheduler_task = asyncio.create_task(
             run_monitoring_scheduler(services.monitoring, llm_check=_check_llm),
@@ -260,6 +280,11 @@ async def main() -> None:
         logger.info("monitoring.boot enabled=false")
 
     await configure_bot_commands(bot, settings)
+    await restore_pending_jobs(services)
+    try:
+        await maybe_send_morning_digest(services)
+    except Exception:
+        logger.exception("morning_digest.startup_check_failed")
     dispatcher = Dispatcher()
     dispatcher.include_router(build_router(services))
     try:
