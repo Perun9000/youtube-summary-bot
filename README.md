@@ -1,6 +1,6 @@
 # YouTube Summary Telegram Bot
 
-Локальный Telegram-бот: принимает ссылку на YouTube, получает transcript или делает локальную транскрибацию аудио, генерирует summary через локальную LLM в LM Studio, отправляет краткую версию в Telegram и публикует полный конспект в Telegra.ph.
+Локальный Telegram-бот: принимает ссылку на YouTube, получает transcript или транскрибирует аудио через Groq Whisper API, генерирует summary через локальную LLM в LM Studio, отправляет краткую версию в Telegram и публикует полный конспект в Telegra.ph.
 
 ## Что уже настроено
 
@@ -138,9 +138,9 @@ job.start
 queue.job.enqueued / queue.job.start / queue.job.done / queue.job.failed / queue.job.cancelled
 job.metadata.done
 job.transcript.done source=youtube
-job.transcript.unavailable fallback=audio
-job.audio_download.done
-whisper.transcribe.done
+job.transcript.unavailable fallback=groq_queue
+transcription_queue.audio_download.done
+groq.transcribe.done
 job.chunking.done
 summary.chunk.start / summary.chunk.done
 summary.synthesis.start
