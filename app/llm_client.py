@@ -23,6 +23,46 @@ LLM_GENERATE_RETRY_DELAY_SEC = 15
 OPENROUTER_BUDGET_EXCEEDED_MARKER = "OPENROUTER_BUDGET_EXCEEDED"
 
 
+class CircuitBreaker:
+    """Предохранитель от бесполезных полных проходов fallback-цепочки.
+
+    Если OpenRouter лёг целиком (N подряд задач исчерпали все модели цепочки),
+    каждая следующая задача без предохранителя ждала бы 4–6 минут таймаутов.
+    После ``threshold`` подряд неудач открываемся на ``cooldown_sec`` — задачи
+    в этот период падают мгновенно с понятной причиной.
+    """
+
+    def __init__(self, threshold: int = 2, cooldown_sec: float = 600.0) -> None:
+        self._threshold = threshold
+        self._cooldown_sec = cooldown_sec
+        self._consecutive_failures = 0
+        self._opened_at: float | None = None
+
+    def is_open(self) -> bool:
+        if self._opened_at is None:
+            return False
+        if time.monotonic() - self._opened_at >= self._cooldown_sec:
+            # Кулдаун истёк — half-open: даём следующей задаче попробовать.
+            self._opened_at = None
+            self._consecutive_failures = 0
+            return False
+        return True
+
+    def remaining_sec(self) -> float:
+        if self._opened_at is None:
+            return 0.0
+        return max(0.0, self._cooldown_sec - (time.monotonic() - self._opened_at))
+
+    def record_failure(self) -> None:
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self._threshold:
+            self._opened_at = time.monotonic()
+
+    def record_success(self) -> None:
+        self._consecutive_failures = 0
+        self._opened_at = None
+
+
 @dataclass
 class GenerationUsage:
     """Mutable accumulator для метрик LLM-вызовов в рамках одной задачи."""
@@ -303,6 +343,7 @@ class OpenRouterClient:
         )
         self._runtime = OpenRouterRuntimeState(db, legacy_json_path=settings.openrouter_runtime_state_path)
         self._cached_context_length: dict[str, int] = {}
+        self._breaker = CircuitBreaker()
 
     @property
     def provider_name(self) -> str:
@@ -344,14 +385,22 @@ class OpenRouterClient:
             logger.warning("llm.generate.budget_block provider=openrouter reason=%s", reason)
             raise RuntimeError(f"{OPENROUTER_BUDGET_EXCEEDED_MARKER}: {reason}")
 
+        if self._breaker.is_open():
+            raise RuntimeError(
+                "OpenRouter временно недоступен (circuit breaker), "
+                f"следующая попытка через ~{int(self._breaker.remaining_sec() / 60) + 1} мин."
+            )
+
         chain = self.current_chain()
         if not chain:
             raise RuntimeError("OpenRouter: список моделей пуст. Проверь .env.")
 
         if self.is_paid_mode():
-            return await self._generate_with_retries(
+            result = await self._generate_with_retries(
                 chain[0], prompt, system, usage, max_tokens
             )
+            self._breaker.record_success()
+            return result
 
         # Free mode — cycle through the chain, then sleep + retry full chain.
         passes = self._settings.openrouter_fallback_retry_passes + 1
@@ -360,9 +409,11 @@ class OpenRouterClient:
         for pass_idx in range(passes):
             for model in chain:
                 try:
-                    return await self._generate_one_attempt(
+                    result = await self._generate_one_attempt(
                         model, prompt, system, usage, max_tokens
                     )
+                    self._breaker.record_success()
+                    return result
                 except _OpenRouterRetriable as exc:
                     last_error = exc.cause
                     logger.warning(
@@ -392,6 +443,7 @@ class OpenRouterClient:
             if is_quota_402
             else "Попробуй позже или переключись на платную через /llm_paid."
         )
+        self._breaker.record_failure()
         raise RuntimeError(
             f"OpenRouter: все free-модели в цепочке отказались отвечать за {passes} проходов "
             f"({models_tried}). Последняя ошибка: {last_error}. {suffix}"
@@ -418,6 +470,7 @@ class OpenRouterClient:
             except _OpenRouterRetriable as exc:
                 last_exc = exc.cause
                 if attempt >= LLM_GENERATE_MAX_ATTEMPTS:
+                    self._breaker.record_failure()
                     raise RuntimeError(
                         f"OpenRouter ({model}) не ответил после {attempt} попыток: "
                         f"{exc.short_reason}"
@@ -430,7 +483,9 @@ class OpenRouterClient:
                 )
                 await asyncio.sleep(LLM_GENERATE_RETRY_DELAY_SEC)
         if last_exc is not None:
+            self._breaker.record_failure()
             raise RuntimeError(f"OpenRouter ({model}) не ответил.") from last_exc
+        self._breaker.record_failure()
         raise RuntimeError(f"OpenRouter ({model}) не ответил.")
 
     async def _generate_one_attempt(
