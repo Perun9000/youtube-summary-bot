@@ -30,7 +30,6 @@ from app.summarizer import SUMMARY_SYSTEM_PROMPT, Summarizer
 from app.system_prompt_store import SystemPromptStore
 from app.telegraph_service import TelegraphService
 from app.user_store import UserStore
-from app.whisper_service import WhisperService
 from app.youtube_service import YouTubeService
 
 
@@ -190,7 +189,6 @@ async def main() -> None:
         users=user_store,
         llm=llm,
         youtube=YouTubeService(settings),
-        whisper=WhisperService(settings),
         summarizer=Summarizer(
             llm,
             hierarchy_threshold=settings.synthesis_hierarchy_threshold,

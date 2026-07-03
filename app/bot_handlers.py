@@ -52,7 +52,6 @@ from app.utils import (
     extract_video_id,
     extract_youtube_url,
 )
-from app.whisper_service import WhisperService
 from app.youtube_service import TranscriptUnavailable, YouTubeService
 
 
@@ -94,7 +93,6 @@ class Services:
     users: UserStore
     llm: LLMClient
     youtube: YouTubeService
-    whisper: WhisperService
     summarizer: Summarizer
     telegraph: TelegraphService
     summary_queue: asyncio.Queue[SummaryJob]
@@ -1836,29 +1834,6 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                     time.monotonic() - stage_started,
                 )
             except TranscriptUnavailable:
-                # === Локальный Whisper отключён. Cloud-инференс через Groq
-                # идёт в отдельной очереди transcription_queue, чтобы main
-                # worker не блокировался ожиданием транскрипции на длинных
-                # роликах. Старый код локального Whisper закомментирован
-                # ниже — оставляю на случай быстрого отката. ===
-                #
-                # await _set_service_status(
-                #     services, message,
-                #     "Субтитры недоступны. Скачиваю аудио и распознаю локально...",
-                #     job=job,
-                # )
-                # audio_path = await _run_with_telegram_status(
-                #     services=services, source_message=message,
-                #     operation=asyncio.to_thread(services.youtube.download_audio, url),
-                #     base_text="Субтитры недоступны. Скачиваю аудио...", job=job,
-                # )
-                # segments = await _run_with_telegram_status(
-                #     services=services, source_message=message,
-                #     operation=asyncio.to_thread(services.whisper.transcribe, audio_path),
-                #     base_text="Распознаю аудио локально через Whisper...", job=job,
-                # )
-                # transcript_source = "whisper"
-
                 if services.groq_whisper is None or not services.groq_whisper.enabled:
                     raise RuntimeError(
                         "Субтитры YouTube недоступны для этого ролика, "

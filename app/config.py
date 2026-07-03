@@ -43,9 +43,6 @@ class Settings:
     openrouter_daily_budget_usd: float
     openrouter_daily_request_limit: int
     openrouter_budget_state_path: Path
-    whisper_model: str
-    whisper_device: str
-    whisper_compute_type: str
     groq_api_key: str | None
     groq_whisper_model: str
     groq_base_url: str
@@ -275,9 +272,6 @@ def load_settings() -> Settings:
         openrouter_daily_budget_usd=openrouter_daily_budget_usd,
         openrouter_daily_request_limit=openrouter_daily_request_limit,
         openrouter_budget_state_path=openrouter_budget_state_path,
-        whisper_model=os.getenv("WHISPER_MODEL", "small"),
-        whisper_device=os.getenv("WHISPER_DEVICE", "cpu"),
-        whisper_compute_type=os.getenv("WHISPER_COMPUTE_TYPE", "int8"),
         groq_api_key=os.getenv("GROQ_API_KEY", "").strip() or None,
         groq_whisper_model=os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo").strip(),
         groq_base_url=os.getenv("GROQ_BASE_URL", "https://api.groq.com").rstrip("/"),
