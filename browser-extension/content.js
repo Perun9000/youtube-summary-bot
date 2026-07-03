@@ -12,11 +12,24 @@
 (() => {
   'use strict';
 
-  const BOT_HANDLE = 'YouTube_Sum_mary_bot';
+  const api = globalThis.browser ?? globalThis.chrome;
+  const DEFAULT_BOT_HANDLE = 'YouTube_Sum_mary_bot';
   const BUTTON_ID = 'yt-summary-bot-btn';
   const TOAST_ID = 'yt-summary-bot-toast';
   // YouTube video_id: ровно 11 символов из base64url-алфавита.
   const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
+
+  function getBotHandle() {
+    return new Promise((resolve) => {
+      try {
+        api.storage.sync.get({ botHandle: DEFAULT_BOT_HANDLE }, (items) =>
+          resolve(items.botHandle || DEFAULT_BOT_HANDLE)
+        );
+      } catch {
+        resolve(DEFAULT_BOT_HANDLE);
+      }
+    });
+  }
 
   // ───────────────────────────── helpers ─────────────────────────────
 
@@ -54,7 +67,7 @@
     btn.type = 'button';
     btn.title = 'Получить саммари ролика в Telegram';
     btn.textContent = '📚 Summary';
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
       // Видео могло смениться между injection'ом и кликом (SPA), поэтому
       // ID добываем заново в момент нажатия.
       const id = extractVideoId();
@@ -62,7 +75,8 @@
         showToast('Открой ролик YouTube и нажми снова — это не страница с видео.');
         return;
       }
-      const url = `https://t.me/${BOT_HANDLE}?start=${encodeURIComponent(id)}`;
+      const handle = await getBotHandle();
+      const url = `https://t.me/${handle}?start=${encodeURIComponent(id)}`;
       window.open(url, '_blank', 'noopener,noreferrer');
     });
     return btn;
