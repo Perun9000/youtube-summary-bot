@@ -253,18 +253,26 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             top_comments = []
 
         await _set_service_status(services, message, "Публикую полный конспект в Telegra.ph...", job=job)
-        telegraph_url = await _run_with_telegram_status(
-            services=services,
-            source_message=message,
-            operation=services.telegraph.publish(
-                title=title,
-                url=url,
-                summary=summary,
-                top_comments=top_comments,
-            ),
-            base_text="Публикую полный конспект в Telegra.ph...",
-            job=job,
-        )
+        try:
+            telegraph_url = await _run_with_telegram_status(
+                services=services,
+                source_message=message,
+                operation=services.telegraph.publish(
+                    title=title,
+                    url=url,
+                    summary=summary,
+                    top_comments=top_comments,
+                ),
+                base_text="Публикую полный конспект в Telegra.ph...",
+                job=job,
+            )
+        except Exception:
+            # Telegra.ph лежит — не роняем job: пользователь получит краткое
+            # саммари в чат, просто без кнопки на полный конспект. Кэш не
+            # пишем (без URL запись бесполезна), дайджест сам пропустит
+            # запись без telegraph_url.
+            logger.exception("job.telegraph.publish_failed job_id=%s — деградируем без страницы", job_id)
+            telegraph_url = ""
 
         total_duration_sec = time.monotonic() - started
         # model_name всё ещё нужен ниже — пишем в кэш (CachedSummary.model) и
@@ -294,7 +302,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             job=job,
             text=summary_text,
             video_id=video_id,
-            telegraph_url=telegraph_url,
+            telegraph_url=telegraph_url or None,
         )
         # Сервисное сообщение со статусом («Получаю данные…», «Генерирую
         # summary…» и т.п.) дослужило — удаляем его, чтобы в чате осталось
@@ -324,7 +332,12 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
         # Кэшируем результат — но только для full-video. Segment-mode даёт
         # частичное саммари по конкретному эксперту, его нельзя считать
         # «каноном» для этого video_id.
-        if _is_job_cacheable(job) and services.summary_cache is not None and video_id != "unknown":
+        if (
+            _is_job_cacheable(job)
+            and services.summary_cache is not None
+            and video_id != "unknown"
+            and telegraph_url
+        ):
             try:
                 _save_summary_to_cache(
                     services=services,

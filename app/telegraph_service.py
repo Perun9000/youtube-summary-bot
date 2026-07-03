@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -12,6 +13,8 @@ from app.models import Summary, VideoComment
 
 
 logger = logging.getLogger(__name__)
+
+RETRY_DELAYS_SEC: tuple[float, ...] = (2.0, 8.0)
 
 
 class TelegraphService:
@@ -29,6 +32,48 @@ class TelegraphService:
 
     def _token_file_path(self) -> Path:
         return self._settings.bot_data_dir / "telegraph_token.txt"
+
+    async def _post_with_retries(self, endpoint: str, data: dict) -> dict:
+        """POST к api.telegra.ph с ретраями на сетевые ошибки и 5xx.
+
+        Часовая генерация саммари не должна пропадать из-за секундного
+        сбоя HTTP — три попытки с паузами 2s/8s. 4xx (наши ошибки данных)
+        не ретраим.
+        """
+        last_exc: Exception | None = None
+        for attempt, delay in enumerate((*RETRY_DELAYS_SEC, None), start=1):
+            try:
+                async with httpx.AsyncClient(timeout=60) as client:
+                    response = await client.post(f"https://api.telegra.ph/{endpoint}", data=data)
+                if response.status_code >= 500:
+                    raise httpx.HTTPStatusError(
+                        f"{response.status_code}", request=response.request, response=response
+                    )
+                # 4xx — наши ошибки данных (например, PAGE_ACCESS_DENIED),
+                # ретраить их бессмысленно: результат не изменится. Поднимаем
+                # сразу, не через retry-цикл.
+                response.raise_for_status()
+                return response.json()
+            except httpx.HTTPStatusError as exc:
+                if exc.response is not None and exc.response.status_code < 500:
+                    raise
+                last_exc = exc
+                if delay is None:
+                    break
+                logger.warning(
+                    "telegraph.retry endpoint=%s attempt=%s error=%s", endpoint, attempt, exc
+                )
+                await asyncio.sleep(delay)
+            except httpx.HTTPError as exc:
+                last_exc = exc
+                if delay is None:
+                    break
+                logger.warning(
+                    "telegraph.retry endpoint=%s attempt=%s error=%s", endpoint, attempt, exc
+                )
+                await asyncio.sleep(delay)
+        assert last_exc is not None
+        raise last_exc
 
     async def publish(
         self,
@@ -51,24 +96,21 @@ class TelegraphService:
         content = _summary_to_nodes(
             url, summary, top_comments=top_comments,
         )
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(
-                "https://api.telegra.ph/createPage",
-                data={
-                    "access_token": self._access_token,
-                    "title": title[:255] or "YouTube summary",
-                    "author_name": self._settings.telegraph_author_name,
-                    "content": json.dumps(content, ensure_ascii=False),
-                    "return_content": "false",
-                },
-            )
-            response.raise_for_status()
-            data = response.json()
-            if not data.get("ok"):
-                raise RuntimeError(data.get("error", "Telegra.ph createPage failed"))
-            page_url = str(data["result"]["url"])
-            logger.info("telegraph.publish.done duration_sec=%.1f url=%s", time.monotonic() - started, page_url)
-            return page_url
+        data = await self._post_with_retries(
+            "createPage",
+            {
+                "access_token": self._access_token,
+                "title": title[:255] or "YouTube summary",
+                "author_name": self._settings.telegraph_author_name,
+                "content": json.dumps(content, ensure_ascii=False),
+                "return_content": "false",
+            },
+        )
+        if not data.get("ok"):
+            raise RuntimeError(data.get("error", "Telegra.ph createPage failed"))
+        page_url = str(data["result"]["url"])
+        logger.info("telegraph.publish.done duration_sec=%.1f url=%s", time.monotonic() - started, page_url)
+        return page_url
 
     async def edit(
         self,
@@ -101,48 +143,42 @@ class TelegraphService:
         content = _summary_to_nodes(
             video_url, summary, top_comments=top_comments,
         )
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(
-                "https://api.telegra.ph/editPage",
-                data={
-                    "access_token": self._access_token,
-                    "path": page_path,
-                    "title": title[:255] or "YouTube summary",
-                    "author_name": self._settings.telegraph_author_name,
-                    "content": json.dumps(content, ensure_ascii=False),
-                    "return_content": "false",
-                },
-            )
-            response.raise_for_status()
-            data = response.json()
-            if not data.get("ok"):
-                raise RuntimeError(data.get("error", "Telegra.ph editPage failed"))
-            page_url = str(data["result"]["url"])
-            logger.info(
-                "telegraph.edit.done duration_sec=%.1f url=%s",
-                time.monotonic() - started, page_url,
-            )
-            return page_url
+        data = await self._post_with_retries(
+            "editPage",
+            {
+                "access_token": self._access_token,
+                "path": page_path,
+                "title": title[:255] or "YouTube summary",
+                "author_name": self._settings.telegraph_author_name,
+                "content": json.dumps(content, ensure_ascii=False),
+                "return_content": "false",
+            },
+        )
+        if not data.get("ok"):
+            raise RuntimeError(data.get("error", "Telegra.ph editPage failed"))
+        page_url = str(data["result"]["url"])
+        logger.info(
+            "telegraph.edit.done duration_sec=%.1f url=%s",
+            time.monotonic() - started, page_url,
+        )
+        return page_url
 
     async def _create_account(self) -> str:
         logger.info("telegraph.account.create.start")
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(
-                "https://api.telegra.ph/createAccount",
-                data={
-                    "short_name": "yt_summary_bot",
-                    "author_name": self._settings.telegraph_author_name,
-                },
-            )
-            response.raise_for_status()
-            data = response.json()
-            if not data.get("ok"):
-                raise RuntimeError(data.get("error", "Telegra.ph createAccount failed"))
-            token = str(data["result"]["access_token"])
-            # Persist so subsequent restarts can keep editing pages we created.
-            _persist_token(self._token_file_path(), token)
-            logger.info("telegraph.account.create.done token_persisted=true")
-            return token
+        data = await self._post_with_retries(
+            "createAccount",
+            {
+                "short_name": "yt_summary_bot",
+                "author_name": self._settings.telegraph_author_name,
+            },
+        )
+        if not data.get("ok"):
+            raise RuntimeError(data.get("error", "Telegra.ph createAccount failed"))
+        token = str(data["result"]["access_token"])
+        # Persist so subsequent restarts can keep editing pages we created.
+        _persist_token(self._token_file_path(), token)
+        logger.info("telegraph.account.create.done token_persisted=true")
+        return token
 
 
 def _summary_to_nodes(
