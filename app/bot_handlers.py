@@ -1138,6 +1138,11 @@ async def _summary_queue_worker(services: Services) -> None:
                     continue
 
             if job.scheduled and not await _is_llm_available(services):
+                # DB-статус job_store здесь сознательно не трогаем: обработка
+                # ещё не начиналась, так что "queued" — точное состояние job'а
+                # на всё время деферрала. Если контейнер перезапустится во время
+                # долгого даунтайма LLM, restore_pending_jobs корректно поднимет
+                # его из БД именно как queued-работу.
                 retry_interval = services.settings.monitoring_llm_retry_interval_sec
                 job.retry_count += 1
                 logger.info(
