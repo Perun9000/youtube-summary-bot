@@ -16,6 +16,7 @@ from aiogram.types import (
 
 from app.bot_handlers import Services, build_router, enqueue_scheduled_candidate
 from app.config import Settings, load_settings
+from app.db import Database
 from app.digest_service import DigestStore
 from app.groq_whisper_service import GroqWhisperService
 from app.llm_client import create_llm_client, health_check_with_reason
@@ -113,6 +114,8 @@ async def main() -> None:
     settings.bot_data_dir.mkdir(parents=True, exist_ok=True)
     configure_logging(settings.bot_data_dir)
 
+    db = Database(settings.database_path)
+
     llm = create_llm_client(settings)
     bot = Bot(token=settings.telegram_bot_token)
     groq_whisper = GroqWhisperService(settings)
@@ -125,8 +128,9 @@ async def main() -> None:
         logger.info("groq.boot enabled=false reason=no_api_key")
 
     summary_cache = SummaryCache(
-        settings.summary_cache_path,
+        db,
         ttl_days=settings.summary_cache_ttl_days,
+        legacy_json_path=settings.summary_cache_path,
     )
     logger.info(
         "summary_cache.boot path=%s entries=%s ttl_days=%s",
@@ -162,9 +166,10 @@ async def main() -> None:
         settings.digests_path, settings.digest_pins_path,
     )
     user_store = UserStore(
-        settings.allowed_users_path,
+        db,
         seed_user_ids=settings.allowed_user_ids,
         owner_user_id=settings.owner_user_id,
+        legacy_json_path=settings.allowed_users_path,
     )
     logger.info(
         "users.boot path=%s count=%s owner_user_id=%s",
@@ -218,6 +223,7 @@ async def main() -> None:
         tags_catalog=tags_catalog,
         digests=digest_store,
         system_prompts=system_prompt_store,
+        db=db,
     )
 
     scheduler_task: asyncio.Task[None] | None = None

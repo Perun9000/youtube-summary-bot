@@ -26,6 +26,7 @@ from aiogram.types import (
 
 from app.config import Settings
 from app.channel_posts_store import ChannelPost, ChannelPostsStore
+from app.db import Database
 from app.digest_service import DigestEntry, DigestStore, render_digest_html, update_pin_for_user
 from app.groq_whisper_service import GroqWhisperService, GroqWhisperUnavailable
 from app import log_analytics
@@ -123,6 +124,7 @@ class Services:
     tags_catalog: "TagsCatalog | None" = None
     digests: "DigestStore | None" = None
     system_prompts: "SystemPromptStore | None" = None
+    db: "Database | None" = None
     # Двухшаговые админ-команды («введи /user_add — бот спросит — ты отвечаешь
     # данными в следующем сообщении»). Ключ — chat_id, значение —
     # PendingAdminInput. Не персистится: после рестарта диалог теряется,
