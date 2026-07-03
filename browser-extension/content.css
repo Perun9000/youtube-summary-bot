@@ -49,6 +49,42 @@ ytd-app[dark] #yt-summary-bot-btn:active {
   background: rgba(255, 255, 255, 0.3);
 }
 
+/* Оверлей-кнопка «🔮» на превью related-видео (страница /watch).
+ * Слева сверху — чтобы не конфликтовать с родными hover-кнопками YouTube
+ * («Посмотреть позже», «В очередь» — справа сверху) и бейджем длительности
+ * (справа снизу). Появляется при наведении на превью, как родные кнопки. */
+
+.yt-summary-preview-host {
+  position: relative;
+}
+
+.yt-summary-preview-btn {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  z-index: 10;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.72);
+  font-size: 14px;
+  line-height: 28px;
+  text-align: center;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.yt-summary-preview-host:hover .yt-summary-preview-btn {
+  opacity: 1;
+}
+
+.yt-summary-preview-btn:hover {
+  background: rgba(0, 0, 0, 0.9);
+}
+
 /* Toast при попытке кликнуть кнопку, когда video_id невалидный. */
 #yt-summary-bot-toast {
   position: fixed;

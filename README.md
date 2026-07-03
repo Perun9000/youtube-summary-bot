@@ -173,7 +173,7 @@ data/youtube.cookies.txt
 ## Browser extension
 
 В `browser-extension/` — расширение для Chrome/Firefox (Manifest V3),
-добавляющее кнопку **📚 Summary** на странице YouTube-видео рядом с
+добавляющее кнопку **🔮 Summary** на странице YouTube-видео рядом с
 Like/Share/Save. Клик открывает Telegram deep-link'ом на бота с `video_id` —
 бот ставит ролик в очередь и присылает саммари в личный чат. Хэндл бота
 настраивается через options-страницу расширения. Подробности установки — в

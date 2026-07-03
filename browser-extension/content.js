@@ -1,7 +1,8 @@
 // YouTube Summary (Telegram bot) — content script
 //
-// Что делает: на странице /watch?... добавляет кнопку «📚 Summary» рядом
-// с Like/Share/Save. По клику открывает Telegram через deep-link с
+// Что делает: на странице /watch?... добавляет кнопку «🔮 Summary» рядом
+// с Like/Share/Save, а на превью related-видео в сайдбаре — маленькую
+// оверлей-кнопку «🔮». По клику открывает Telegram через deep-link с
 // payload'ом /start <video_id>. Бот видит payload, валидирует как
 // 11-символьный YouTube ID и кладёт ролик в очередь саммари.
 //
@@ -75,7 +76,7 @@
     btn.id = BUTTON_ID;
     btn.type = 'button';
     btn.title = 'Получить саммари ролика в Telegram';
-    btn.textContent = '📚 Summary';
+    btn.textContent = '🔮 Summary';
     btn.addEventListener('click', async () => {
       // Видео могло смениться между injection'ом и кликом (SPA), поэтому
       // ID добываем заново в момент нажатия.
@@ -126,6 +127,66 @@
     if (btn && btn.parentNode) btn.parentNode.removeChild(btn);
   }
 
+  // ─────────────── preview buttons (related-сайдбар на /watch) ───────────────
+  //
+  // На каждое превью related-видео вешаем оверлей-кнопку «🔮»: клик отправляет
+  // ЭТОТ ролик боту, не открывая его. YouTube часто переименовывает свои
+  // рендереры (ytd-compact-video-renderer → yt-lockup-view-model, ...),
+  // поэтому к именам не привязываемся: берём все ссылки на /watch?v=...
+  // внутри сайдбара #secondary, содержащие картинку-превью.
+
+  const PREVIEW_BTN_CLASS = 'yt-summary-preview-btn';
+  const PREVIEW_HOST_CLASS = 'yt-summary-preview-host';
+
+  function extractIdFromHref(href) {
+    try {
+      const u = new URL(href, location.origin);
+      if (u.pathname === '/watch') {
+        const v = u.searchParams.get('v');
+        if (v && VIDEO_ID_RE.test(v)) return v;
+      }
+    } catch (e) {
+      // Битый href — пропускаем.
+    }
+    return null;
+  }
+
+  function buildPreviewButton(anchor) {
+    const btn = document.createElement('button');
+    btn.className = PREVIEW_BTN_CLASS;
+    btn.type = 'button';
+    btn.title = 'Получить саммари этого ролика в Telegram';
+    btn.textContent = '🔮';
+    btn.addEventListener('click', async (ev) => {
+      // Не даём клику провалиться в ссылку превью и открыть сам ролик.
+      ev.preventDefault();
+      ev.stopPropagation();
+      // href читаем в момент клика: YouTube переиспользует DOM-ноды
+      // сайдбара при SPA-переходах, и ссылка могла смениться.
+      const id = extractIdFromHref(anchor.href);
+      if (!id) return;
+      const handle = await getBotHandle();
+      const url = `https://t.me/${handle}?start=${encodeURIComponent(id)}`;
+      window.open(url, '_blank', 'noopener,noreferrer');
+    });
+    return btn;
+  }
+
+  function injectPreviewButtons() {
+    if (!extractVideoId()) return; // только на странице открытого видео
+    const sidebar = document.querySelector('#secondary');
+    if (!sidebar) return;
+    const anchors = sidebar.querySelectorAll('a[href*="/watch?v="]');
+    for (const anchor of anchors) {
+      // Нужны именно превью (ссылки с картинкой), а не текстовые заголовки.
+      if (!anchor.querySelector('img, yt-image')) continue;
+      if (anchor.querySelector(`.${PREVIEW_BTN_CLASS}`)) continue; // уже есть
+      if (!extractIdFromHref(anchor.href)) continue;
+      anchor.classList.add(PREVIEW_HOST_CLASS);
+      anchor.appendChild(buildPreviewButton(anchor));
+    }
+  }
+
   function onRouteChange() {
     // YouTube — SPA, DOM собирается асинхронно. На каждом событии делаем
     // 3 попытки injection с разными задержками — обычно достаточно.
@@ -136,6 +197,9 @@
     setTimeout(injectButton, 200);
     setTimeout(injectButton, 800);
     setTimeout(injectButton, 2000);
+    // Сайдбар related собирается позже основной разметки.
+    setTimeout(injectPreviewButtons, 800);
+    setTimeout(injectPreviewButtons, 2500);
   }
 
   // ───────────────────────────── SPA events ─────────────────────────────
@@ -146,10 +210,20 @@
   // Подстраховка: если событие не прилетит — следим за изменением
   // location.href через MutationObserver на body.
   let lastUrl = location.href;
+  // Related-список подгружается лениво при скролле — дозакидываем кнопки
+  // на новые превью по мутациям DOM, но не чаще раза в секунду.
+  let previewScanQueued = false;
   const urlObserver = new MutationObserver(() => {
     if (location.href !== lastUrl) {
       lastUrl = location.href;
       onRouteChange();
+    }
+    if (!previewScanQueued) {
+      previewScanQueued = true;
+      setTimeout(() => {
+        previewScanQueued = false;
+        injectPreviewButtons();
+      }, 1000);
     }
   });
   urlObserver.observe(document.body, {childList: true, subtree: true});

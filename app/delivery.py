@@ -71,12 +71,22 @@ def _format_telegram_summary(
     overview_line = f"<b>О чем видео:</b>\n{escape_html(summary.overview)}"
     reading_line = f"Время чтения: {_estimate_reading_time_minutes(summary)} мин"
 
-    # Ссылка на Telegra.ph уехала в inline-кнопку — см. _build_summary_keyboard.
-    # В теле сообщения её больше нет, чтобы не дублировать и не занимать место.
+    # Ссылка на полный конспект живёт и в inline-кнопке (_build_summary_keyboard),
+    # и в теле сообщения: кнопка при пересылке сообщения не сохраняется,
+    # а гиперссылка в тексте — сохраняется. При деградации Telegraph
+    # (telegraph_url == "") строка просто не добавляется.
+    telegraph_line = ""
+    if telegraph_url:
+        telegraph_line = (
+            f'🔮 <a href="{escape_html(telegraph_url)}">подробное саммари</a>'
+        )
+
     blocks = [channel_line, title_line]
     if segment_line:
         blocks.append(segment_line)
     blocks.extend([overview_line, reading_line])
+    if telegraph_line:
+        blocks.append(telegraph_line)
 
     tags_line = _format_tags_line(summary.tags)
     if tags_line:

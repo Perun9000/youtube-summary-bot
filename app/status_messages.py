@@ -260,7 +260,7 @@ async def _run_with_telegram_status(
             lines = [
                 base_text,
                 "",
-                f"Время генерации: {_format_elapsed_minutes(elapsed)}",
+                f"Времени прошло: {_format_elapsed_minutes(elapsed)}",
             ]
             progress_text = _format_job_progress(job, elapsed)
             if progress_text:
