@@ -5,9 +5,9 @@
 // payload'ом /start <video_id>. Бот видит payload, валидирует как
 // 11-символьный YouTube ID и кладёт ролик в очередь саммари.
 //
-// Бот: @YouTube_Sum_mary_bot. Чтобы поменять — отредактируй BOT_HANDLE
-// ниже и перезагрузи extension. Никаких popup-настроек нет — этот
-// extension личный, не для распространения.
+// Хэндл бота настраивается на options-странице расширения и хранится
+// в storage.sync; если ничего не сохранено — используется дефолт
+// DEFAULT_BOT_HANDLE (@YouTube_Sum_mary_bot).
 
 (() => {
   'use strict';
@@ -20,11 +20,20 @@
   const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 
   function getBotHandle() {
+    // Firefox: browser.storage.sync.get — Promise-only, callback-форму
+    // молча игнорирует. Chrome: поддерживает обе. Поэтому сначала зовём
+    // без callback'а; если вернулся thenable — работаем как с Promise,
+    // иначе повторяем вызов в callback-стиле.
     return new Promise((resolve) => {
+      const done = (items) =>
+        resolve((items && items.botHandle) || DEFAULT_BOT_HANDLE);
       try {
-        api.storage.sync.get({ botHandle: DEFAULT_BOT_HANDLE }, (items) =>
-          resolve(items.botHandle || DEFAULT_BOT_HANDLE)
-        );
+        const maybe = api.storage.sync.get({ botHandle: DEFAULT_BOT_HANDLE });
+        if (maybe && typeof maybe.then === 'function') {
+          maybe.then(done, () => resolve(DEFAULT_BOT_HANDLE));
+        } else {
+          api.storage.sync.get({ botHandle: DEFAULT_BOT_HANDLE }, done);
+        }
       } catch {
         resolve(DEFAULT_BOT_HANDLE);
       }
