@@ -14,11 +14,17 @@ from aiogram.types import (
     MenuButtonCommands,
 )
 
-from app.bot_handlers import Services, build_router, enqueue_scheduled_candidate
+from app.bot_handlers import (
+    Services,
+    build_router,
+    enqueue_scheduled_candidate,
+    restore_pending_jobs,
+)
 from app.config import Settings, load_settings
 from app.db import Database
 from app.digest_service import DigestStore
 from app.groq_whisper_service import GroqWhisperService
+from app.job_store import JobStore
 from app.llm_client import create_llm_client, health_check_with_reason
 from app.channel_posts_store import ChannelPostsStore
 from app.summary_cache import SummaryCache
@@ -225,6 +231,7 @@ async def main() -> None:
         digests=digest_store,
         system_prompts=system_prompt_store,
         db=db,
+        job_store=JobStore(db),
     )
 
     scheduler_task: asyncio.Task[None] | None = None
@@ -260,6 +267,7 @@ async def main() -> None:
         logger.info("monitoring.boot enabled=false")
 
     await configure_bot_commands(bot, settings)
+    await restore_pending_jobs(services)
     dispatcher = Dispatcher()
     dispatcher.include_router(build_router(services))
     try:

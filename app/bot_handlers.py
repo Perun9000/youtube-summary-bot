@@ -30,6 +30,7 @@ from app.db import Database
 from app.digest_service import DigestEntry, DigestStore, render_digest_html, update_pin_for_user
 from app.groq_whisper_service import GroqWhisperService, GroqWhisperUnavailable
 from app import log_analytics
+from app.job_store import JobStore
 from app.llm_client import GenerationUsage, LLMClient, OpenRouterClient, health_check_with_reason
 from app.summary_cache import CachedSummary, SummaryCache
 from app.tags_catalog import CANONICAL_FORMATS, TagsCatalog
@@ -86,6 +87,13 @@ class SummaryJob:
     expert_matches: list[str] | None = None
     show_matches: list[str] | None = None
     retry_count: int = 0
+    db_id: int | None = None
+    # Transient, не персистится: main worker выставляет "done"/"failed" по
+    # результату _process_youtube_job, но маршрут «нет субтитров →
+    # transcription_queue» — не финал: job вернётся в summary_queue после
+    # Groq. Флаг говорит воркеру не трогать статус на этом проходе (он
+    # остаётся "active").
+    routed_to_transcription: bool = False
 
 
 @dataclass
@@ -125,6 +133,7 @@ class Services:
     digests: "DigestStore | None" = None
     system_prompts: "SystemPromptStore | None" = None
     db: "Database | None" = None
+    job_store: "JobStore | None" = None
     # Двухшаговые админ-команды («введи /user_add — бот спросит — ты отвечаешь
     # данными в следующем сообщении»). Ключ — chat_id, значение —
     # PendingAdminInput. Не персистится: после рестарта диалог теряется,
@@ -507,7 +516,12 @@ def build_router(services: Services) -> Router:
             logger.exception("stats.failed")
             await message.answer(f"Не удалось собрать статистику: {exc}")
             return
-        await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+        job_counts = services.job_store.counts_since(30) if services.job_store else {}
+        db_line = (
+            f"Jobs за 30 дней (БД): ✅ {job_counts.get('done', 0)} · "
+            f"❌ {job_counts.get('failed', 0)} · ⏹ {job_counts.get('cancelled', 0)}\n\n"
+        )
+        await message.answer(db_line + text, parse_mode="HTML", disable_web_page_preview=True)
 
     @router.message(Command("llm_paid"))
     async def llm_paid(message: Message) -> None:
@@ -685,12 +699,20 @@ async def _enqueue_summary_job(message: Message, url: str, services: Services) -
             active_job = services.summary_active_job
             active_count = 1 if active_job is not None else 0
             position = active_count + services.summary_queue.qsize() + 1
+            db_id = (
+                services.job_store.add(
+                    url, message.chat.id, scheduled=False, disable_notification=False, title_hint=None
+                )
+                if services.job_store
+                else None
+            )
             job = SummaryJob(
                 sequence=sequence,
                 message=message,
                 url=url,
                 enqueued_at=time.monotonic(),
                 chat_id=message.chat.id,
+                db_id=db_id,
             )
             await services.summary_queue.put(job)
             if services.summary_worker_task is None or services.summary_worker_task.done():
@@ -1011,13 +1033,25 @@ async def enqueue_scheduled_candidate(
     async with services.summary_queue_lock:
         services.summary_next_sequence += 1
         sequence = services.summary_next_sequence
+        title_hint = candidate.metadata.title or candidate.feed_entry.title
+        db_id = (
+            services.job_store.add(
+                candidate.feed_entry.url,
+                target_chat_id,
+                scheduled=True,
+                disable_notification=True,
+                title_hint=title_hint,
+            )
+            if services.job_store
+            else None
+        )
         job = SummaryJob(
             sequence=sequence,
             message=None,
             url=candidate.feed_entry.url,
             enqueued_at=time.monotonic(),
             chat_id=target_chat_id,
-            title_hint=candidate.metadata.title or candidate.feed_entry.title,
+            title_hint=title_hint,
             scheduled=True,
             disable_notification=True,
             pre_fetched_metadata=candidate.metadata,
@@ -1026,6 +1060,7 @@ async def enqueue_scheduled_candidate(
             segment_spans=list(candidate.segment_spans) or None,
             expert_matches=list(candidate.expert_matches) or None,
             show_matches=list(candidate.show_matches) or None,
+            db_id=db_id,
         )
         await services.summary_queue.put(job)
         if services.summary_worker_task is None or services.summary_worker_task.done():
@@ -1039,6 +1074,42 @@ async def enqueue_scheduled_candidate(
         candidate.expert_matches,
         candidate.segment_spans,
     )
+
+
+async def restore_pending_jobs(services: Services) -> int:
+    """Восстановить незавершённые job'ы из БД после рестарта контейнера.
+
+    message=None: доставка результата пойдёт через bot.send_message(chat_id) —
+    тот же путь, что у scheduled-задач. pre_fetched-данные не персистились,
+    metadata/субтитры будут получены заново (кэш саммари при этом продолжает
+    отсекать полные повторы).
+    """
+    if services.job_store is None:
+        return 0
+    rows = services.job_store.pending()
+    restored = 0
+    async with services.summary_queue_lock:
+        for row in rows:
+            services.summary_next_sequence += 1
+            job = SummaryJob(
+                sequence=services.summary_next_sequence,
+                message=None,
+                url=row["url"],
+                enqueued_at=time.monotonic(),
+                chat_id=row["chat_id"],
+                title_hint=row["title_hint"],
+                scheduled=bool(row["scheduled"]),
+                disable_notification=bool(row["disable_notification"]),
+                db_id=row["id"],
+            )
+            services.job_store.set_status(row["id"], "queued")
+            await services.summary_queue.put(job)
+            restored += 1
+        if restored and (services.summary_worker_task is None or services.summary_worker_task.done()):
+            services.summary_worker_task = asyncio.create_task(_summary_queue_worker(services))
+    if restored:
+        logger.info("queue.restored jobs=%s", restored)
+    return restored
 
 
 async def _is_llm_available(services: Services) -> bool:
@@ -1085,6 +1156,8 @@ async def _summary_queue_worker(services: Services) -> None:
 
             async with services.summary_queue_lock:
                 services.summary_active_job = job
+            if services.job_store and job.db_id:
+                services.job_store.set_status(job.db_id, "active")
 
             wait_sec = time.monotonic() - job.enqueued_at
             logger.info(
@@ -1104,11 +1177,19 @@ async def _summary_queue_worker(services: Services) -> None:
                     job.chat_id,
                     services.summary_queue.qsize(),
                 )
+                # Маршрут «нет субтитров → transcription_queue» не финализирует
+                # статус: job вернётся сюда после Groq, остаётся "active".
+                if services.job_store and job.db_id and not job.routed_to_transcription:
+                    services.job_store.set_status(job.db_id, "done")
             except asyncio.CancelledError:
                 logger.info("queue.job.cancelled sequence=%s chat_id=%s", job.sequence, job.chat_id)
+                if services.job_store and job.db_id:
+                    services.job_store.set_status(job.db_id, "cancelled")
                 raise
             except Exception:
                 logger.exception("queue.job.failed sequence=%s url=%s", job.sequence, job.url)
+                if services.job_store and job.db_id:
+                    services.job_store.set_status(job.db_id, "failed")
             finally:
                 async with services.summary_queue_lock:
                     if services.summary_active_job == job:
@@ -1201,6 +1282,12 @@ async def _transcription_queue_worker(services: Services) -> None:
             try:
                 await _process_transcription_job(job, services)
             except asyncio.CancelledError:
+                # Не покрыто брифом напрямую: воркер транскрипции сегодня не
+                # отменяется явно ни из /stop, ни где-либо ещё, но может
+                # получить CancelledError при остановке процесса (shutdown).
+                # По смыслу это "cancelled", а не "failed".
+                if services.job_store and job.db_id:
+                    services.job_store.set_status(job.db_id, "cancelled")
                 raise
             except Exception:
                 logger.exception(
@@ -1305,6 +1392,9 @@ async def _process_transcription_job(job: SummaryJob, services: Services) -> Non
     # Стамп: транскрипт получен, отдаём обратно в summary_queue.
     job.pre_fetched_segments = list(segments)
     job.pre_fetched_transcript_source = "groq"
+    # Job возвращается на обычный путь main worker'а — следующий проход
+    # обязан финализировать статус (done/failed) как любой другой job.
+    job.routed_to_transcription = False
     # Сбросим pre_fetched_metadata, если он не пришёл — пусть main worker
     # перетянет actual метаданные ролика заново. (Скорее всего тут он None.)
 
@@ -1355,6 +1445,10 @@ async def _send_transcription_failure(services: Services, job: SummaryJob, reaso
     # с причиной, status-сообщение «Скачиваю аудио…» больше не нужно.
     if job.chat_id:
         await _delete_service_status(services, job.chat_id)
+    # Транскрипция — тупиковая ветка (job не возвращается в summary_queue),
+    # так что это и есть финализация статуса в БД.
+    if services.job_store and job.db_id:
+        services.job_store.set_status(job.db_id, "failed")
 
 
 # Подстроки → человеческая причина. Сравнение case-insensitive, на сообщении
@@ -1442,7 +1536,7 @@ def _classify_youtube_download_error(exc: Exception) -> str:
 async def _stop_summary_queue(message: Message, services: Services) -> None:
     async with services.summary_queue_lock:
         active = services.summary_active_job
-        pending_count = _drain_summary_queue(services.summary_queue)
+        pending_count = _drain_summary_queue(services.summary_queue, services)
         worker_task = services.summary_worker_task
         services.summary_next_sequence = 0
         if worker_task is not None and not worker_task.done():
@@ -1458,13 +1552,15 @@ async def _stop_summary_queue(message: Message, services: Services) -> None:
         await message.answer(f"Очередь summary очищена. Удалено из очереди: {pending_count}.")
 
 
-def _drain_summary_queue(queue: asyncio.Queue[SummaryJob]) -> int:
+def _drain_summary_queue(queue: asyncio.Queue[SummaryJob], services: Services) -> int:
     count = 0
     while True:
         try:
-            queue.get_nowait()
+            job = queue.get_nowait()
         except asyncio.QueueEmpty:
             return count
+        if services.job_store and job.db_id:
+            services.job_store.set_status(job.db_id, "cancelled")
         queue.task_done()
         count += 1
 
@@ -1852,6 +1948,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                     "Субтитры недоступны. Отправляю в очередь распознавания через Groq Whisper...",
                     job=job,
                 )
+                job.routed_to_transcription = True
                 await _enqueue_transcription_job(job, services)
                 logger.info(
                     "job.routed_to_transcription job_id=%s url=%s sequence=%s",
@@ -1861,7 +1958,8 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                 )
                 # Возвращаемся: main worker возьмёт следующий job из summary_queue,
                 # а transcription worker сам перенаправит этот job обратно после
-                # успешного распознавания.
+                # успешного распознавания. Статус в БД остаётся "active" —
+                # см. SummaryJob.routed_to_transcription.
                 return
 
         # If this is a scheduled segment-mode job, trim segments to the expert span(s).
