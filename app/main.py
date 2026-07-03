@@ -243,6 +243,16 @@ async def main() -> None:
         async def _enqueue(candidate, channel):
             await enqueue_scheduled_candidate(candidate, channel, services)
 
+        async def _notify_skip(title: str, reason: str) -> None:
+            owner = settings.owner_user_id
+            if owner is None:
+                return
+            await bot.send_message(
+                chat_id=owner,
+                text=f"Мониторинг пропустил видео «{title}»: {reason}.",
+                disable_notification=True,
+            )
+
         async def _check_llm() -> tuple[bool, str]:
             return await health_check_with_reason(services.llm)
 
@@ -251,6 +261,7 @@ async def main() -> None:
             state=monitoring_state,
             youtube=services.youtube,
             enqueue=_enqueue,
+            on_skip=_notify_skip,
         )
         scheduler_task = asyncio.create_task(
             run_monitoring_scheduler(services.monitoring, llm_check=_check_llm),

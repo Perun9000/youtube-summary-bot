@@ -45,6 +45,8 @@ from app.pipeline import _download_audio_to_chat  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
+MAX_SYSTEM_PROMPT_CHARS = 8000
+
 
 def build_router(services: Services) -> Router:
     router = Router()
@@ -925,6 +927,14 @@ async def _apply_prompt_set(message: Message, raw_text: str, services: Services)
         await message.answer(
             "Первый символ — «/», похоже на команду, а не на промпт. "
             "Не сохраняю. Запусти /prompt_set заново и пришли именно текст промпта."
+        )
+        return
+
+    if len(prompt_text) > MAX_SYSTEM_PROMPT_CHARS:
+        await message.answer(
+            f"Промпт слишком длинный: {len(prompt_text)} символов при лимите "
+            f"{MAX_SYSTEM_PROMPT_CHARS}. Такой промпт съест контекст модели и "
+            "испортит все саммари. Сократи и пришли ещё раз."
         )
         return
 
