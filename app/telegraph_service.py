@@ -240,24 +240,34 @@ def _summary_to_nodes(
             "children": [{"tag": "i", "children": [tags_text]}],
         })
 
-    # Executive summary + подробный разбор тезисов. Блока с короткими
-    # тезисами-буллетами больше нет.
+    # Executive summary — рендерим всегда.
     nodes.extend([
         {"tag": "h3", "children": ["Executive summary"]},
         {"tag": "p", "children": [summary.overview]},
-        {"tag": "h3", "children": ["Ключевые тезисы"]},
     ])
 
-    for chapter in summary.chapters:
-        heading = chapter.title.strip() or "Тезис"
-        nodes.append({"tag": "h4", "children": [heading]})
-        for paragraph in [part.strip() for part in chapter.notes.split("\n\n") if part.strip()]:
-            nodes.append({"tag": "p", "children": [paragraph]})
-
-    if not summary.chapters:
-        # Если модель почему-то не отдала chapters — не оставляем пустой раздел,
-        # показываем сырой ответ как fallback.
-        nodes.append({"tag": "p", "children": [summary.raw_text]})
+    # Подробный разбор тезисов — только если модель отдала валидные chapters.
+    # Если chapters пустые (обычно — модель вернула повреждённый JSON, и
+    # _summary_from_damaged_json смог достать только overview), заголовок
+    # «Ключевые тезисы» вообще не показываем. Раньше здесь дампился raw_text —
+    # но это сырой JSON модели, читателю от него только хуже.
+    if summary.chapters:
+        nodes.append({"tag": "h3", "children": ["Ключевые тезисы"]})
+        for chapter in summary.chapters:
+            heading = chapter.title.strip() or "Тезис"
+            nodes.append({"tag": "h4", "children": [heading]})
+            for paragraph in [part.strip() for part in chapter.notes.split("\n\n") if part.strip()]:
+                nodes.append({"tag": "p", "children": [paragraph]})
+    else:
+        nodes.append({
+            "tag": "p",
+            "children": [
+                {"tag": "em", "children": [
+                    "Подробный разбор тезисов извлечь не удалось — модель "
+                    "вернула неполный ответ. Executive summary выше корректный."
+                ]},
+            ],
+        })
 
     if top_comments:
         nodes.append({"tag": "h3", "children": ["Топ-комментарии"]})

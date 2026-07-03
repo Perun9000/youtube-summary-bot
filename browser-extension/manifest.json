@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube Summary (Telegram bot)",
+  "version": "0.1.0",
+  "description": "Кнопка «Summary» в UI YouTube. По клику открывает Telegram-бота с ID текущего ролика — бот возвращает краткое саммари и полный конспект в Telegra.ph.",
+  "default_locale": "ru",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.youtube.com/*"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "permissions": [],
+  "host_permissions": [],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "youtube-summary-bot@perun9000",
+      "strict_min_version": "109.0"
+    }
+  }
+}

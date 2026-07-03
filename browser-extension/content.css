@@ -1,0 +1,75 @@
+/* Кнопка Summary рядом с Like/Share/Save.
+ * Использует CSS-переменные YouTube'а где возможно, чтобы автоматически
+ * подхватывать light/dark тему. На случай отсутствия переменных есть
+ * fallback'и. */
+
+#yt-summary-bot-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 36px;
+  padding: 0 16px;
+  margin-left: 8px;
+  border: none;
+  border-radius: 18px;
+  background: var(--yt-spec-badge-chip-background, #f2f2f2);
+  color: var(--yt-spec-text-primary, #0f0f0f);
+  font-family: 'Roboto', 'Arial', sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.1s ease-out;
+  user-select: none;
+}
+
+#yt-summary-bot-btn:hover {
+  background: var(--yt-spec-button-chip-background-hover, #e5e5e5);
+}
+
+#yt-summary-bot-btn:active {
+  background: var(--yt-spec-button-chip-background-pressed, #d9d9d9);
+}
+
+/* Dark theme: YouTube ставит атрибут [dark] на <html> и/или <ytd-app>. */
+html[dark] #yt-summary-bot-btn,
+ytd-app[dark] #yt-summary-bot-btn {
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+}
+
+html[dark] #yt-summary-bot-btn:hover,
+ytd-app[dark] #yt-summary-bot-btn:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+html[dark] #yt-summary-bot-btn:active,
+ytd-app[dark] #yt-summary-bot-btn:active {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+/* Toast при попытке кликнуть кнопку, когда video_id невалидный. */
+#yt-summary-bot-toast {
+  position: fixed;
+  bottom: 80px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 99999;
+  padding: 12px 20px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.85);
+  color: #fff;
+  font-family: 'Roboto', 'Arial', sans-serif;
+  font-size: 14px;
+  max-width: 400px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  pointer-events: none;
+  animation: yt-summary-bot-toast-fade 3.5s ease-out forwards;
+}
+
+@keyframes yt-summary-bot-toast-fade {
+  0%, 5% { opacity: 0; transform: translate(-50%, 20px); }
+  10%, 80% { opacity: 1; transform: translate(-50%, 0); }
+  100% { opacity: 0; transform: translate(-50%, -20px); }
+}

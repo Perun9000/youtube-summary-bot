@@ -53,20 +53,49 @@ class QAService:
             ),
             system=QA_SYSTEM_PROMPT,
         )
-        logger.info(
-            "qa.done title=%r question_chars=%s context_chars=%s answer_chars=%s duration_sec=%.1f",
-            context.title,
-            len(question),
-            len(chunks),
-            len(answer),
-            time.monotonic() - started,
-        )
+        if not answer or not answer.strip():
+            logger.warning(
+                "qa.empty_answer title=%r question_chars=%s context_chars=%s summary_chars=%s duration_sec=%.1f",
+                context.title,
+                len(question),
+                len(chunks),
+                len(summary_text),
+                time.monotonic() - started,
+            )
+        else:
+            logger.info(
+                "qa.done title=%r question_chars=%s context_chars=%s answer_chars=%s duration_sec=%.1f",
+                context.title,
+                len(question),
+                len(chunks),
+                len(answer),
+                time.monotonic() - started,
+            )
         return answer
 
 
 def _summary_to_text(context: VideoContext) -> str:
-    points = "\n".join(f"- {point}" for point in context.summary.key_points)
-    return f"{context.summary.overview}\n{points}".strip()
+    """Плоский текстовый вид саммари для Q&A-промпта.
+
+    Схема саммари: overview (executive) + chapters (подробный разбор). Раньше
+    здесь были key_points, но теперь буллетов нет — соберём вместо них
+    заголовок+подробности каждой главы, чтобы у модели был полный контекст, а
+    не только 3–5 предложений overview.
+    """
+    parts: list[str] = []
+    overview = context.summary.overview.strip()
+    if overview:
+        parts.append(overview)
+    for chapter in context.summary.chapters:
+        title = chapter.title.strip()
+        notes = chapter.notes.strip()
+        if title and notes:
+            parts.append(f"{title}\n{notes}")
+        elif notes:
+            parts.append(notes)
+        elif title:
+            parts.append(title)
+    return "\n\n".join(parts).strip()
 
 
 def _rank_chunks(chunks: list[str], question: str, limit: int) -> list[str]:

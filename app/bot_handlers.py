@@ -691,7 +691,18 @@ def build_router(services: Services) -> Router:
         progress = await message.answer("Думаю над ответом по текущему ролику...")
         try:
             answer = await services.qa.answer(context, text)
-            await progress.edit_text(answer[:4000])
+            trimmed = (answer or "").strip()
+            if not trimmed:
+                # Пусто — модель не смогла или упёрлась в свои лимиты. Не пытаемся
+                # edit_text("") — Telegram отдаст «message text is empty». Даём
+                # пользователю понятный текст, а в bot.log уже лежит WARNING из
+                # QAService.answer с деталями.
+                await progress.edit_text(
+                    "Модель не вернула ответ. Попробуй переформулировать вопрос "
+                    "или задать более конкретный."
+                )
+                return
+            await progress.edit_text(trimmed[:4000])
         except Exception as exc:
             await progress.edit_text(f"Не удалось ответить на вопрос: {exc}")
 
