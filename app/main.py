@@ -25,7 +25,6 @@ from app.tags_catalog import TagsCatalog
 from app.monitoring_config import MonitoringConfig
 from app.monitoring_service import MonitoringService
 from app.monitoring_state import MonitoringState
-from app.qa_service import QAService
 from app.scheduler_service import run_monitoring_scheduler
 from app.summarizer import SUMMARY_SYSTEM_PROMPT, Summarizer
 from app.system_prompt_store import SystemPromptStore
@@ -49,7 +48,6 @@ OWNER_BOT_COMMANDS: list[BotCommand] = [
     BotCommand(command="users", description="Список пользователей"),
     BotCommand(command="user_add", description="Добавить пользователя"),
     BotCommand(command="user_remove", description="Удалить пользователя"),
-    BotCommand(command="reset", description="Забыть текущий ролик"),
     BotCommand(command="models", description="Доступные LLM-модели"),
     BotCommand(command="model", description="Текущая модель бота"),
     BotCommand(command="queue", description="Очередь summary"),
@@ -201,9 +199,7 @@ async def main() -> None:
             final_max_tokens=settings.llm_max_tokens_final,
             system_prompt_provider=system_prompt_store.current,
         ),
-        qa=QAService(llm),
         telegraph=TelegraphService(settings),
-        contexts={},
         summary_queue=asyncio.Queue(),
         summary_queue_lock=asyncio.Lock(),
         summary_worker_task=None,

@@ -32,7 +32,7 @@ from app import log_analytics
 from app.llm_client import GenerationUsage, LLMClient, OpenRouterClient, health_check_with_reason
 from app.summary_cache import CachedSummary, SummaryCache
 from app.tags_catalog import CANONICAL_FORMATS, TagsCatalog
-from app.models import Summary, SummaryTags, TranscriptSegment, VideoComment, VideoContext, VideoMetadata
+from app.models import Summary, SummaryTags, TranscriptSegment, VideoComment, VideoMetadata
 from app.monitoring_service import (
     MonitoringService,
     ScanProgress,
@@ -40,7 +40,6 @@ from app.monitoring_service import (
     filter_segments_by_spans,
     format_spans_for_humans,
 )
-from app.qa_service import QAService
 from app.summarizer import Summarizer, SummaryProgress
 from app.system_prompt_store import SystemPromptStore
 from app.telegraph_service import TelegraphService
@@ -106,9 +105,7 @@ class Services:
     youtube: YouTubeService
     whisper: WhisperService
     summarizer: Summarizer
-    qa: QAService
     telegraph: TelegraphService
-    contexts: dict[int, VideoContext]
     summary_queue: asyncio.Queue[SummaryJob]
     summary_queue_lock: asyncio.Lock
     summary_worker_task: asyncio.Task[None] | None
@@ -206,8 +203,7 @@ def build_router(services: Services) -> Router:
                 "/help - помощь\n"
                 "/last - последние 20 саммари\n\n"
                 "Пришли ссылку на YouTube-ролик — я верну краткое summary здесь "
-                "и полный конспект в Telegra.ph. После обработки можно задавать "
-                "вопросы по ролику в этом же чате."
+                "и полный конспект в Telegra.ph."
             )
             return
         await message.answer(
@@ -217,9 +213,8 @@ def build_router(services: Services) -> Router:
             "/user_add - добавить пользователя (бот спросит id и имя)\n\n"
             "/user_remove - удалить пользователя (бот спросит id)\n\n"
             "/cancel - отменить начатый диалог (например, /user_add)\n\n"
-            "/reset - забыть текущий ролик\n\n"
             "/models - показать модели, доступные локальному LLM-серверу\n\n"
-            "/model - показать модель, которую бот использует для summary и Q&A\n\n"
+            "/model - показать модель, которую бот использует для summary\n\n"
             "/queue - показать очередь summary\n\n"
             "/stop - остановить текущую генерацию и очистить очередь\n\n"
             "/scan_now - вручную запустить сканер мониторинга или показать статус идущего скана\n\n"
@@ -229,9 +224,7 @@ def build_router(services: Services) -> Router:
             "/cache_drop - убрать ролик из кэша саммари (аргумент — video_id или URL)\n\n"
             "/prompt_set - задать кастомный системный промпт для саммари (бот ждёт текст 5 мин)\n\n"
             "/prompt_show - показать текущий системный промпт\n\n"
-            "/prompt_reset - вернуть системный промпт к дефолту\n\n"
-            "После обработки ролика можно задавать вопросы по нему в этом же чате. "
-            "Контекст хранится в памяти контейнера до рестарта."
+            "/prompt_reset - вернуть системный промпт к дефолту"
         )
 
     @router.message(Command("last"))
@@ -431,14 +424,6 @@ def build_router(services: Services) -> Router:
         else:
             await message.answer("Сейчас нет активного диалога.")
 
-    @router.message(Command("reset"))
-    async def reset(message: Message) -> None:
-        if not _is_owner(message, services):
-            await _answer_owner_only(message, services)
-            return
-        services.contexts.pop(message.chat.id, None)
-        await message.answer("Текущий ролик забыт.")
-
     @router.message(Command("models"))
     async def models(message: Message) -> None:
         if not _is_owner(message, services):
@@ -473,7 +458,7 @@ def build_router(services: Services) -> Router:
             return
 
         await message.answer(
-            f"Бот использует для summary и Q&A:\n{services.llm.provider_name}: {model_name}"
+            f"Бот использует для summary:\n{services.llm.provider_name}: {model_name}"
         )
 
     @router.message(Command("queue"))
@@ -665,10 +650,8 @@ def build_router(services: Services) -> Router:
             )
             return
 
-        # В тексте есть http(s)-URL, но не от YouTube — режем сразу, чтобы не
-        # отправлять его в Q&A-ветку (LLM бесполезно скажет «у меня нет доступа
-        # к этому ресурсу») и не показывать generic-сообщение «сначала пришли
-        # ссылку на ютуб» — пользователь именно ссылку и прислал, просто не ту.
+        # В тексте есть http(s)-URL, но не от YouTube — отвечаем конкретно,
+        # что это не YouTube-ссылка, а не общим "пришли ссылку на видео".
         foreign_url = extract_first_url(text)
         if foreign_url:
             try:
@@ -683,28 +666,10 @@ def build_router(services: Services) -> Router:
             )
             return
 
-        context = services.contexts.get(message.chat.id)
-        if not context:
-            await message.answer("Сначала пришли ссылку на YouTube-ролик.")
-            return
-
-        progress = await message.answer("Думаю над ответом по текущему ролику...")
-        try:
-            answer = await services.qa.answer(context, text)
-            trimmed = (answer or "").strip()
-            if not trimmed:
-                # Пусто — модель не смогла или упёрлась в свои лимиты. Не пытаемся
-                # edit_text("") — Telegram отдаст «message text is empty». Даём
-                # пользователю понятный текст, а в bot.log уже лежит WARNING из
-                # QAService.answer с деталями.
-                await progress.edit_text(
-                    "Модель не вернула ответ. Попробуй переформулировать вопрос "
-                    "или задать более конкретный."
-                )
-                return
-            await progress.edit_text(trimmed[:4000])
-        except Exception as exc:
-            await progress.edit_text(f"Не удалось ответить на вопрос: {exc}")
+        await message.answer(
+            "Я умею только саммари YouTube-роликов. Пришли ссылку на видео — "
+            "или /help, чтобы посмотреть команды."
+        )
 
     return router
 
@@ -2080,19 +2045,6 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             job=job,
         )
 
-        # Scheduled jobs come from daily monitoring, not from an interactive chat
-        # session — we don't want to hijack the user's Q&A context with the bot.
-        if not job.scheduled:
-            services.contexts[chat_id] = VideoContext(
-                url=url,
-                video_id=video_id,
-                title=title,
-                transcript_text=transcript_text,
-                chunks=chunks,
-                summary=summary,
-                telegraph_url=telegraph_url,
-            )
-
         total_duration_sec = time.monotonic() - started
         # model_name всё ещё нужен ниже — пишем в кэш (CachedSummary.model) и
         # в строку job.done для аналитики. Сам user-facing «service info»-блок
@@ -3095,7 +3047,7 @@ async def _send_cached_summary_to_chat(
     cached: CachedSummary,
     services: Services,
 ) -> None:
-    """Manual flow: respond to a user message with cached summary + restore Q&A."""
+    """Manual flow: respond to a user message with cached summary."""
     fresh_comments = await _refresh_cached_comments(cached, services, source_label="manual")
     text = _format_cached_summary_text(cached, override_top_comments=fresh_comments)
     user_id = _message_user_id(message)
@@ -3110,7 +3062,6 @@ async def _send_cached_summary_to_chat(
         disable_web_page_preview=True,
         reply_markup=reply_markup,
     )
-    _restore_qa_context_from_cache(message.chat.id, cached, services)
     # NB: исходное user-message с YouTube-ссылкой удаляется централизованно
     # в `_enqueue_summary_job` (finally-блок), как только ссылка попала в
     # обработку. Здесь дублировать delete не нужно.
@@ -3139,8 +3090,7 @@ async def _deliver_cached_summary_for_job(
     cached: CachedSummary,
 ) -> None:
     """Job-level delivery: works for both manual (job.message != None) and
-    scheduled (services.bot.send_message). Restores Q&A context only for
-    interactive (manual) sessions."""
+    scheduled (services.bot.send_message)."""
     fresh_comments = await _refresh_cached_comments(cached, services, source_label="job")
     text = _format_cached_summary_text(cached, override_top_comments=fresh_comments)
     await _send_summary_delivery(
@@ -3150,8 +3100,6 @@ async def _deliver_cached_summary_for_job(
         video_id=cached.video_id,
         telegraph_url=cached.telegraph_url,
     )
-    if not job.scheduled and job.chat_id:
-        _restore_qa_context_from_cache(job.chat_id, cached, services)
     # NB: исходное user-message с ссылкой уже удалено в `_enqueue_summary_job`
     # к моменту, когда job попал в обработку. У scheduled-job его и не было.
 
@@ -3169,60 +3117,6 @@ async def _deliver_cached_summary_for_job(
             channel_name=cached.channel_name or "",
             created_at_unix=cached.created_at_unix or time.time(),
         )
-
-
-def _restore_qa_context_from_cache(
-    chat_id: int,
-    cached: CachedSummary,
-    services: Services,
-) -> None:
-    """Re-hydrate VideoContext for follow-up Q&A when we serve a cached summary.
-
-    We pull the saved transcript text from disk (data/transcripts/<video_id>.txt
-    written when the summary was first generated). If the transcript file is
-    missing, Q&A still works on summary-only context — just less rich.
-    """
-    transcript_text = ""
-    chunks: list[str] = []
-    transcript_path = (
-        services.settings.bot_data_dir / TRANSCRIPTS_SUBDIR / f"{cached.video_id}.txt"
-    )
-    if transcript_path.exists():
-        try:
-            transcript_text = transcript_path.read_text(encoding="utf-8")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "cache.restore.transcript_read_failed video_id=%s error=%s",
-                cached.video_id, exc,
-            )
-    if transcript_text:
-        try:
-            active_model = services.settings.openrouter_model_paid  # safe default
-            try:
-                # Try active model first when available — same chunk size that
-                # would be used for fresh generation.
-                pass
-            except Exception:
-                pass
-            chunk_size = services.settings.effective_chunk_max_chars(
-                active_model=cached.model
-            )
-            chunks = chunk_transcript(transcript_text, max_chars=chunk_size)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "cache.restore.chunking_failed video_id=%s error=%s",
-                cached.video_id, exc,
-            )
-
-    services.contexts[chat_id] = VideoContext(
-        url=cached.url,
-        video_id=cached.video_id,
-        title=cached.title,
-        transcript_text=transcript_text,
-        chunks=chunks,
-        summary=cached.to_summary(),
-        telegraph_url=cached.telegraph_url,
-    )
 
 
 def _save_summary_to_cache(

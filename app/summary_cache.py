@@ -3,8 +3,8 @@
 When a user re-sends an already-processed link, the bot returns the saved
 summary instantly — no LLM round-trips, no transcription, no re-publishing
 to Telegra.ph (we already have the page URL). The cache stores enough
-structure (overview, key_points, chapters) to also recover the Q&A
-``VideoContext`` later, paired with the on-disk transcript file.
+structure (overview, key_points, chapters) to reconstruct the summary
+later, paired with the on-disk transcript file.
 
 Storage layout: a single ``data/summary_cache.json`` mapping
 ``video_id -> dict``. Atomic write via ``tmp + replace``. Concurrent
