@@ -4,7 +4,8 @@ When a user re-sends an already-processed link, the bot returns the saved
 summary instantly — no LLM round-trips, no transcription, no re-publishing
 to Telegra.ph (we already have the page URL). The cache stores enough
 structure (overview, key_points, chapters) to reconstruct the summary
-later, paired with the on-disk transcript file.
+later. The transcript itself is never persisted — it lives in memory only
+for the duration of summary generation.
 
 Storage layout: a single ``data/summary_cache.json`` mapping
 ``video_id -> dict``. Atomic write via ``tmp + replace``. Concurrent
@@ -52,6 +53,9 @@ class CachedSummary:
     summary_chapters: list[dict]   # serialized Chapter list (start/title/notes)
     summary_raw_text: str
     telegraph_url: str
+    # Back-compat only: old cache entries may still have a Telegra.ph
+    # transcript-page URL here. New entries always write None — transcript
+    # pages are no longer published.
     transcript_url: str | None
     transcript_source: str           # "youtube" / "groq" / "whisper" / "none"
     model: str

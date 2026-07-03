@@ -60,20 +60,11 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 MAX_TELEGRAM_MESSAGE_CHARS = 4000
 TOP_COMMENT_MAX_CHARS = 2200
-TRANSCRIPTS_SUBDIR = "transcripts"
 
 # Формат YouTube video_id: ровно 11 символов из base64url-алфавита.
 # Используется в /start deep-link'ах от browser-extension'а.
 import re as _re  # локальный alias, чтобы не светить re по всему модулю
 _YOUTUBE_VIDEO_ID_RE = _re.compile(r"[A-Za-z0-9_-]{11}")
-
-
-def _save_transcript_to_file(data_dir: Path, video_id: str, transcript_text: str) -> Path:
-    transcripts_dir = data_dir / TRANSCRIPTS_SUBDIR
-    transcripts_dir.mkdir(parents=True, exist_ok=True)
-    path = transcripts_dir / f"{video_id}.txt"
-    path.write_text(transcript_text, encoding="utf-8")
-    return path
 
 
 @dataclass
@@ -1775,7 +1766,6 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
     video_id = "unknown"
     transcript_source = "unknown"
     title = url
-    transcript_publish_task: asyncio.Task[str | None] | None = None
 
     # Cache check at the very top — covers scheduled jobs + race-conditions
     # where the same video was queued twice in quick succession.
@@ -1935,37 +1925,6 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             job.progress_estimate_sec or 0.0,
         )
 
-        try:
-            saved_path = await asyncio.to_thread(
-                _save_transcript_to_file,
-                services.settings.bot_data_dir,
-                video_id,
-                transcript_text,
-            )
-            logger.info(
-                "job.transcript.saved job_id=%s path=%s chars=%s",
-                job_id,
-                saved_path,
-                len(transcript_text),
-            )
-        except Exception as exc:
-            logger.warning("job.transcript.save_failed job_id=%s error=%s", job_id, exc)
-
-        transcript_url: str | None = None
-        transcript_publish_task: asyncio.Task[str | None] | None = None
-        if segments:
-            transcript_publish_task = asyncio.create_task(
-                _publish_transcript_background(
-                    services=services,
-                    job_id=job_id,
-                    title=title,
-                    video_url=url,
-                    video_id=video_id,
-                    segments=list(segments),
-                    source=transcript_source,
-                )
-            )
-
         # Тянем топ-комментарии параллельно с генерацией саммари. yt-dlp на
         # comments-extractor'е тратит 5–15 секунд, и если запускать после LLM,
         # это всё уходит в общий duration. Параллельный запуск экономит ровно
@@ -2020,16 +1979,6 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             logger.warning("job.comments.await_failed job_id=%s error=%s", job_id, exc)
             top_comments = []
 
-        if transcript_publish_task is not None:
-            if not transcript_publish_task.done():
-                await _set_service_status(
-                    services,
-                    message,
-                    "Дожидаюсь публикации транскрипта в Telegra.ph...",
-                    job=job,
-                )
-            transcript_url = await transcript_publish_task
-
         await _set_service_status(services, message, "Публикую полный конспект в Telegra.ph...", job=job)
         telegraph_url = await _run_with_telegram_status(
             services=services,
@@ -2038,7 +1987,6 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                 title=title,
                 url=url,
                 summary=summary,
-                transcript_url=transcript_url,
                 top_comments=top_comments,
             ),
             base_text="Публикую полный конспект в Telegra.ph...",
@@ -2113,7 +2061,6 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                     metadata=metadata,
                     summary=summary,
                     telegraph_url=telegraph_url,
-                    transcript_url=transcript_url,
                     transcript_source=transcript_source,
                     transcript_chars=len(transcript_text),
                     model=model_name,
@@ -2138,8 +2085,6 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             usage.duration_sec,
         )
     except asyncio.CancelledError:
-        if transcript_publish_task is not None and not transcript_publish_task.done():
-            await _cancel_task_safely(transcript_publish_task)
         logger.info("job.cancelled job_id=%s video_id=%s duration_sec=%.1f", job_id, video_id, time.monotonic() - started)
         try:
             await _set_service_status(services, message, "Генерация summary остановлена.", job=job)
@@ -2149,8 +2094,6 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
         _forget_service_status(services, chat_id)
         raise
     except Exception as exc:
-        if transcript_publish_task is not None and not transcript_publish_task.done():
-            await _cancel_task_safely(transcript_publish_task)
         logger.exception("job.failed job_id=%s video_id=%s duration_sec=%.1f", job_id, video_id, time.monotonic() - started)
         await _set_service_status(services, message, "Генерация summary прервана.", job=job)
         await _send_summary_delivery(
@@ -2160,34 +2103,6 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
         )
         _forget_service_status(services, chat_id)
         raise
-
-
-async def _publish_transcript_background(
-    *,
-    services: Services,
-    job_id: str,
-    title: str,
-    video_url: str,
-    video_id: str,
-    segments: list[TranscriptSegment],
-    source: str,
-) -> str | None:
-    try:
-        transcript_url = await services.telegraph.publish_transcript(
-            title=title,
-            video_url=video_url,
-            video_id=video_id,
-            segments=segments,
-            source=source,
-        )
-        logger.info("job.transcript.published job_id=%s url=%s", job_id, transcript_url)
-        return transcript_url
-    except asyncio.CancelledError:
-        logger.info("job.transcript.publish_cancelled job_id=%s", job_id)
-        raise
-    except Exception:
-        logger.exception("job.transcript.publish_failed job_id=%s", job_id)
-        return None
 
 
 async def _fetch_top_comments_background(
@@ -2214,16 +2129,6 @@ async def _fetch_top_comments_background(
         # пусть будет WARNING, чтобы не портить error-counter в /stats.
         logger.warning("job.comments.failed job_id=%s error=%s", job_id, exc)
         return []
-
-
-async def _cancel_task_safely(task: asyncio.Task) -> None:
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    except Exception:
-        logger.exception("background_task.cancel_failed")
 
 
 async def _run_with_telegram_status(
@@ -2992,7 +2897,6 @@ async def _refresh_cached_comments(
             title=cached.title,
             video_url=cached.url,
             summary=cached.to_summary(),
-            transcript_url=cached.transcript_url,
             top_comments=fresh,
         )
         telegraph_updated = True
@@ -3128,7 +3032,6 @@ def _save_summary_to_cache(
     metadata,
     summary,
     telegraph_url: str,
-    transcript_url: str | None,
     transcript_source: str,
     transcript_chars: int,
     model: str,
@@ -3154,7 +3057,7 @@ def _save_summary_to_cache(
         ],
         summary_raw_text=summary.raw_text,
         telegraph_url=telegraph_url,
-        transcript_url=transcript_url,
+        transcript_url=None,
         transcript_source=transcript_source,
         model=model or "unknown",
         created_at_iso=iso_time,
