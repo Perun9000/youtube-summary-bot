@@ -20,3 +20,15 @@ def test_scheduled_pending_count(tmp_path):
     assert store.scheduled_pending_count() == 1
     store.set_status(j2, "done")
     assert store.scheduled_pending_count() == 1
+
+
+def test_deferred_lifecycle(tmp_path):
+    store = JobStore(Database(tmp_path / "bot.db"))
+    job_id = store.add("https://youtu.be/x", 42, scheduled=False, disable_notification=False, title_hint=None)
+    store.set_deferred(job_id, run_after=1000.0)
+    assert store.pending() == []                    # deferred — не queued/active
+    assert store.due_deferred(999.0) == []          # время ещё не пришло
+    assert [r["id"] for r in store.due_deferred(1000.0)] == [job_id]
+    store.set_status(job_id, "queued")              # deferred-scheduler поднял
+    assert [r["id"] for r in store.pending()] == [job_id]
+    assert store.due_deferred(2000.0) == []

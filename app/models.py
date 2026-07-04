@@ -25,6 +25,10 @@ class VideoMetadata:
     duration_sec: float = 0.0
     description: str = ""
     chapters: tuple[VideoChapter, ...] = ()
+    # Премьеры / запланированные стримы: yt-dlp отдаёт live_status
+    # ("is_upcoming" и т.п.) и release_timestamp (unix-время выхода).
+    live_status: str = ""
+    release_timestamp: float | None = None
 
 
 @dataclass(frozen=True)

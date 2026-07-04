@@ -39,6 +39,26 @@ class JobStore:
             (status, time.time(), job_id),
         )
 
+    def set_deferred(self, job_id: int, run_after: float) -> None:
+        """Отложить job до момента run_after (unix-время).
+
+        Используется для премьер: ролик ещё не вышел, вернёмся за саммари
+        после release + PREMIERE_SUMMARY_DELAY_HOURS. Отложенные строки не
+        попадают в pending() (их не трогает restore после рестарта) —
+        их поднимает deferred-scheduler через due_deferred().
+        """
+        self._db.execute(
+            "UPDATE jobs SET status = 'deferred', run_after = ?, updated_at = ? WHERE id = ?",
+            (run_after, time.time(), job_id),
+        )
+
+    def due_deferred(self, now: float) -> list[sqlite3.Row]:
+        return self._db.query(
+            "SELECT * FROM jobs WHERE status = 'deferred' AND run_after IS NOT NULL "
+            "AND run_after <= ? ORDER BY id",
+            (now,),
+        )
+
     def pending(self) -> list[sqlite3.Row]:
         return self._db.query(
             "SELECT * FROM jobs WHERE status IN ('queued', 'active') ORDER BY id"

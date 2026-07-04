@@ -199,6 +199,57 @@ async def restore_pending_jobs(services: Services) -> int:
     if restored:
         logger.info("queue.restored jobs=%s", restored)
     return restored
+
+
+# Как часто deferred-scheduler проверяет, не пришло ли время отложенных
+# премьер. 5 минут: точность «через 4 часа после выхода» ±5 мин достаточна.
+DEFERRED_POLL_INTERVAL_SEC = 300
+
+
+async def run_deferred_jobs_scheduler(services: Services) -> None:
+    """Фоновый цикл: поднимает отложенные премьеры (status='deferred'),
+    у которых наступил run_after, обратно в summary_queue."""
+    logger.info("deferred.scheduler.start")
+    try:
+        while True:
+            try:
+                await _requeue_due_deferred(services)
+            except Exception:
+                logger.exception("deferred.scheduler.tick_failed")
+            await asyncio.sleep(DEFERRED_POLL_INTERVAL_SEC)
+    except asyncio.CancelledError:
+        logger.info("deferred.scheduler.cancelled")
+        raise
+
+
+async def _requeue_due_deferred(services: Services) -> None:
+    if services.job_store is None:
+        return
+    rows = services.job_store.due_deferred(time.time())
+    if not rows:
+        return
+    async with services.summary_queue_lock:
+        for row in rows:
+            services.summary_next_sequence += 1
+            job = SummaryJob(
+                sequence=services.summary_next_sequence,
+                message=None,
+                url=row["url"],
+                enqueued_at=time.monotonic(),
+                chat_id=row["chat_id"],
+                title_hint=row["title_hint"],
+                scheduled=bool(row["scheduled"]),
+                disable_notification=bool(row["disable_notification"]),
+                db_id=row["id"],
+            )
+            services.job_store.set_status(row["id"], "queued")
+            await services.summary_queue.put(job)
+            logger.info(
+                "deferred.requeued db_id=%s chat_id=%s url=%s",
+                row["id"], row["chat_id"], row["url"],
+            )
+        if services.summary_worker_task is None or services.summary_worker_task.done():
+            services.summary_worker_task = asyncio.create_task(_summary_queue_worker(services))
 async def _is_llm_available(services: Services) -> bool:
     try:
         await asyncio.wait_for(services.llm.list_models(), timeout=10)
@@ -269,7 +320,14 @@ async def _summary_queue_worker(services: Services) -> None:
                 )
                 # Маршрут «нет субтитров → transcription_queue» не финализирует
                 # статус: job вернётся сюда после Groq, остаётся "active".
-                if services.job_store and job.db_id and not job.routed_to_transcription:
+                # Отложенные премьеры (deferred_until) финализировать тоже
+                # нельзя — pipeline уже проставил "deferred" + run_after.
+                if (
+                    services.job_store
+                    and job.db_id
+                    and not job.routed_to_transcription
+                    and job.deferred_until is None
+                ):
                     services.job_store.set_status(job.db_id, "done")
             except asyncio.CancelledError:
                 logger.info("queue.job.cancelled sequence=%s chat_id=%s", job.sequence, job.chat_id)

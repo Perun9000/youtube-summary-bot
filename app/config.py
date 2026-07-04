@@ -61,6 +61,7 @@ class Settings:
     monitoring_state_path: Path
     monitoring_target_chat_id: int | None
     monitoring_llm_retry_interval_sec: int
+    premiere_delay_hours: int
     summary_cache_path: Path
     summary_cache_ttl_days: int
     telegram_publish_channel_id: int | None
@@ -167,6 +168,9 @@ def load_settings() -> Settings:
     monitoring_target_chat_id = _parse_optional_int(os.getenv("MONITORING_TARGET_CHAT_ID", ""))
     monitoring_enabled = os.getenv("MONITORING_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
     monitoring_llm_retry_interval_sec = env.int("MONITORING_LLM_RETRY_INTERVAL_SEC", "300")
+    # Премьеры: через сколько часов после запланированного выхода ролика
+    # возвращаться за саммари (чтобы успели появиться субтитры).
+    premiere_delay_hours = env.int("PREMIERE_SUMMARY_DELAY_HOURS", "4")
     summary_cache_path = Path(
         os.getenv("SUMMARY_CACHE_PATH", str(data_dir / "summary_cache.json"))
     ).expanduser()
@@ -344,6 +348,7 @@ def load_settings() -> Settings:
         monitoring_state_path=monitoring_state_path,
         monitoring_target_chat_id=monitoring_target_chat_id,
         monitoring_llm_retry_interval_sec=monitoring_llm_retry_interval_sec,
+        premiere_delay_hours=premiere_delay_hours,
         summary_cache_path=summary_cache_path,
         summary_cache_ttl_days=summary_cache_ttl_days,
         telegram_publish_channel_id=telegram_publish_channel_id,

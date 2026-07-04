@@ -22,6 +22,7 @@ from app.bot_handlers import (
 )
 from app.config import Settings, load_settings
 from app.db import Database
+from app.queue_service import run_deferred_jobs_scheduler
 from app.digest_service import DigestStore
 from app.groq_whisper_service import GroqWhisperService
 from app.job_store import JobStore
@@ -285,19 +286,25 @@ async def main() -> None:
         await maybe_send_morning_digest(services)
     except Exception:
         logger.exception("morning_digest.startup_check_failed")
+    # Отложенные премьеры: фоновый цикл поднимает job'ы, у которых наступил
+    # run_after (release + PREMIERE_SUMMARY_DELAY_HOURS), обратно в очередь.
+    deferred_task = asyncio.create_task(
+        run_deferred_jobs_scheduler(services), name="deferred-scheduler"
+    )
     dispatcher = Dispatcher()
     dispatcher.include_router(build_router(services))
     try:
         await dispatcher.start_polling(bot)
     finally:
-        if scheduler_task is not None and not scheduler_task.done():
-            scheduler_task.cancel()
-            try:
-                await scheduler_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.exception("monitoring.scheduler.shutdown_failed")
+        for task, label in ((scheduler_task, "monitoring"), (deferred_task, "deferred")):
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.exception("%s.scheduler.shutdown_failed", label)
 
 
 if __name__ == "__main__":

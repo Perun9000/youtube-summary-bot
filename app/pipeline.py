@@ -12,12 +12,12 @@ from aiogram.types import CallbackQuery, FSInputFile
 
 from app.groq_whisper_service import GroqWhisperUnavailable
 from app.llm_client import GenerationUsage
-from app.models import VideoComment
+from app.models import VideoComment, VideoMetadata
 from app.monitoring_service import filter_segments_by_spans, format_spans_for_humans
 from app.morning_digest import MorningDigestItem
 from app.summarizer import SummaryProgress
 from app.transcript_chunker import chunk_transcript, segments_to_text
-from app.utils import extract_video_id
+from app.utils import escape_html, extract_video_id
 from app.youtube_service import TranscriptUnavailable
 
 from app.services_container import Services, SummaryJob
@@ -50,6 +50,86 @@ from app.delivery import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _is_upcoming(metadata: VideoMetadata) -> bool:
+    """Премьера или запланированный стрим, у которого контента ещё нет."""
+    if metadata.live_status == "is_upcoming":
+        return True
+    ts = metadata.release_timestamp
+    return bool(ts and ts > time.time())
+
+
+def _format_local_time(services: Services, ts: float) -> str:
+    """Unix-время → «04.07 18:00» в таймзоне бота (scan_tz мониторинга)."""
+    import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    tz_name = "Europe/Moscow"
+    if services.monitoring is not None and services.monitoring.rules.scan_tz:
+        tz_name = services.monitoring.rules.scan_tz
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:  # noqa: BLE001
+        tz = _dt.timezone.utc
+    return _dt.datetime.fromtimestamp(ts, tz).strftime("%d.%m %H:%M")
+
+
+async def _defer_premiere_job(
+    job: SummaryJob,
+    services: Services,
+    metadata: VideoMetadata,
+    job_id: str,
+) -> None:
+    """Отложить job премьеры до release + PREMIERE_SUMMARY_DELAY_HOURS.
+
+    Строка в jobs переводится в статус "deferred" с run_after; поднимет её
+    deferred-scheduler (queue_service.run_deferred_jobs_scheduler). Если
+    время выхода неизвестно (yt-dlp не отдал release_timestamp) — пробуем
+    через delay + 1 час от текущего момента.
+    """
+    delay_sec = services.settings.premiere_delay_hours * 3600
+    release_ts = metadata.release_timestamp
+    run_after = (release_ts + delay_sec) if release_ts else (time.time() + delay_sec + 3600)
+
+    title_link = f'<a href="{escape_html(job.url)}">{escape_html(metadata.title)}</a>'
+    if services.job_store is None or job.db_id is None:
+        # Отложить не через что (нет персистентной строки) — честно просим
+        # вернуться позже; job завершается без ошибки.
+        await _send_summary_delivery(
+            services=services,
+            job=job,
+            text=(
+                f"Ролик {title_link} — премьера, он ещё не вышел. "
+                "Пришли ссылку ещё раз после выхода."
+            ),
+        )
+        await _delete_service_status(services, job.chat_id)
+        return
+
+    job.deferred_until = run_after
+    services.job_store.set_deferred(job.db_id, run_after)
+    logger.info(
+        "job.premiere.deferred job_id=%s video_id=%s release_ts=%s run_after=%.0f",
+        job_id,
+        metadata.video_id,
+        f"{release_ts:.0f}" if release_ts else "unknown",
+        run_after,
+    )
+
+    if release_ts:
+        text = (
+            f"Это премьера: ролик {title_link} выйдет {_format_local_time(services, release_ts)}. "
+            f"Вернусь с саммари примерно в {_format_local_time(services, run_after)} — "
+            f"через {services.settings.premiere_delay_hours} ч после выхода."
+        )
+    else:
+        text = (
+            f"Ролик {title_link} — премьера, время выхода определить не удалось. "
+            f"Попробую сделать саммари в {_format_local_time(services, run_after)}."
+        )
+    await _send_summary_delivery(services=services, job=job, text=text)
+    await _delete_service_status(services, job.chat_id)
 
 
 async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
@@ -109,6 +189,13 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
         video_id = metadata.video_id
         title = metadata.title
         job.video_duration_sec = metadata.duration_sec or None
+
+        # Премьера / запланированный стрим: контента ещё нет. Запоминаем
+        # время выхода и откладываем job — deferred-scheduler вернёт его
+        # в очередь через PREMIERE_SUMMARY_DELAY_HOURS после релиза.
+        if _is_upcoming(metadata):
+            await _defer_premiere_job(job, services, metadata, job_id)
+            return
 
         if job.pre_fetched_segments is not None:
             segments = list(job.pre_fetched_segments)

@@ -67,7 +67,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     title_hint TEXT,
     status TEXT NOT NULL DEFAULT 'queued',
     created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    run_after REAL
 );
 CREATE TABLE IF NOT EXISTS morning_digest_items (
     video_id TEXT PRIMARY KEY,
@@ -94,6 +95,13 @@ class Database:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.executescript(_SCHEMA)
+            # Миграция для баз, созданных до появления run_after (премьеры):
+            # CREATE IF NOT EXISTS новые колонки не добавляет.
+            try:
+                self._conn.execute("ALTER TABLE jobs ADD COLUMN run_after REAL")
+                logger.info("db.migrate jobs.run_after added")
+            except sqlite3.OperationalError:
+                pass  # колонка уже есть
             self._conn.commit()
         logger.info("db.boot path=%s", path)
 

@@ -31,6 +31,11 @@ class YouTubeService:
             "no_warnings": True,
             "skip_download": True,
             "noplaylist": True,
+            # Премьеры/запланированные стримы не имеют форматов, и без этой
+            # опции yt-dlp кидает «Premieres in N hours» вместо метаданных.
+            # С ней возвращается info с live_status/release_timestamp —
+            # на них опирается детект премьер в pipeline (_is_upcoming).
+            "ignore_no_formats_error": True,
         }
         self._add_cookie_option(options)
 
@@ -48,6 +53,14 @@ class YouTubeService:
                 duration = info.get("duration") or 0
                 description = info.get("description") or ""
                 chapters = _parse_chapters(info.get("chapters"))
+                # Премьеры / запланированные стримы: live_status="is_upcoming",
+                # release_timestamp — unix-время запланированного выхода.
+                live_status = str(info.get("live_status") or "")
+                release_raw = info.get("release_timestamp")
+                try:
+                    release_timestamp = float(release_raw) if release_raw else None
+                except (TypeError, ValueError):
+                    release_timestamp = None
                 return VideoMetadata(
                     video_id=video_id,
                     title=title,
@@ -56,6 +69,8 @@ class YouTubeService:
                     duration_sec=float(duration or 0),
                     description=str(description),
                     chapters=chapters,
+                    live_status=live_status,
+                    release_timestamp=release_timestamp,
                 )
         except Exception:
             return VideoMetadata(

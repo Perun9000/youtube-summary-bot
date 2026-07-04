@@ -60,6 +60,10 @@ class SummaryJob:
     # Groq. Флаг говорит воркеру не трогать статус на этом проходе (он
     # остаётся "active").
     routed_to_transcription: bool = False
+    # Transient, не персистится: pipeline отложил job (премьера ещё не
+    # вышла) и уже проставил в БД статус "deferred" + run_after. Воркеру
+    # финальный статус трогать не нужно — job поднимет deferred-scheduler.
+    deferred_until: float | None = None
 @dataclass
 class Services:
     settings: Settings
