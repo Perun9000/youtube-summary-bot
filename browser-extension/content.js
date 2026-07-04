@@ -96,8 +96,10 @@
 
   function findInjectionHost() {
     // YouTube переписывает разметку чаще, чем хотелось бы. Перебираем
-    // несколько селекторов от самого нового к более старым. Берём
-    // **первый существующий** — туда и кладём кнопку.
+    // несколько селекторов от самого нового к более старым. Селектор может
+    // совпасть с десятками узлов (например, menu-renderer есть у каждой
+    // карточки сайдбара) и с узлами в скрытых деревьях SPA — берём
+    // **первый ВИДИМЫЙ** узел (у display:none поддеревьев нет client rects).
     const selectors = [
       // 2024–2026: top-level buttons row внутри ytd-watch-metadata.
       'ytd-watch-metadata #top-level-buttons-computed',
@@ -107,14 +109,21 @@
       '#actions-inner #top-level-buttons-computed',
     ];
     for (const sel of selectors) {
-      const node = document.querySelector(sel);
-      if (node) return node;
+      for (const node of document.querySelectorAll(sel)) {
+        if (node.getClientRects().length > 0) return node;
+      }
     }
     return null;
   }
 
   function injectButton() {
-    if (document.getElementById(BUTTON_ID)) return; // уже на месте
+    const existing = document.getElementById(BUTTON_ID);
+    if (existing) {
+      if (existing.getClientRects().length > 0) return; // на месте и видима
+      // Кнопка застряла в скрытом дереве SPA (YouTube держит в DOM
+      // несколько layout-деревьев) — убираем и инжектим заново в видимое.
+      existing.remove();
+    }
     const id = extractVideoId();
     if (!id) return; // не /watch — нечего делать
     const host = findInjectionHost();
@@ -230,6 +239,9 @@
       setTimeout(() => {
         previewScanQueued = false;
         injectPreviewButtons();
+        // Главную кнопку тоже перепроверяем: YouTube может подменить
+        // активное layout-дерево без смены URL, и кнопка «уедет» в скрытое.
+        injectButton();
       }, 1000);
     }
   });
