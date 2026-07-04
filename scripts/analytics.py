@@ -1,4 +1,4 @@
-"""CLI для аналитики из bot.log* + summary_cache.json + tags_catalog.json.
+"""CLI для аналитики из bot.log* + bot.db (summary_cache, users) + tags_catalog.json.
 
 Запуск (внутри контейнера):
 
@@ -18,6 +18,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -48,29 +49,56 @@ def _resolve_data_dir(arg: str | None) -> Path:
     return Path("data")
 
 
-def _try_load_summary_cache(data_dir: Path):
-    """Загружаем summary_cache.json «руками», без TagsCatalog/lock."""
-    path = data_dir / "summary_cache.json"
-    if not path.exists():
+def _resolve_db_path(data_dir: Path, arg: str | None) -> Path:
+    if arg:
+        return Path(arg).expanduser()
+    env = os.getenv("DATABASE_PATH")
+    if env:
+        return Path(env).expanduser()
+    return data_dir / "bot.db"
+
+
+def _open_db_readonly(db_path: Path) -> sqlite3.Connection | None:
+    """Открываем bot.db строго read-only: скрипт не должен ни писать,
+    ни блокировать живую базу бота (WAL допускает параллельные чтения)."""
+    if not db_path.exists():
+        return None
+    try:
+        return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        print(f"Не открылась база {db_path}: {exc}", file=sys.stderr)
+        return None
+
+
+def _try_load_summary_cache(conn: sqlite3.Connection | None):
+    """Читаем таблицу summary_cache и собираем стаб под format_markdown
+    (ему нужен ._entries со свойством .channel_name у записей)."""
+    if conn is None:
         return None
 
     class _CacheStub:
         _entries: dict
 
+    class _EntryStub:
+        def __init__(self, channel_name):
+            self.channel_name = channel_name
+
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    if not isinstance(raw, dict):
+        rows = conn.execute("SELECT video_id, payload FROM summary_cache").fetchall()
+    except sqlite3.Error:
         return None
 
-    # Маппим минимально: нам нужен .channel_name для top-channels.
-    class _EntryStub:
-        def __init__(self, body):
-            self.channel_name = body.get("channel_name", "")
+    entries: dict[str, _EntryStub] = {}
+    for vid, payload in rows:
+        try:
+            body = json.loads(payload)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(body, dict):
+            entries[str(vid)] = _EntryStub(str(body.get("channel_name") or ""))
 
     stub = _CacheStub()
-    stub._entries = {vid: _EntryStub(body) for vid, body in raw.items() if isinstance(body, dict)}
+    stub._entries = entries
     return stub
 
 
@@ -92,24 +120,20 @@ def _try_load_tags_catalog(data_dir: Path):
     return _CatStub(raw or {})
 
 
-def _load_users(data_dir: Path) -> dict[str, str]:
-    """Загружаем data/users.json чтобы резолвить chat_id → имя."""
-    path = data_dir / "users.json"
-    if not path.exists():
+def _load_users(conn: sqlite3.Connection | None) -> dict[str, str]:
+    """Читаем таблицу users чтобы резолвить chat_id → имя."""
+    if conn is None:
         return {}
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+        rows = conn.execute("SELECT user_id, name FROM users").fetchall()
+    except sqlite3.Error:
         return {}
     out: dict[str, str] = {}
-    if isinstance(raw, dict):
-        for user in (raw.get("users") or []):
-            if not isinstance(user, dict):
-                continue
-            uid = str(user.get("user_id") or "").strip()
-            name = str(user.get("name") or "").strip()
-            if uid and name:
-                out[uid] = name
+    for user_id, name in rows:
+        uid = str(user_id or "").strip()
+        name = str(name or "").strip()
+        if uid and name:
+            out[uid] = name
     return out
 
 
@@ -131,7 +155,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--data-dir", default=None,
-        help="Папка с *.json (summary_cache, tags_catalog, users). По умолчанию /data или ./data.",
+        help="Папка с bot.db и tags_catalog.json. По умолчанию /data или ./data.",
+    )
+    parser.add_argument(
+        "--db", default=None,
+        help="Путь к bot.db. По умолчанию $DATABASE_PATH или <data-dir>/bot.db.",
     )
     args = parser.parse_args()
 
@@ -155,9 +183,17 @@ def main() -> int:
 
     stats = aggregate(iter_events(logs_dir, since=since_dt))
 
-    users = _load_users(data_dir)
+    db_path = _resolve_db_path(data_dir, args.db)
+    conn = _open_db_readonly(db_path)
+    if conn is None:
+        print(f"# Базы нет в {db_path} — отчёт без имён и top-channels", file=sys.stderr)
+    try:
+        users = _load_users(conn)
+        summary_cache = _try_load_summary_cache(conn)
+    finally:
+        if conn is not None:
+            conn.close()
     name_resolver = lambda chat: users.get(chat)
-    summary_cache = _try_load_summary_cache(data_dir)
     tags_catalog = _try_load_tags_catalog(data_dir)
 
     report = format_markdown(
