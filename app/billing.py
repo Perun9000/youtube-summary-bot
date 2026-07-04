@@ -29,7 +29,7 @@ MONTH_SEC = 30 * 86400
 class QuotaVerdict:
     allowed: bool
     kind: str            # 'starter' | 'free' | 'sub' | ''
-    remaining: int       # сколько ЕЩЁ можно списать в текущем окне (включая запрошенный weight)
+    remaining: int       # свободная ёмкость текущего окна ДО списания (allow-гейт: remaining >= weight)
     is_subscriber: bool
     deny_reason: str = ""  # '' | 'weekly_exhausted' | 'monthly_exhausted'
 

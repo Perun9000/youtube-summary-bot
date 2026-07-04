@@ -60,6 +60,14 @@ def test_heavy_weight_respects_remaining(tmp_path):
     assert store.usage_since(1, NOW - 1) == 3   # 1 + 2 (сумма weight)
 
 
+def test_remaining_is_capacity_before_charge(tmp_path):
+    # remaining — свободная ёмкость окна ДО списания: weight не вычитается.
+    store, quota = make(tmp_path, starter=3)
+    v = quota.check(1, weight=2, now=NOW)
+    assert v.allowed is True
+    assert v.remaining == 3
+
+
 def test_renewal_extends_subscription(tmp_path):
     store, _ = make(tmp_path)
     store.activate_subscription(1, until_unix=NOW + MONTH_SEC, charge_id="c1")
