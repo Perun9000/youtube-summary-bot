@@ -174,12 +174,19 @@
 
   function injectPreviewButtons() {
     if (!extractVideoId()) return; // только на странице открытого видео
-    const sidebar = document.querySelector('#secondary');
-    if (!sidebar) return;
-    const anchors = sidebar.querySelectorAll('a[href*="/watch?v="]');
+    // YouTube-SPA держит в DOM несколько деревьев разметки одновременно
+    // (старый/новый layout, кэш предыдущих страниц), а id вроде #secondary
+    // дублируются — привязываться к контейнеру ненадёжно (первый #secondary
+    // может оказаться пустым деревом неактивного layout'а). Поэтому берём
+    // все ВИДИМЫЕ превью-ссылки на /watch?v= по всему документу: скрытые
+    // деревья отсекаются по getClientRects() (у display:none поддеревьев
+    // их нет), сам плеер — по closest().
+    const anchors = document.querySelectorAll('a[href*="/watch?v="]');
     for (const anchor of anchors) {
       // Нужны именно превью (ссылки с картинкой), а не текстовые заголовки.
       if (!anchor.querySelector('img, yt-image')) continue;
+      if (anchor.closest('#player, ytd-player')) continue;
+      if (anchor.getClientRects().length === 0) continue;
       if (anchor.querySelector(`.${PREVIEW_BTN_CLASS}`)) continue; // уже есть
       if (!extractIdFromHref(anchor.href)) continue;
       anchor.classList.add(PREVIEW_HOST_CLASS);
