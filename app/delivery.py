@@ -273,7 +273,7 @@ async def _send_summary_delivery(
 
     Attaches an inline keyboard:
       • «📄 Саммари» → Telegra.ph URL (visible to everyone if telegraph_url is set),
-      • «🎧 Скачать аудио» → owner-only callback (visible only when recipient is owner).
+      • «Скачать аудио» → owner-only callback (visible only when recipient is owner).
     """
     reply_markup = _build_summary_keyboard(
         telegraph_url=telegraph_url,
