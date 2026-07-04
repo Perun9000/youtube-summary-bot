@@ -314,8 +314,8 @@ def _build_summary_keyboard(
     """Собрать inline-клавиатуру под финальным саммари.
 
     Обе кнопки идут в один ряд (Telegram сам сожмёт по ширине экрана):
-      1. «🔮 подробное саммари» — ссылка на Telegra.ph. Видна всем.
-      2. «🎧 Скачать аудио» — owner-only, callback на транскрипцию/отправку файла.
+      1. «подробное саммари» — ссылка на Telegra.ph. Видна всем.
+      2. «Скачать аудио» — owner-only, callback на транскрипцию/отправку файла.
 
     Возвращаем None, если ни одна кнопка не применима (нет telegraph_url и
     получатель не owner) — тогда саммари уходит вообще без клавиатуры.
@@ -323,12 +323,12 @@ def _build_summary_keyboard(
     row: list[InlineKeyboardButton] = []
     if telegraph_url:
         row.append(
-            InlineKeyboardButton(text="🔮 подробное саммари", url=telegraph_url)
+            InlineKeyboardButton(text="подробное саммари", url=telegraph_url)
         )
     if is_owner and video_id:
         row.append(
             InlineKeyboardButton(
-                text="🎧 Скачать аудио",
+                text="Скачать аудио",
                 callback_data=f"download:{video_id}",
             )
         )
