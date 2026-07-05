@@ -16,7 +16,7 @@ from app.status_messages import (
     _prefetch_job_title,
     _set_service_status,
 )
-from app.delivery import _lookup_cached_summary, _send_cached_summary_to_chat
+from app.delivery import _lookup_cached_summary, _send_cached_summary_to_chat, _send_quota_denied
 from app.pipeline import _process_transcription_job, _process_youtube_job
 
 
@@ -24,6 +24,13 @@ logger = logging.getLogger(__name__)
 
 
 async def _enqueue_summary_job(message: Message, url: str, services: Services) -> None:
+    # Внешний пользователь (не allowlist) в PUBLIC_MODE проходит через квоты.
+    from app.bot_handlers import _is_allowed  # local: избегаем цикла
+    quota_user_id: int | None = None
+    if not _is_allowed(message, services) and message.from_user is not None:
+        quota_user_id = message.from_user.id
+
+    enqueued = False
     try:
         # Cache hit fast-path: если по этому ролику уже было саммари, отдаём его
         # сразу, не занимая очередь и не дёргая LLM/Whisper.
@@ -34,7 +41,14 @@ async def _enqueue_summary_job(message: Message, url: str, services: Services) -
                 message.chat.id, cached.video_id, cached.telegraph_url,
             )
             await _send_cached_summary_to_chat(message, cached, services)
+            enqueued = True
             return
+
+        if quota_user_id is not None and services.quota is not None:
+            verdict = services.quota.check(quota_user_id)
+            if not verdict.allowed:
+                await _send_quota_denied(message, services, verdict)
+                return  # сообщение пользователя НЕ удаляем — finally ниже пропустит
 
         active_job: SummaryJob | None
         async with services.summary_queue_lock:
@@ -57,8 +71,10 @@ async def _enqueue_summary_job(message: Message, url: str, services: Services) -
                 enqueued_at=time.monotonic(),
                 chat_id=message.chat.id,
                 db_id=db_id,
+                quota_user_id=quota_user_id,
             )
             await services.summary_queue.put(job)
+            enqueued = True
             if services.summary_worker_task is None or services.summary_worker_task.done():
                 services.summary_worker_task = asyncio.create_task(_summary_queue_worker(services))
 
@@ -98,13 +114,16 @@ async def _enqueue_summary_job(message: Message, url: str, services: Services) -
         # и чат остаётся чистым на всё время обработки. Бот может удалить
         # user-message в private chat в течение 48 часов; ошибки swallow'им,
         # потому что удаление best-effort и не влияет на саму доставку саммари.
-        try:
-            await message.delete()
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "source_message.delete_failed chat_id=%s error=%s",
-                message.chat.id, exc,
-            )
+        # При отказе по квоте (enqueued=False) сообщение с ссылкой оставляем —
+        # пользователь должен видеть, что именно он присылал, когда получил отказ.
+        if enqueued:
+            try:
+                await message.delete()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "source_message.delete_failed chat_id=%s error=%s",
+                    message.chat.id, exc,
+                )
 async def enqueue_scheduled_candidate(
     candidate: ScheduledCandidate, channel, services: Services
 ) -> None:

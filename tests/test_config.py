@@ -30,3 +30,18 @@ def test_invalid_float(base_env, monkeypatch):
     monkeypatch.setenv("LLM_TEMPERATURE", "tepло")
     with pytest.raises(RuntimeError, match="LLM_TEMPERATURE"):
         load_settings()
+
+
+def test_monetization_defaults(base_env):
+    settings = load_settings()
+    assert settings.public_mode is False
+    assert settings.subscription_price_stars == 149
+    assert settings.quota_starter == 3
+    assert settings.quota_free_weekly == 1
+    assert settings.quota_sub_monthly == 30
+    assert settings.heavy_duration_sec == 3600
+
+
+def test_public_mode_flag(base_env, monkeypatch):
+    monkeypatch.setenv("PUBLIC_MODE", "true")
+    assert load_settings().public_mode is True

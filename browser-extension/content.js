@@ -1,8 +1,9 @@
 // YouTube Summary (Telegram bot) — content script
 //
 // Что делает: на странице /watch?... добавляет кнопку «🔮 Summary» рядом
-// с Like/Share/Save, а на превью related-видео в сайдбаре — маленькую
-// оверлей-кнопку «🔮». По клику открывает Telegram через deep-link с
+// с Like/Share/Save, а на превью видео по всему YouTube (главная, подписки,
+// поиск, каналы, related-сайдбар) — маленькую оверлей-кнопку «🔮».
+// По клику открывает Telegram через deep-link с
 // payload'ом /start <video_id>. Бот видит payload, валидирует как
 // 11-символьный YouTube ID и кладёт ролик в очередь саммари.
 //
@@ -136,13 +137,13 @@
     if (btn && btn.parentNode) btn.parentNode.removeChild(btn);
   }
 
-  // ─────────────── preview buttons (related-сайдбар на /watch) ───────────────
+  // ─────────────── preview buttons (карточки видео на любой странице) ───────────────
   //
-  // На каждое превью related-видео вешаем оверлей-кнопку «🔮»: клик отправляет
+  // На каждое превью видео вешаем оверлей-кнопку «🔮»: клик отправляет
   // ЭТОТ ролик боту, не открывая его. YouTube часто переименовывает свои
   // рендереры (ytd-compact-video-renderer → yt-lockup-view-model, ...),
-  // поэтому к именам не привязываемся: берём все ссылки на /watch?v=...
-  // внутри сайдбара #secondary, содержащие картинку-превью.
+  // поэтому к именам не привязываемся: берём все ссылки на /watch?v=...,
+  // содержащие картинку-превью.
 
   const PREVIEW_BTN_CLASS = 'yt-summary-preview-btn';
   const PREVIEW_HOST_CLASS = 'yt-summary-preview-host';
@@ -182,7 +183,6 @@
   }
 
   function injectPreviewButtons() {
-    if (!extractVideoId()) return; // только на странице открытого видео
     // YouTube-SPA держит в DOM несколько деревьев разметки одновременно
     // (старый/новый layout, кэш предыдущих страниц), а id вроде #secondary
     // дублируются — привязываться к контейнеру ненадёжно (первый #secondary
@@ -194,7 +194,9 @@
     for (const anchor of anchors) {
       // Нужны именно превью (ссылки с картинкой), а не текстовые заголовки.
       if (!anchor.querySelector('img, yt-image')) continue;
-      if (anchor.closest('#player, ytd-player')) continue;
+      // Мимо: сам плеер, мелкие миниатюры в дропдауне уведомлений,
+      // hover-плеер карточки (кнопка перекрывалась бы его контролами).
+      if (anchor.closest('#player, ytd-player, ytd-notification-renderer, ytd-video-preview')) continue;
       if (anchor.getClientRects().length === 0) continue;
       if (anchor.querySelector(`.${PREVIEW_BTN_CLASS}`)) continue; // уже есть
       if (!extractIdFromHref(anchor.href)) continue;
@@ -205,15 +207,16 @@
 
   function onRouteChange() {
     // YouTube — SPA, DOM собирается асинхронно. На каждом событии делаем
-    // 3 попытки injection с разными задержками — обычно достаточно.
-    if (!extractVideoId()) {
+    // несколько попыток injection с разными задержками — обычно достаточно.
+    // Главная кнопка живёт только на /watch; превью-кнопки — на любой странице.
+    if (extractVideoId()) {
+      setTimeout(injectButton, 200);
+      setTimeout(injectButton, 800);
+      setTimeout(injectButton, 2000);
+    } else {
       uninjectButton();
-      return;
     }
-    setTimeout(injectButton, 200);
-    setTimeout(injectButton, 800);
-    setTimeout(injectButton, 2000);
-    // Сайдбар related собирается позже основной разметки.
+    // Сетка карточек/сайдбар собираются позже основной разметки.
     setTimeout(injectPreviewButtons, 800);
     setTimeout(injectPreviewButtons, 2500);
   }

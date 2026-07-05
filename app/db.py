@@ -81,6 +81,21 @@ CREATE TABLE IF NOT EXISTS morning_digest_items (
     created_at_unix REAL NOT NULL DEFAULT 0,
     sent INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS subscriptions (
+    user_id INTEGER PRIMARY KEY,
+    until_unix REAL NOT NULL DEFAULT 0,
+    last_charge_id TEXT NOT NULL DEFAULT '',
+    updated_at REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS usage_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    video_id TEXT NOT NULL DEFAULT '',
+    weight INTEGER NOT NULL DEFAULT 1,
+    kind TEXT NOT NULL DEFAULT 'free',
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_usage_user_time ON usage_events(user_id, created_at);
 """
 
 

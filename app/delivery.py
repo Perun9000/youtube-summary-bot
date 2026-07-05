@@ -510,6 +510,33 @@ async def _send_cached_summary_to_chat(
             channel_name=cached.channel_name or "",
             created_at_unix=cached.created_at_unix or time.time(),
         )
+async def _send_quota_denied(message: Message, services: Services, verdict) -> None:
+    """Отказ по квоте + кнопка оформления подписки.
+
+    callback 'subscribe' обрабатывается в bot_handlers (шлёт Stars-инвойс) —
+    кнопка работает и из этого сообщения, и из /subscribe.
+    """
+    s = services.settings
+    if verdict.deny_reason == "monthly_exhausted":
+        text = (
+            f"Лимит подписки на месяц исчерпан ({s.quota_sub_monthly} саммари). "
+            "Новые генерации станут доступны по мере «оттаивания» окна 30 дней — /limits."
+        )
+        await message.answer(text)
+        return
+    text = (
+        "Бесплатный лимит на эту неделю исчерпан.\n\n"
+        f"Подписка — {s.subscription_price_stars} ⭐/мес: "
+        f"{s.quota_sub_monthly} саммари в месяц, автопродление, отмена в любой момент.\n"
+        "Остаток лимитов: /limits."
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text=f"Оформить подписку — {s.subscription_price_stars} ⭐",
+            callback_data="subscribe",
+        )
+    ]])
+    await message.answer(text, reply_markup=keyboard)
 async def _deliver_cached_summary_for_job(
     job: SummaryJob,
     services: Services,
