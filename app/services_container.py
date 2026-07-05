@@ -65,6 +65,12 @@ class SummaryJob:
     # вышла) и уже проставил в БД статус "deferred" + run_after. Воркеру
     # финальный статус трогать не нужно — job поднимет deferred-scheduler.
     deferred_until: float | None = None
+    # Квоты внешних пользователей (PUBLIC_MODE). None — безлимит (allowlist,
+    # owner, scheduled-мониторинг): ни проверок, ни списаний.
+    quota_user_id: int | None = None
+    # Вес списания: 1 обычный ролик, 2 — тяжёлый (Groq-транскрипция, ≥1 ч).
+    # Выставляется в pipeline, когда выясняется источник транскрипта.
+    usage_weight: int = 1
 @dataclass
 class Services:
     settings: Settings

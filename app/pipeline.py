@@ -229,6 +229,26 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                     "job.transcript.unavailable job_id=%s fallback=groq_queue",
                     job_id,
                 )
+                # Тяжёлый ролик для платного пользователя: Groq-транскрипция
+                # длинного видео стоит на порядок дороже — списываем 2 единицы.
+                if (
+                    job.quota_user_id is not None
+                    and services.quota is not None
+                    and (metadata.duration_sec or 0) >= services.settings.heavy_duration_sec
+                ):
+                    verdict = services.quota.check(job.quota_user_id, weight=2)
+                    if not verdict.allowed:
+                        raise RuntimeError(
+                            "у ролика нет субтитров, и он длиннее часа — такая "
+                            "генерация списывает 2 единицы лимита, а осталось "
+                            f"{verdict.remaining}. Подписка: /subscribe"
+                        )
+                    job.usage_weight = 2
+                    await _set_service_status(
+                        services, message,
+                        "Ролик без субтитров и длиннее часа — спишется 2 генерации.",
+                        job=job,
+                    )
                 await _set_service_status(
                     services,
                     message,
@@ -431,6 +451,14 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
         # NB: исходное user-message с YouTube-ссылкой удалили ещё на этапе
         # `_enqueue_summary_job` (finally-блок), как только ссылка попала
         # в очередь. Здесь ничего удалять не нужно.
+
+        # Списываем квоту только после успешной доставки. Кэш-хиты сюда не
+        # доходят (fast-path выше), упавшие job'ы — тоже (except-ветка).
+        if job.quota_user_id is not None and services.quota is not None:
+            try:
+                services.quota.charge(job.quota_user_id, video_id, job.usage_weight)
+            except Exception:
+                logger.exception("billing.charge_failed user_id=%s", job.quota_user_id)
 
         # Кэшируем результат — но только для full-video. Segment-mode даёт
         # частичное саммари по конкретному эксперту, его нельзя считать
