@@ -45,3 +45,7 @@ def test_monetization_defaults(base_env):
 def test_public_mode_flag(base_env, monkeypatch):
     monkeypatch.setenv("PUBLIC_MODE", "true")
     assert load_settings().public_mode is True
+
+
+def test_paid_fallback_budget_default(base_env):
+    assert load_settings().paid_fallback_free_budget_sec == 180

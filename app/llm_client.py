@@ -98,6 +98,7 @@ class LLMClient(Protocol):
         system: str | None = None,
         usage: GenerationUsage | None = None,
         max_tokens: int | None = None,
+        route: str = "default",
     ) -> str:
         ...
 
@@ -379,11 +380,15 @@ class OpenRouterClient:
         system: str | None = None,
         usage: GenerationUsage | None = None,
         max_tokens: int | None = None,
+        route: str = "default",
     ) -> str:
         ok, reason = self._budget.check()
         if not ok:
             logger.warning("llm.generate.budget_block provider=openrouter reason=%s", reason)
             raise RuntimeError(f"{OPENROUTER_BUDGET_EXCEEDED_MARKER}: {reason}")
+
+        if route == "paid_fallback":
+            return await self._generate_with_paid_fallback(prompt, system, usage, max_tokens)
 
         if self._breaker.is_open():
             raise RuntimeError(
@@ -391,17 +396,25 @@ class OpenRouterClient:
                 f"следующая попытка через ~{int(self._breaker.remaining_sec() / 60) + 1} мин."
             )
 
-        chain = self.current_chain()
-        if not chain:
+        # free_only (внешний без подписки): всегда free-цепочка, глобальный
+        # /llm_paid игнорируется — платные токены только платящим.
+        if route != "free_only" and self.is_paid_mode():
+            if not self._settings.openrouter_model_paid:
+                raise RuntimeError("OpenRouter: платная модель не задана. Проверь .env.")
+            return await self._generate_paid(prompt, system, usage, max_tokens)
+
+        if not self._settings.openrouter_model_free_chain:
             raise RuntimeError("OpenRouter: список моделей пуст. Проверь .env.")
+        return await self._generate_free_chain(prompt, system, usage, max_tokens)
 
-        if self.is_paid_mode():
-            result = await self._generate_with_retries(
-                chain[0], prompt, system, usage, max_tokens
-            )
-            self._breaker.record_success()
-            return result
-
+    async def _generate_free_chain(
+        self,
+        prompt: str,
+        system: str | None,
+        usage: GenerationUsage | None,
+        max_tokens: int | None,
+    ) -> str:
+        chain = self.current_chain()
         # Free mode — cycle through the chain, then sleep + retry full chain.
         passes = self._settings.openrouter_fallback_retry_passes + 1
         delay = self._settings.openrouter_fallback_retry_delay_sec
@@ -448,6 +461,77 @@ class OpenRouterClient:
             f"OpenRouter: все free-модели в цепочке отказались отвечать за {passes} проходов "
             f"({models_tried}). Последняя ошибка: {last_error}. {suffix}"
         )
+
+    async def _generate_paid(
+        self,
+        prompt: str,
+        system: str | None,
+        usage: GenerationUsage | None,
+        max_tokens: int | None,
+        *,
+        record_success: bool = True,
+    ) -> str:
+        """Одна платная модель со стандартной retry-политикой.
+
+        record_success=False — для fallback-пути подписчика: успех платной
+        модели ничего не говорит о здоровье free-цепочки, breaker не трогаем.
+        """
+        result = await self._generate_with_retries(
+            self._settings.openrouter_model_paid, prompt, system, usage, max_tokens
+        )
+        if record_success:
+            self._breaker.record_success()
+        return result
+
+    async def _generate_with_paid_fallback(
+        self,
+        prompt: str,
+        system: str | None,
+        usage: GenerationUsage | None,
+        max_tokens: int | None,
+    ) -> str:
+        """Маршрут подписчика: free сначала, платная — когда free плоха.
+
+        Триггеры платной попытки: открытый breaker (free-цепочка лежит),
+        исчерпание цепочки, превышение бюджета времени
+        PAID_FALLBACK_FREE_BUDGET_SEC на весь free-этап. Бюджетная ошибка
+        OpenRouter (дневной cap) пробрасывается — это стоп для всех маршрутов.
+        """
+        paid_model = self._settings.openrouter_model_paid
+        if not paid_model:
+            # Фолбэчить не на что — ведём себя как free_only.
+            return await self._generate_free_chain(prompt, system, usage, max_tokens)
+
+        if self.is_paid_mode():
+            # Владелец включил платный режим глобально — подписчик тоже сразу
+            # на платной (это его tier).
+            return await self._generate_paid(prompt, system, usage, max_tokens)
+
+        if self._breaker.is_open():
+            logger.info("llm.paid_fallback.trigger reason=breaker_open")
+        else:
+            budget_sec = self._settings.paid_fallback_free_budget_sec
+            try:
+                return await asyncio.wait_for(
+                    self._generate_free_chain(prompt, system, usage, max_tokens),
+                    timeout=budget_sec,
+                )
+            except asyncio.TimeoutError:
+                logger.info(
+                    "llm.paid_fallback.trigger reason=slow budget_sec=%s", budget_sec
+                )
+            except RuntimeError as exc:
+                if OPENROUTER_BUDGET_EXCEEDED_MARKER in str(exc):
+                    raise
+                # Цепочка исчерпана; record_failure уже сделан внутри —
+                # breaker честно отражает здоровье free для остальных.
+                logger.info("llm.paid_fallback.trigger reason=free_exhausted")
+
+        result = await self._generate_paid(
+            prompt, system, usage, max_tokens, record_success=False
+        )
+        logger.info("llm.paid_fallback.success model=%s", paid_model)
+        return result
 
     async def _generate_with_retries(
         self,
@@ -729,7 +813,9 @@ class LMStudioClient:
         system: str | None = None,
         usage: GenerationUsage | None = None,
         max_tokens: int | None = None,
+        route: str = "default",
     ) -> str:
+        """route игнорируется: локальная модель бесплатна — маршрутизация не применяется."""
         started = time.monotonic()
         model = await self._resolve_model()
         messages = []
