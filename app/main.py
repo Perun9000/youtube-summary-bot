@@ -14,6 +14,7 @@ from aiogram.types import (
     MenuButtonCommands,
 )
 
+from app.billing import BillingStore, QuotaService
 from app.bot_handlers import (
     Services,
     build_router,
@@ -49,6 +50,7 @@ PUBLIC_BOT_COMMANDS: list[BotCommand] = [
     BotCommand(command="start", description="Начать работу"),
     BotCommand(command="help", description="Что умеет бот"),
     BotCommand(command="last", description="Последние 20 саммари"),
+    BotCommand(command="limits", description="Остаток лимитов"),
 ]
 
 OWNER_BOT_COMMANDS: list[BotCommand] = [
@@ -123,6 +125,19 @@ async def main() -> None:
     configure_logging(settings.bot_data_dir)
 
     db = Database(settings.database_path)
+
+    billing_store = BillingStore(db)
+    quota_service = QuotaService(
+        billing_store,
+        starter=settings.quota_starter,
+        weekly=settings.quota_free_weekly,
+        monthly=settings.quota_sub_monthly,
+    )
+    logger.info(
+        "billing.boot public_mode=%s price_stars=%s quotas=%s/%s/%s",
+        settings.public_mode, settings.subscription_price_stars,
+        settings.quota_starter, settings.quota_free_weekly, settings.quota_sub_monthly,
+    )
 
     llm = create_llm_client(settings, db)
     bot = Bot(token=settings.telegram_bot_token)
@@ -235,6 +250,8 @@ async def main() -> None:
         db=db,
         job_store=JobStore(db),
         morning_digest=MorningDigestStore(db),
+        billing=billing_store,
+        quota=quota_service,
     )
 
     scheduler_task: asyncio.Task[None] | None = None

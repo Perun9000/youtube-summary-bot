@@ -53,7 +53,7 @@ def build_router(services: Services) -> Router:
 
     @router.message(Command("start"))
     async def start(message: Message) -> None:
-        if not _is_allowed(message, services):
+        if not _has_access(message, services):
             await message.answer("Этот бот закрыт для личного использования.")
             return
         # Telegram передаёт payload deep-link'а как второй токен команды:
@@ -83,24 +83,45 @@ def build_router(services: Services) -> Router:
                 "она должна слать 11-символьный video_id."
             )
             return
-        await message.answer(
+        text = (
             "Пришли ссылку на YouTube-ролик. Я верну краткое summary здесь и полный конспект в Telegra.ph."
         )
+        if not _is_allowed(message, services):
+            text += (
+                "\n\nБесплатно: "
+                f"{services.settings.quota_starter} саммари на старте, "
+                f"дальше {services.settings.quota_free_weekly} в неделю. "
+                f"Подписка {services.settings.subscription_price_stars} ⭐/мес — "
+                f"{services.settings.quota_sub_monthly} саммари в месяц: /subscribe. "
+                "Остаток лимитов: /limits."
+            )
+        await message.answer(text)
 
     @router.message(Command("help"))
     async def help_command(message: Message) -> None:
-        if not _is_allowed(message, services):
+        if not _has_access(message, services):
             await message.answer("Этот бот закрыт для личного использования.")
             return
         if not _is_owner(message, services):
-            await message.answer(
+            text = (
                 "Доступные команды:\n"
                 "/start - начать работу\n"
                 "/help - помощь\n"
-                "/last - последние 20 саммари\n\n"
+                "/last - последние 20 саммари\n"
+                "/limits - остаток лимитов\n\n"
                 "Пришли ссылку на YouTube-ролик — я верну краткое summary здесь "
                 "и полный конспект в Telegra.ph."
             )
+            if not _is_allowed(message, services):
+                text += (
+                    "\n\nБесплатно: "
+                    f"{services.settings.quota_starter} саммари на старте, "
+                    f"дальше {services.settings.quota_free_weekly} в неделю. "
+                    f"Подписка {services.settings.subscription_price_stars} ⭐/мес — "
+                    f"{services.settings.quota_sub_monthly} саммари в месяц: /subscribe. "
+                    "Остаток лимитов: /limits."
+                )
+            await message.answer(text)
             return
         await message.answer(
             "Команды:\n"
@@ -125,7 +146,7 @@ def build_router(services: Services) -> Router:
 
     @router.message(Command("last"))
     async def last_command(message: Message) -> None:
-        if not _is_allowed(message, services):
+        if not _has_access(message, services):
             await message.answer("Этот бот закрыт для личного использования.")
             return
         user_id = _message_user_id(message)
@@ -148,6 +169,46 @@ def build_router(services: Services) -> Router:
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
+
+    @router.message(Command("limits"))
+    async def limits(message: Message) -> None:
+        if not _has_access(message, services):
+            await message.answer("Этот бот закрыт для личного использования.")
+            return
+        user_id = _message_user_id(message)
+        if user_id is None or services.quota is None or services.billing is None:
+            await message.answer("Лимиты не настроены.")
+            return
+        if _is_allowed(message, services):
+            await message.answer("У тебя безлимитный доступ 🎉")
+            return
+        s = services.settings
+        verdict = services.quota.check(user_id)
+        if verdict.is_subscriber:
+            until = services.billing.subscription_until(user_id)
+            until_text = datetime.datetime.fromtimestamp(until).strftime("%d.%m.%Y")
+            await message.answer(
+                f"Подписка активна до {until_text}.\n"
+                f"Осталось в этом месяце: {verdict.remaining} из {s.quota_sub_monthly}."
+            )
+            return
+        if verdict.kind == "starter":
+            await message.answer(
+                f"Стартовых саммари осталось: {verdict.remaining} из {s.quota_starter}.\n"
+                f"Дальше — {s.quota_free_weekly} в неделю бесплатно или подписка: /subscribe."
+            )
+            return
+        if verdict.allowed:
+            await message.answer(
+                f"Доступно бесплатных на этой неделе: {verdict.remaining} из {s.quota_free_weekly}.\n"
+                f"Больше — по подписке {s.subscription_price_stars} ⭐/мес: /subscribe."
+            )
+        else:
+            await message.answer(
+                "Бесплатный лимит на эту неделю исчерпан.\n"
+                f"Подписка {s.subscription_price_stars} ⭐/мес — "
+                f"{s.quota_sub_monthly} саммари: /subscribe."
+            )
 
     @router.message(Command("users"))
     async def users(message: Message) -> None:
@@ -499,7 +560,7 @@ def build_router(services: Services) -> Router:
 
     @router.message(F.text)
     async def text_message(message: Message) -> None:
-        if not _is_allowed(message, services):
+        if not _has_access(message, services):
             await message.answer("Этот бот закрыт для личного использования.")
             return
 
@@ -948,3 +1009,6 @@ def _is_allowed(message: Message, services: Services) -> bool:
     return services.users.is_allowed(_message_user_id(message))
 def _is_owner(message: Message, services: Services) -> bool:
     return services.users.is_owner(_message_user_id(message))
+def _has_access(message: Message, services: Services) -> bool:
+    """Allowlist — всегда да; внешние — только при PUBLIC_MODE."""
+    return _is_allowed(message, services) or services.settings.public_mode

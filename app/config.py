@@ -62,6 +62,12 @@ class Settings:
     monitoring_target_chat_id: int | None
     monitoring_llm_retry_interval_sec: int
     premiere_delay_hours: int
+    public_mode: bool
+    subscription_price_stars: int
+    quota_starter: int
+    quota_free_weekly: int
+    quota_sub_monthly: int
+    heavy_duration_sec: int
     summary_cache_path: Path
     summary_cache_ttl_days: int
     telegram_publish_channel_id: int | None
@@ -171,6 +177,14 @@ def load_settings() -> Settings:
     # Премьеры: через сколько часов после запланированного выхода ролика
     # возвращаться за саммари (чтобы успели появиться субтитры).
     premiere_delay_hours = env.int("PREMIERE_SUMMARY_DELAY_HOURS", "4")
+    # Монетизация: PUBLIC_MODE открывает бота внешним пользователям с квотами
+    # и подпиской за Stars. false — прежнее закрытое поведение (allowlist).
+    public_mode = os.getenv("PUBLIC_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
+    subscription_price_stars = env.int("SUBSCRIPTION_PRICE_STARS", "149")
+    quota_starter = env.int("QUOTA_STARTER", "3")
+    quota_free_weekly = env.int("QUOTA_FREE_WEEKLY", "1")
+    quota_sub_monthly = env.int("QUOTA_SUB_MONTHLY", "30")
+    heavy_duration_sec = env.int("HEAVY_DURATION_SEC", "3600")
     summary_cache_path = Path(
         os.getenv("SUMMARY_CACHE_PATH", str(data_dir / "summary_cache.json"))
     ).expanduser()
@@ -349,6 +363,12 @@ def load_settings() -> Settings:
         monitoring_target_chat_id=monitoring_target_chat_id,
         monitoring_llm_retry_interval_sec=monitoring_llm_retry_interval_sec,
         premiere_delay_hours=premiere_delay_hours,
+        public_mode=public_mode,
+        subscription_price_stars=subscription_price_stars,
+        quota_starter=quota_starter,
+        quota_free_weekly=quota_free_weekly,
+        quota_sub_monthly=quota_sub_monthly,
+        heavy_duration_sec=heavy_duration_sec,
         summary_cache_path=summary_cache_path,
         summary_cache_ttl_days=summary_cache_ttl_days,
         telegram_publish_channel_id=telegram_publish_channel_id,
