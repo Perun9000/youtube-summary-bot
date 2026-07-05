@@ -52,6 +52,23 @@ from app.delivery import (
 logger = logging.getLogger(__name__)
 
 
+def _llm_route_for_job(job: SummaryJob, services: Services) -> str:
+    """Маршрут LLM по тарифу пользователя (см. README, «Маршрутизация LLM»).
+
+    NB: route и списание (charge) читают статус подписки в разные моменты:
+    route — перед генерацией, kind списания — после доставки. При истечении
+    подписки посреди job'а расхождение в пользу пользователя (получил
+    paid_fallback, списали как free) — осознанная семантика.
+    """
+    if job.quota_user_id is None:
+        return "default"
+    is_sub = bool(
+        services.billing is not None
+        and services.billing.is_subscriber(job.quota_user_id)
+    )
+    return "paid_fallback" if is_sub else "free_only"
+
+
 def _is_upcoming(metadata: VideoMetadata) -> bool:
     """Премьера или запланированный стрим, у которого контента ещё нет."""
     if metadata.live_status == "is_upcoming":
@@ -318,6 +335,15 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
         summary_progress = SummaryProgress()
         context_hint = _build_context_hint(job)
         topic_hint, speaker_hint, host_hint = _build_tags_hints(services)
+
+        # Tier-маршрутизация LLM: подписчик получает paid-fallback (free
+        # сначала, платная при недоступности/медленности); бесплатный внешний
+        # пользователь никогда не тратит платные токены; allowlist — как
+        # раньше, по глобальному /llm_paid.
+        llm_route = _llm_route_for_job(job, services)
+        if job.quota_user_id is not None:
+            logger.info("job.llm_route job_id=%s route=%s", job_id, llm_route)
+
         await _set_service_status(services, message, f"Генерирую summary через {services.llm.provider_name}...", job=job)
         summary = await _run_with_telegram_status(
             services=services,
@@ -332,6 +358,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                 topic_hint=topic_hint,
                 speaker_hint=speaker_hint,
                 host_hint=host_hint,
+                llm_route=llm_route,
             ),
             base_text=f"Генерирую summary через {services.llm.provider_name}...",
             job=job,

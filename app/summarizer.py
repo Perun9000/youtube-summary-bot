@@ -288,6 +288,9 @@ class Summarizer:
         self._system_prompt_provider = system_prompt_provider or (
             lambda: SUMMARY_SYSTEM_PROMPT
         )
+        # Маршрут LLM для текущей суммаризации; выставляется заново в начале
+        # каждого summarize() (см. комментарий там про последовательность воркера).
+        self._route: str = "default"
 
     async def summarize(
         self,
@@ -300,7 +303,11 @@ class Summarizer:
         topic_hint: str = "",
         speaker_hint: str = "",
         host_hint: str = "",
+        llm_route: str = "default",
     ) -> Summary:
+        # Маршрут LLM на время этой суммаризации. Инстанс-атрибут безопасен:
+        # summary-воркер строго последовательный, конкурирующих summarize нет.
+        self._route = llm_route
         started = time.monotonic()
         logger.info(
             "summary.start title=%r chunks=%s context_hint=%s tags_hints=%s",
@@ -327,6 +334,7 @@ class Summarizer:
                 system=system_prompt,
                 usage=usage,
                 max_tokens=self._final_max_tokens,
+                route=self._route,
             )
             try:
                 summary = self._parse_summary(raw)
@@ -343,6 +351,7 @@ class Summarizer:
                     system=system_prompt,
                     usage=usage,
                     max_tokens=self._final_max_tokens,
+                    route=self._route,
                 )
                 if retry_raw.strip():
                     raw = retry_raw
@@ -389,6 +398,7 @@ class Summarizer:
                 system=system_prompt,
                 usage=usage,
                 max_tokens=self._partial_max_tokens,
+                route=self._route,
             )
             logger.info(
                 "summary.chunk.done index=%s total=%s duration_sec=%.1f response_chars=%s",
@@ -433,6 +443,7 @@ class Summarizer:
                     system=system_prompt,
                     usage=usage,
                     max_tokens=self._partial_max_tokens,
+                    route=self._route,
                 )
                 logger.info(
                     "summary.hierarchy.group.done index=%s total=%s duration_sec=%.1f response_chars=%s",
@@ -466,6 +477,7 @@ class Summarizer:
             system=system_prompt,
             usage=usage,
             max_tokens=self._final_max_tokens,
+            route=self._route,
         )
 
         if not raw.strip():
@@ -483,6 +495,7 @@ class Summarizer:
                 system=system_prompt,
                 usage=usage,
                 max_tokens=self._final_max_tokens,
+                route=self._route,
             )
 
         if raw.strip():
@@ -504,6 +517,7 @@ class Summarizer:
                     system=system_prompt,
                     usage=usage,
                     max_tokens=self._final_max_tokens,
+                    route=self._route,
                 )
                 if retry_raw.strip():
                     raw = retry_raw

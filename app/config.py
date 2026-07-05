@@ -62,6 +62,7 @@ class Settings:
     monitoring_target_chat_id: int | None
     monitoring_llm_retry_interval_sec: int
     premiere_delay_hours: int
+    paid_fallback_free_budget_sec: int
     public_mode: bool
     subscription_price_stars: int
     quota_starter: int
@@ -177,6 +178,9 @@ def load_settings() -> Settings:
     # Премьеры: через сколько часов после запланированного выхода ролика
     # возвращаться за саммари (чтобы успели появиться субтитры).
     premiere_delay_hours = env.int("PREMIERE_SUMMARY_DELAY_HOURS", "4")
+    # Tier-маршрутизация LLM: сколько секунд подписчик ждёт free-цепочку,
+    # прежде чем запрос уйдёт на платную модель (маршрут paid_fallback).
+    paid_fallback_free_budget_sec = env.int("PAID_FALLBACK_FREE_BUDGET_SEC", "180")
     # Монетизация: PUBLIC_MODE открывает бота внешним пользователям с квотами
     # и подпиской за Stars. false — прежнее закрытое поведение (allowlist).
     public_mode = os.getenv("PUBLIC_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -363,6 +367,7 @@ def load_settings() -> Settings:
         monitoring_target_chat_id=monitoring_target_chat_id,
         monitoring_llm_retry_interval_sec=monitoring_llm_retry_interval_sec,
         premiere_delay_hours=premiere_delay_hours,
+        paid_fallback_free_budget_sec=paid_fallback_free_budget_sec,
         public_mode=public_mode,
         subscription_price_stars=subscription_price_stars,
         quota_starter=quota_starter,
