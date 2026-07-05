@@ -5,6 +5,7 @@ import pytest
 from app.config import load_settings
 from app.db import Database
 from app.llm_client import OPENROUTER_BUDGET_EXCEEDED_MARKER, OpenRouterClient
+from app.summarizer import Summarizer
 
 
 @pytest.fixture
@@ -109,3 +110,26 @@ async def test_paid_fallback_global_paid_goes_straight_paid(client, monkeypatch)
     calls = wire(client, monkeypatch, free=ok_free, paid=ok_paid)
     assert await client.generate("p", route="paid_fallback") == "paid-result"
     assert calls == ["paid"]
+
+
+class _RouteRecordingLLM:
+    def __init__(self):
+        self.routes: list[str] = []
+
+    @property
+    def provider_name(self) -> str:
+        return "fake"
+
+    async def generate(self, prompt, system=None, usage=None, max_tokens=None, route="default"):
+        self.routes.append(route)
+        return '{"overview": "x", "chapters": [], "tags": {}}'
+
+
+async def test_summarizer_threads_route_to_llm():
+    llm = _RouteRecordingLLM()
+    summarizer = Summarizer(llm, system_prompt_provider=lambda: "sys")
+    await summarizer.summarize(
+        url="https://youtu.be/x", title="t", chunks=["один чанк"],
+        llm_route="paid_fallback",
+    )
+    assert llm.routes and all(r == "paid_fallback" for r in llm.routes)

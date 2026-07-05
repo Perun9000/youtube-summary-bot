@@ -318,6 +318,20 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
         summary_progress = SummaryProgress()
         context_hint = _build_context_hint(job)
         topic_hint, speaker_hint, host_hint = _build_tags_hints(services)
+
+        # Tier-маршрутизация LLM: подписчик получает paid-fallback (free
+        # сначала, платная при недоступности/медленности); бесплатный внешний
+        # пользователь никогда не тратит платные токены; allowlist — как
+        # раньше, по глобальному /llm_paid.
+        llm_route = "default"
+        if job.quota_user_id is not None:
+            is_sub = bool(
+                services.billing is not None
+                and services.billing.is_subscriber(job.quota_user_id)
+            )
+            llm_route = "paid_fallback" if is_sub else "free_only"
+            logger.info("job.llm_route job_id=%s route=%s", job_id, llm_route)
+
         await _set_service_status(services, message, f"Генерирую summary через {services.llm.provider_name}...", job=job)
         summary = await _run_with_telegram_status(
             services=services,
@@ -332,6 +346,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                 topic_hint=topic_hint,
                 speaker_hint=speaker_hint,
                 host_hint=host_hint,
+                llm_route=llm_route,
             ),
             base_text=f"Генерирую summary через {services.llm.provider_name}...",
             job=job,
