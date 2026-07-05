@@ -1,8 +1,25 @@
+import datetime
+
 from app.billing import BillingStore, QuotaService, WEEK_SEC, MONTH_SEC
+from app.bot_handlers import _subscription_until_from_payment
 from app.db import Database
 
 
 NOW = 1_000_000.0
+
+
+class _FakePayment:
+    def __init__(self, expiration):
+        self.subscription_expiration_date = expiration
+
+
+def test_subscription_until_from_payment_datetime():
+    dt = datetime.datetime(2026, 8, 3, 12, 0, tzinfo=datetime.timezone.utc)
+    assert _subscription_until_from_payment(_FakePayment(dt), now=0.0) == dt.timestamp()
+
+
+def test_subscription_until_from_payment_fallback_30d():
+    assert _subscription_until_from_payment(_FakePayment(None), now=1000.0) == 1000.0 + 30 * 86400
 
 
 def make(tmp_path, starter=3, weekly=1, monthly=30):

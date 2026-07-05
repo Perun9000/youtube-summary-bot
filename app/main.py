@@ -51,10 +51,13 @@ PUBLIC_BOT_COMMANDS: list[BotCommand] = [
     BotCommand(command="help", description="Что умеет бот"),
     BotCommand(command="last", description="Последние 20 саммари"),
     BotCommand(command="limits", description="Остаток лимитов"),
+    BotCommand(command="subscribe", description="Подписка"),
+    BotCommand(command="paysupport", description="Вопросы по оплате"),
 ]
 
 OWNER_BOT_COMMANDS: list[BotCommand] = [
     *PUBLIC_BOT_COMMANDS,
+    BotCommand(command="refund", description="Возврат платежа Stars"),
     BotCommand(command="users", description="Список пользователей"),
     BotCommand(command="user_add", description="Добавить пользователя"),
     BotCommand(command="user_remove", description="Удалить пользователя"),

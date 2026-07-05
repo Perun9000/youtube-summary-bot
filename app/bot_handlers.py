@@ -8,9 +8,17 @@ from urllib.parse import urlparse
 
 from aiogram import F, Router
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LabeledPrice,
+    Message,
+    PreCheckoutQuery,
+)
 
 from app import log_analytics
+from app.billing import MONTH_SEC
 from app.digest_service import render_digest_html
 from app.llm_client import OpenRouterClient, health_check_with_reason
 from app.monitoring_service import ScanProgress
@@ -46,6 +54,55 @@ from app.pipeline import _download_audio_to_chat  # noqa: F401
 logger = logging.getLogger(__name__)
 
 MAX_SYSTEM_PROMPT_CHARS = 8000
+
+SUBSCRIPTION_PAYLOAD = "monthly_summary_subscription"
+
+
+def _subscription_until_from_payment(payment, now: float | None = None) -> float:
+    """Срок подписки из SuccessfulPayment.subscription_expiration_date.
+
+    По Bot API это Unix-время (int); некоторые версии aiogram отдают его как
+    datetime — поддерживаем оба варианта. Если поля нет — 30 дней от now."""
+    now = now if now is not None else time.time()
+    expiration = getattr(payment, "subscription_expiration_date", None)
+    if expiration is not None:
+        to_timestamp = getattr(expiration, "timestamp", None)
+        return to_timestamp() if callable(to_timestamp) else float(expiration)
+    return now + MONTH_SEC
+
+
+async def _send_subscription_invoice(chat_id: int, services: Services) -> None:
+    """Инвойс нативной Stars-подписки (валюта XTR, автопродление 30 дней).
+
+    subscription_period поддерживается только в createInvoiceLink, поэтому
+    шлём ссылку кнопкой, а не send_invoice.
+    """
+    s = services.settings
+    link = await services.bot.create_invoice_link(
+        title="Подписка на саммари",
+        description=(
+            f"{s.quota_sub_monthly} саммари в месяц. Автопродление каждые 30 дней, "
+            "отмена в любой момент в настройках Telegram."
+        ),
+        payload=SUBSCRIPTION_PAYLOAD,
+        currency="XTR",
+        prices=[LabeledPrice(label="Подписка на месяц", amount=s.subscription_price_stars)],
+        subscription_period=2592000,
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text=f"Оплатить {s.subscription_price_stars} ⭐", url=link
+        )
+    ]])
+    await services.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"Подписка: {s.quota_sub_monthly} саммари в месяц за "
+            f"{s.subscription_price_stars} ⭐.\n"
+            "Вопросы по оплате: /paysupport."
+        ),
+        reply_markup=keyboard,
+    )
 
 
 def build_router(services: Services) -> Router:
@@ -209,6 +266,84 @@ def build_router(services: Services) -> Router:
                 f"Подписка {s.subscription_price_stars} ⭐/мес — "
                 f"{s.quota_sub_monthly} саммари: /subscribe."
             )
+
+    @router.message(Command("subscribe"))
+    async def subscribe(message: Message) -> None:
+        if not _has_access(message, services):
+            await message.answer("Этот бот закрыт для личного использования.")
+            return
+        if _is_allowed(message, services):
+            await message.answer("У тебя и так безлимитный доступ 🎉")
+            return
+        await _send_subscription_invoice(message.chat.id, services)
+
+    @router.callback_query(F.data == "subscribe")
+    async def subscribe_callback(callback: CallbackQuery) -> None:
+        await callback.answer()
+        if callback.message is not None:
+            await _send_subscription_invoice(callback.message.chat.id, services)
+
+    @router.pre_checkout_query()
+    async def pre_checkout(query: PreCheckoutQuery) -> None:
+        # Цифровая услуга, проверять нечего — подтверждаем всегда.
+        await query.answer(ok=True)
+
+    @router.message(F.successful_payment)
+    async def successful_payment(message: Message) -> None:
+        payment = message.successful_payment
+        user_id = _message_user_id(message)
+        if user_id is None or services.billing is None:
+            logger.error("billing.payment.no_user_or_store payload=%s", payment.invoice_payload)
+            return
+        until = _subscription_until_from_payment(payment)
+        services.billing.activate_subscription(
+            user_id, until_unix=until, charge_id=payment.telegram_payment_charge_id
+        )
+        until_text = datetime.datetime.fromtimestamp(until).strftime("%d.%m.%Y")
+        await message.answer(
+            f"Подписка активна до {until_text} — {services.settings.quota_sub_monthly} "
+            "саммари в месяц. Остаток: /limits. Спасибо! 🔮"
+        )
+
+    @router.message(Command("paysupport"))
+    async def paysupport(message: Message) -> None:
+        # Обязательная команда по ToS Telegram для ботов, принимающих Stars.
+        owner = services.settings.owner_user_id
+        contact = f'<a href="tg://user?id={owner}">владельцу бота</a>' if owner else "владельцу бота"
+        await message.answer(
+            "По вопросам оплаты и возвратов напиши " + contact + ". "
+            "Возвраты выполняются вручную в течение 1–2 дней.",
+            parse_mode="HTML",
+        )
+
+    @router.message(Command("refund"))
+    async def refund(message: Message) -> None:
+        if not _is_owner(message, services):
+            await _answer_owner_only(message, services)
+            return
+        parts = (message.text or "").split()
+        if len(parts) < 2:
+            await message.answer("Использование: /refund <user_id> [charge_id]")
+            return
+        try:
+            target_user = int(parts[1])
+        except ValueError:
+            await message.answer("user_id должен быть числом.")
+            return
+        charge_id = parts[2] if len(parts) > 2 else (
+            services.billing.last_charge_id(target_user) if services.billing else ""
+        )
+        if not charge_id:
+            await message.answer("Не нашёл charge_id последнего платежа этого пользователя.")
+            return
+        try:
+            await services.bot.refund_star_payment(
+                user_id=target_user, telegram_payment_charge_id=charge_id
+            )
+        except Exception as exc:  # noqa: BLE001
+            await message.answer(f"Возврат не прошёл: {exc}")
+            return
+        await message.answer(f"Возврат {charge_id} пользователю {target_user} выполнен.")
 
     @router.message(Command("users"))
     async def users(message: Message) -> None:
