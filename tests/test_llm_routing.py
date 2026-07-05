@@ -1,10 +1,13 @@
 import asyncio
+import types
 
 import pytest
 
 from app.config import load_settings
 from app.db import Database
 from app.llm_client import OPENROUTER_BUDGET_EXCEEDED_MARKER, OpenRouterClient
+from app.pipeline import _llm_route_for_job
+from app.services_container import SummaryJob
 from app.summarizer import Summarizer
 
 
@@ -133,3 +136,38 @@ async def test_summarizer_threads_route_to_llm():
         llm_route="paid_fallback",
     )
     assert llm.routes and all(r == "paid_fallback" for r in llm.routes)
+
+
+def _job(quota_user_id=None):
+    return SummaryJob(
+        sequence=1, message=None, url="https://youtu.be/x",
+        enqueued_at=0.0, chat_id=1, quota_user_id=quota_user_id,
+    )
+
+
+class _FakeBilling:
+    def __init__(self, subscriber_ids):
+        self._ids = set(subscriber_ids)
+
+    def is_subscriber(self, user_id, now=None):
+        return user_id in self._ids
+
+
+def test_route_matrix_allowlist_default():
+    services = types.SimpleNamespace(billing=_FakeBilling({7}))
+    assert _llm_route_for_job(_job(quota_user_id=None), services) == "default"
+
+
+def test_route_matrix_subscriber_paid_fallback():
+    services = types.SimpleNamespace(billing=_FakeBilling({7}))
+    assert _llm_route_for_job(_job(quota_user_id=7), services) == "paid_fallback"
+
+
+def test_route_matrix_free_external_free_only():
+    services = types.SimpleNamespace(billing=_FakeBilling({7}))
+    assert _llm_route_for_job(_job(quota_user_id=99), services) == "free_only"
+
+
+def test_route_matrix_no_billing_store_free_only():
+    services = types.SimpleNamespace(billing=None)
+    assert _llm_route_for_job(_job(quota_user_id=99), services) == "free_only"
