@@ -62,7 +62,9 @@ ytd-app[dark] #yt-summary-bot-btn:active {
   position: absolute;
   top: 4px;
   left: 4px;
-  z-index: 10;
+  /* Выше inline-плеера превью на главной, который YouTube монтирует
+   * поверх ссылки при наведении. */
+  z-index: 1000;
   width: 28px;
   height: 28px;
   padding: 0;
@@ -77,7 +79,11 @@ ytd-app[dark] #yt-summary-bot-btn:active {
   transition: opacity 0.15s ease;
 }
 
-.yt-summary-preview-host:hover .yt-summary-preview-btn {
+/* Класс ставит content.js по elementsFromPoint: CSS :hover не срабатывает,
+ * когда поверх ссылки лежит inline-плеер (не её потомок). :hover оставлен
+ * как подстраховка для разметок без оверлея. */
+.yt-summary-preview-host:hover .yt-summary-preview-btn,
+.yt-summary-preview-host.yt-summary-preview-visible .yt-summary-preview-btn {
   opacity: 1;
 }
 

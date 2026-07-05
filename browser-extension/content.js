@@ -147,6 +147,56 @@
 
   const PREVIEW_BTN_CLASS = 'yt-summary-preview-btn';
   const PREVIEW_HOST_CLASS = 'yt-summary-preview-host';
+  const PREVIEW_VISIBLE_CLASS = 'yt-summary-preview-visible';
+
+  // Показ кнопки по наведению делаем из JS, а не чистым CSS :hover: на
+  // главной YouTube поверх ссылки-превью монтируется inline-плеер
+  // (<video class="html5-main-video">), который НЕ потомок ссылки — :hover
+  // на неё не срабатывает, и кнопка навсегда остаётся с opacity:0.
+  // elementsFromPoint() возвращает весь стек под курсором, включая
+  // перекрытый хост, поэтому работает и сквозь плеер.
+  let visiblePreviewHost = null;
+  let lastPointerX = -1;
+  let lastPointerY = -1;
+
+  function updateHoveredPreviewHost(x, y) {
+    let host = null;
+    if (x >= 0 && y >= 0) {
+      for (const el of document.elementsFromPoint(x, y)) {
+        if (el.classList && el.classList.contains(PREVIEW_HOST_CLASS)) {
+          host = el;
+          break;
+        }
+      }
+    }
+    if (host === visiblePreviewHost) return;
+    if (visiblePreviewHost) visiblePreviewHost.classList.remove(PREVIEW_VISIBLE_CLASS);
+    visiblePreviewHost = host;
+    if (host) host.classList.add(PREVIEW_VISIBLE_CLASS);
+  }
+
+  // mouseover срабатывает при каждой смене элемента под курсором — этого
+  // достаточно (вход на карточку, монтирование/размонтирование плеера).
+  document.addEventListener('mouseover', (ev) => {
+    lastPointerX = ev.clientX;
+    lastPointerY = ev.clientY;
+    updateHoveredPreviewHost(lastPointerX, lastPointerY);
+  }, true);
+  // Курсор ушёл из окна — прячем.
+  document.documentElement.addEventListener('mouseleave', () => {
+    updateHoveredPreviewHost(-1, -1);
+  });
+  // При скролле элемент под неподвижным курсором меняется без mouse-событий;
+  // пересчитываем по последним координатам, не чаще кадра.
+  let hoverScanQueued = false;
+  document.addEventListener('scroll', () => {
+    if (hoverScanQueued) return;
+    hoverScanQueued = true;
+    requestAnimationFrame(() => {
+      hoverScanQueued = false;
+      updateHoveredPreviewHost(lastPointerX, lastPointerY);
+    });
+  }, {capture: true, passive: true});
 
   function extractIdFromHref(href) {
     try {
