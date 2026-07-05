@@ -128,7 +128,13 @@ class _EnvReader:
             return int(raw)
         except ValueError:
             self.errors.append(f"{name}={raw!r} — ожидается целое число")
-            return int(default)
+            # default может быть цепочным (os.getenv другой переменной) и сам
+            # не парситься — тогда возвращаем заглушку: ошибка уже записана,
+            # raise_if_errors() не даст этому значению дожить до работы.
+            try:
+                return int(default)
+            except ValueError:
+                return 0
 
     def float(self, name: str, default: str) -> float:
         raw = os.getenv(name, default).strip() or default
@@ -136,7 +142,10 @@ class _EnvReader:
             return float(raw)
         except ValueError:
             self.errors.append(f"{name}={raw!r} — ожидается число")
-            return float(default)
+            try:
+                return float(default)
+            except ValueError:
+                return 0.0
 
     def raise_if_errors(self) -> None:
         if self.errors:

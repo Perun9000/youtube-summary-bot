@@ -13,7 +13,10 @@ from app.summarizer import Summarizer
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)  # не подхватывать реальный .env
+    # Полная изоляция от реального .env: load_dotenv ищет его от config.py
+    # вверх по дереву (usecwd=False), chdir не спасает — глушим вызов.
+    monkeypatch.setattr("app.config.load_dotenv", lambda *a, **k: None)
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "1:x")
     monkeypatch.setenv("BOT_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("LLM_PROVIDER", "openrouter")

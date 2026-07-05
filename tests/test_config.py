@@ -4,7 +4,10 @@ from app.config import load_settings
 
 @pytest.fixture
 def base_env(monkeypatch, tmp_path):
-    # chdir в tmp — чтобы load_dotenv() не подцепил реальный .env репозитория.
+    # Полная изоляция от реального .env репозитория. ВАЖНО: chdir недостаточно —
+    # load_dotenv() по умолчанию ищет .env от файла config.py вверх по дереву
+    # (usecwd=False), а не от текущей директории, поэтому глушим сам вызов.
+    monkeypatch.setattr("app.config.load_dotenv", lambda *args, **kwargs: None)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:abc")
     monkeypatch.setenv("BOT_DATA_DIR", str(tmp_path))

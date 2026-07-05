@@ -140,19 +140,32 @@ def build_router(services: Services) -> Router:
                 "она должна слать 11-символьный video_id."
             )
             return
-        text = (
-            "Пришли ссылку на YouTube-ролик. Я верну краткое summary здесь и полный конспект в Telegra.ph."
-        )
-        if not _is_allowed(message, services):
-            text += (
-                "\n\nБесплатно: "
-                f"{services.settings.quota_starter} саммари на старте, "
-                f"дальше {services.settings.quota_free_weekly} в неделю. "
-                f"Подписка {services.settings.subscription_price_stars} ⭐/мес — "
-                f"{services.settings.quota_sub_monthly} саммари в месяц: /subscribe. "
-                "Остаток лимитов: /limits."
+        if _is_allowed(message, services):
+            await message.answer(
+                "Пришли ссылку на YouTube-ролик. Я верну краткое summary здесь "
+                "и полный конспект в Telegra.ph.\n\nУ тебя безлимитный доступ 🎉"
             )
-        await message.answer(text)
+            return
+        s = services.settings
+        await message.answer(
+            "👋 Привет! Я делаю саммари YouTube-видео.\n\n"
+            "Пришли ссылку на ролик — верну сюда краткую выжимку (о чём видео, "
+            "время чтения, теги, топ-комментарий), а полный конспект по главам "
+            "опубликую в Telegra.ph.\n\n"
+            "<b>Что умею:</b>\n"
+            "• ролики без субтитров — распознаю речь сам\n"
+            "• премьеры — запомню и вернусь с саммари после выхода\n"
+            "• уже обработанные ролики отдаю мгновенно и бесплатно\n\n"
+            "<b>Тарифы:</b>\n"
+            f"🆓 <b>Бесплатно</b> — {s.quota_starter} саммари сразу "
+            f"и {s.quota_free_weekly} в неделю дальше\n"
+            f"⭐ <b>Подписка {s.subscription_price_stars} ⭐/мес</b> — "
+            f"{s.quota_sub_monthly} саммари в месяц и приоритетная скорость "
+            "генерации: /subscribe\n\n"
+            "Длинный ролик без субтитров (дольше часа) считается за 2 саммари.\n\n"
+            "/limits — остаток лимитов · /help — все команды",
+            parse_mode="HTML",
+        )
 
     @router.message(Command("help"))
     async def help_command(message: Message) -> None:
@@ -165,8 +178,20 @@ def build_router(services: Services) -> Router:
                 "/start - начать работу\n"
                 "/help - помощь\n"
                 "/last - последние 20 саммари\n"
-                "/limits - остаток лимитов\n\n"
-                "Пришли ссылку на YouTube-ролик — я верну краткое summary здесь "
+                "/limits - остаток лимитов\n"
+            )
+            if not _is_allowed(message, services):
+                s = services.settings
+                text += (
+                    "/subscribe - подписка\n"
+                    "/paysupport - вопросы по оплате\n\n"
+                    f"Бесплатно: {s.quota_starter} саммари сразу и "
+                    f"{s.quota_free_weekly} в неделю. Подписка "
+                    f"{s.subscription_price_stars} ⭐/мес — {s.quota_sub_monthly} "
+                    "саммари в месяц.\n"
+                )
+            text += (
+                "\nПришли ссылку на YouTube-ролик — я верну краткое summary здесь "
                 "и полный конспект в Telegra.ph."
             )
             if not _is_allowed(message, services):
