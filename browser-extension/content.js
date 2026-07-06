@@ -14,6 +14,11 @@
 (() => {
   'use strict';
 
+  // Маркер версии content script'а: виден со страницы, позволяет отличить
+  // «код не перезагрузился» от «в новом коде баг» при отладке.
+  const SCRIPT_VERSION = '0.2.3';
+  document.documentElement.dataset.ytSummaryExt = SCRIPT_VERSION;
+
   const api = globalThis.browser ?? globalThis.chrome;
   const DEFAULT_BOT_HANDLE = 'YouTube_Sum_mary_bot';
   const BUTTON_ID = 'yt-summary-bot-btn';
