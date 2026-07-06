@@ -325,12 +325,17 @@ def _build_summary_keyboard(
 ) -> InlineKeyboardMarkup | None:
     """Собрать inline-клавиатуру под финальным саммари.
 
-    Обе кнопки идут в один ряд (Telegram сам сожмёт по ширине экрана):
+    Первые две кнопки идут в один ряд (Telegram сам сожмёт по ширине экрана):
       1. «подробное саммари» — ссылка на Telegra.ph. Видна всем.
       2. «Скачать аудио» — owner-only, callback на транскрипцию/отправку файла.
+    Третья кнопка — отдельным рядом:
+      3. «Транскрипт (md)» — callback, доступ проверяется в хендлере
+         (allowlist и подписчики); видна всем, чтобы не выдавать статус
+         подписки видимостью кнопки.
 
-    Возвращаем None, если ни одна кнопка не применима (нет telegraph_url и
-    получатель не owner) — тогда саммари уходит вообще без клавиатуры.
+    Возвращаем None, если ни одна кнопка не применима (нет telegraph_url,
+    получатель не owner и нет video_id) — тогда саммари уходит вообще без
+    клавиатуры.
     """
     row: list[InlineKeyboardButton] = []
     if telegraph_url:
@@ -344,9 +349,19 @@ def _build_summary_keyboard(
                 callback_data=f"download:{video_id}",
             )
         )
-    if not row:
+    rows: list[list[InlineKeyboardButton]] = []
+    if row:
+        rows.append(row)
+    if video_id:
+        rows.append([
+            InlineKeyboardButton(
+                text="📄 Транскрипт (md)",
+                callback_data=f"transcript:{video_id}",
+            )
+        ])
+    if not rows:
         return None
-    return InlineKeyboardMarkup(inline_keyboard=[row])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 def _is_job_cacheable(job: SummaryJob) -> bool:
     """We cache only canonical full-video summaries.
 

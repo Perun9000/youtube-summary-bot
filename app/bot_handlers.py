@@ -10,6 +10,7 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LabeledPrice,
@@ -49,6 +50,7 @@ from app.queue_service import (  # noqa: F401
 )
 from app.delivery import _message_user_id  # noqa: F401
 from app.pipeline import _download_audio_to_chat  # noqa: F401
+from app.transcript_export import transcript_path
 
 
 logger = logging.getLogger(__name__)
@@ -737,6 +739,40 @@ def build_router(services: Services) -> Router:
         await callback.answer("Готовлю аудио...")
         asyncio.create_task(_download_audio_to_chat(callback, video_id, services))
 
+    @router.callback_query(F.data.startswith("transcript:"))
+    async def transcript_callback(callback: CallbackQuery) -> None:
+        """Кнопка под саммари: прислать сохранённый транскрипт (.md).
+
+        Доступ — allowlist или активная подписка; для остальных alert
+        с подсказкой /subscribe вместо файла.
+        """
+        video_id = (callback.data or "").split(":", 1)[1]
+        user_id = callback.from_user.id if callback.from_user else None
+        allowed = user_id is not None and (
+            services.users.is_allowed(user_id)
+            or (services.billing is not None and services.billing.is_subscriber(user_id))
+        )
+        if not allowed:
+            await callback.answer(
+                "Скачивание транскрипта доступно по подписке — /subscribe",
+                show_alert=True,
+            )
+            return
+        path = transcript_path(services.settings.bot_data_dir, video_id)
+        if not path.exists():
+            await callback.answer(
+                "Транскрипт не сохранён для этого ролика (обработан до появления функции).",
+                show_alert=True,
+            )
+            return
+        await callback.answer()
+        if callback.message is not None:
+            await services.bot.send_document(
+                chat_id=callback.message.chat.id,
+                document=FSInputFile(path, filename=f"{video_id}.md"),
+                disable_notification=True,
+            )
+
     # ─────────────────────── DISABLED: канал-публикация ───────────────────────
     # Фича «опубликовать в канал» временно отключена. Код callback'а и логики
     # публикации сохранён в виде комментариев, чтобы при необходимости можно
@@ -1141,6 +1177,7 @@ async def _apply_cache_drop(message: Message, raw_args: str, services: Services)
         )
         return
     removed = services.summary_cache.delete(video_id)
+    transcript_path(services.settings.bot_data_dir, video_id).unlink(missing_ok=True)
     if removed:
         await message.answer(
             f"Убрал <code>{video_id}</code> из кэша. Следующая ссылка на этот ролик "

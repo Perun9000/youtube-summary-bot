@@ -17,6 +17,7 @@ from app.monitoring_service import filter_segments_by_spans, format_spans_for_hu
 from app.morning_digest import MorningDigestItem
 from app.summarizer import SummaryProgress
 from app.transcript_chunker import chunk_transcript, segments_to_text
+from app.transcript_export import save_transcript_markdown
 from app.utils import escape_html, extract_video_id
 from app.youtube_service import TranscriptUnavailable
 
@@ -299,6 +300,18 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             )
 
         transcript_text = segments_to_text(segments)
+
+        # Сохраняем транскрипт в markdown — его можно скачать кнопкой под
+        # саммари (allowlist и подписчики). Ошибка записи не ломает job.
+        try:
+            saved = await asyncio.to_thread(
+                save_transcript_markdown,
+                services.settings.bot_data_dir, video_id, title, url, segments,
+            )
+            logger.info("job.transcript_md.saved job_id=%s path=%s", job_id, saved)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("job.transcript_md.save_failed job_id=%s error=%s", job_id, exc)
+
         active_model = await services.llm.active_model()
         chunk_size = services.settings.effective_chunk_max_chars(active_model=active_model)
         chunks = chunk_transcript(transcript_text, max_chars=chunk_size)
