@@ -190,6 +190,18 @@
     // все ВИДИМЫЕ превью-ссылки на /watch?v= по всему документу: скрытые
     // деревья отсекаются по getClientRects() (у display:none поддеревьев
     // их нет), сам плеер — по closest().
+    // Самолечение: убираем кнопки, оказавшиеся на анкорах-обёртках (внешний
+    // a#wc-endpoint в очереди/плейлистах оборачивает внутренний a#thumbnail).
+    // Такие кнопки могли остаться от прежних версий скрипта или появиться
+    // после пере-вложения разметки при SPA-переходах.
+    for (const btn of document.querySelectorAll(`.${PREVIEW_BTN_CLASS}`)) {
+      const host = btn.closest('a');
+      if (host && host.querySelector('a[href*="/watch?v="]')) {
+        btn.remove();
+        host.classList.remove(PREVIEW_HOST_CLASS);
+      }
+    }
+
     const anchors = document.querySelectorAll('a[href*="/watch?v="]');
     for (const anchor of anchors) {
       // Нужны именно превью (ссылки с картинкой), а не текстовые заголовки.
