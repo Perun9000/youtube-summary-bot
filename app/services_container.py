@@ -90,6 +90,7 @@ class Services:
     summary_status_parse_modes: dict[int, str | None]
     summary_status_disable_previews: dict[int, bool]
     bot: Bot | None = None
+    bot_username: str | None = None
     monitoring: MonitoringService | None = None
     monitoring_scan_task: asyncio.Task[None] | None = None
     monitoring_scan_progress: ScanProgress | None = None

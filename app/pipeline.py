@@ -446,6 +446,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                 segment_spans=job.segment_spans,
                 expert_matches=job.expert_matches,
                 top_comment=top_comments[0] if top_comments else None,
+                bot_username=services.bot_username,
             )
             await _send_summary_delivery(
                 services=services,
