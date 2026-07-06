@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import datetime
+import json
 import tempfile
+import threading
+import time
 import logging
 from pathlib import Path
 
@@ -20,11 +24,79 @@ class TranscriptUnavailable(Exception):
     pass
 
 
+class YtdlpUsage:
+    """Троттлинг и суточный счётчик yt-dlp-обращений.
+
+    Анти-бот YouTube смотрит на IP и темп запросов: всплески и параллелизм
+    триггерят «Sign in to confirm...». Минимальный интервал сглаживает темп,
+    счётчик в kv даёт раннее предупреждение (warning в лог + строка в /stats)
+    ДО того, как YouTube начнёт резать. Методы вызываются из sync-кода в
+    to_thread — блокирующий sleep допустим и не трогает event loop.
+    """
+
+    def __init__(self, db, *, min_interval_sec: float, soft_daily_limit: int) -> None:
+        self._db = db
+        self._min_interval_sec = min_interval_sec
+        self._soft_daily_limit = soft_daily_limit
+        self._lock = threading.Lock()
+        self._last_call_monotonic = 0.0
+        self._warned_day = ""
+
+    def _today(self) -> str:
+        return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+    def before_call(self) -> None:
+        with self._lock:
+            wait = self._min_interval_sec - (time.monotonic() - self._last_call_monotonic)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_call_monotonic = time.monotonic()
+        if self._db is None:
+            return
+        try:
+            day = self._today()
+            row = self._db.query_one("SELECT value FROM kv WHERE key = 'ytdlp_usage'")
+            state = json.loads(row["value"]) if row else {}
+            count = (state.get("count", 0) if state.get("day") == day else 0) + 1
+            self._db.execute(
+                "INSERT OR REPLACE INTO kv(key, value) VALUES ('ytdlp_usage', ?)",
+                (json.dumps({"day": day, "count": count}),),
+            )
+            if count > self._soft_daily_limit and self._warned_day != day:
+                self._warned_day = day
+                logger.warning(
+                    "ytdlp.soft_limit_exceeded count=%s limit=%s", count, self._soft_daily_limit
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ytdlp.usage_failed error=%s", exc)
+
+    def today_count(self) -> int:
+        if self._db is None:
+            return 0
+        try:
+            row = self._db.query_one("SELECT value FROM kv WHERE key = 'ytdlp_usage'")
+            if not row:
+                return 0
+            state = json.loads(row["value"])
+            return int(state.get("count", 0)) if state.get("day") == self._today() else 0
+        except Exception:  # noqa: BLE001
+            return 0
+
+
 class YouTubeService:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, db=None) -> None:
         self._settings = settings
+        self._usage = YtdlpUsage(
+            db,
+            min_interval_sec=settings.ytdlp_min_interval_sec,
+            soft_daily_limit=settings.ytdlp_soft_daily_limit,
+        )
+
+    def ytdlp_today_count(self) -> int:
+        return self._usage.today_count()
 
     def fetch_metadata(self, url: str) -> VideoMetadata:
+        self._usage.before_call()
         video_id = extract_video_id(url)
         options = {
             "quiet": True,
@@ -85,6 +157,7 @@ class YouTubeService:
 
         Uses yt-dlp in flat-extract mode so we don't fetch the whole video list.
         """
+        self._usage.before_call()
         options = {
             "quiet": True,
             "no_warnings": True,
@@ -143,6 +216,7 @@ class YouTubeService:
         ]
 
     def download_audio(self, url: str) -> Path:
+        self._usage.before_call()
         audio_dir = self._settings.bot_data_dir / "audio"
         audio_dir.mkdir(parents=True, exist_ok=True)
         video_id = extract_video_id(url)
@@ -225,6 +299,7 @@ class YouTubeService:
         the extractor fails, or the video has no comments yet — comments
         are an optional enrichment, not a hard dependency.
         """
+        self._usage.before_call()
         options = {
             "quiet": True,
             "no_warnings": True,

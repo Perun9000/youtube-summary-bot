@@ -49,6 +49,8 @@ class Settings:
     telegraph_access_token: str | None
     telegraph_author_name: str
     ytdlp_cookies_path: Path | None
+    ytdlp_min_interval_sec: float
+    ytdlp_soft_daily_limit: int
     bot_data_dir: Path
     database_path: Path
     transcript_chunk_max_chars: int
@@ -327,6 +329,10 @@ def load_settings() -> Settings:
     )
     synthesis_hierarchy_threshold = env.int("SYNTHESIS_HIERARCHY_THRESHOLD", "6")
     synthesis_group_size = env.int("SYNTHESIS_GROUP_SIZE", "5")
+    # Троттлинг yt-dlp: минимальный интервал между обращениями к YouTube (сек)
+    # и мягкий суточный лимит (при превышении — warning в лог, /stats покажет).
+    ytdlp_min_interval_sec = env.float("YTDLP_MIN_INTERVAL_SEC", "2")
+    ytdlp_soft_daily_limit = env.int("YTDLP_SOFT_DAILY_LIMIT", "150")
 
     env.raise_if_errors()
 
@@ -363,6 +369,8 @@ def load_settings() -> Settings:
         telegraph_access_token=os.getenv("TELEGRAPH_ACCESS_TOKEN", "").strip() or None,
         telegraph_author_name=os.getenv("TELEGRAPH_AUTHOR_NAME", "YouTube Summary Bot"),
         ytdlp_cookies_path=cookies_path,
+        ytdlp_min_interval_sec=ytdlp_min_interval_sec,
+        ytdlp_soft_daily_limit=ytdlp_soft_daily_limit,
         bot_data_dir=data_dir,
         database_path=database_path,
         transcript_chunk_max_chars=transcript_chunk_max_chars,

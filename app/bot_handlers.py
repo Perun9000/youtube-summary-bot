@@ -667,8 +667,12 @@ def build_router(services: Services) -> Router:
                 f"упёрлись в лимит: {f['quota_denied_users']} → подписка: {f['subs_activated']} "
                 f"(продлений: {f['sub_renewals']})\n\n"
             )
+        ytdlp_line = (
+            f"yt-dlp сегодня: {services.youtube.ytdlp_today_count()} обращений "
+            f"(мягкий лимит {services.settings.ytdlp_soft_daily_limit})\n\n"
+        )
         await message.answer(
-            db_line + funnel_line + text, parse_mode="HTML", disable_web_page_preview=True
+            db_line + funnel_line + ytdlp_line + text, parse_mode="HTML", disable_web_page_preview=True
         )
 
     @router.message(Command("llm_paid"))

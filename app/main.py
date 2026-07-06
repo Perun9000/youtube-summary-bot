@@ -228,7 +228,7 @@ async def main() -> None:
         settings=settings,
         users=user_store,
         llm=llm,
-        youtube=YouTubeService(settings),
+        youtube=YouTubeService(settings, db),
         summarizer=Summarizer(
             llm,
             hierarchy_threshold=settings.synthesis_hierarchy_threshold,
