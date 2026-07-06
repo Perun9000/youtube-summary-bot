@@ -516,6 +516,9 @@ async def _send_quota_denied(message: Message, services: Services, verdict) -> N
     callback 'subscribe' обрабатывается в bot_handlers (шлёт Stars-инвойс) —
     кнопка работает и из этого сообщения, и из /subscribe.
     """
+    user_id = _message_user_id(message)
+    if services.analytics is not None and user_id is not None:
+        services.analytics.record(user_id, "quota_denied", detail=verdict.deny_reason)
     s = services.settings
     if verdict.deny_reason == "monthly_exhausted":
         text = (

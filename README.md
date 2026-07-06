@@ -269,6 +269,12 @@ billing.charge_failed user_id=...
 billing.payment.no_user_or_store payload=...
 ```
 
+**Аналитика внешних пользователей:** события `first_start` (deep_link/organic),
+`quota_denied`, `sub_activated`, `sub_renewed` пишутся в append-only таблицу
+`analytics_events` и копятся бессрочно (лог-событие: `analytics.first_start`).
+Воронка за последние 30 дней (`/start` → первая генерация → упёрлись в лимит →
+подписка → продления) показывается владельцу в `/stats`.
+
 **Ручной чеклист владельца после включения `PUBLIC_MODE=true`:** зайти с
 второго (не-allowlist) аккаунта → 3 стартовых саммари проходят → 4-й запрос
 упирается в лимит с кнопкой оформления подписки → `/subscribe` → оплатить

@@ -14,6 +14,7 @@ from aiogram.types import (
     MenuButtonCommands,
 )
 
+from app.analytics_events import AnalyticsEvents
 from app.billing import BillingStore, QuotaService
 from app.bot_handlers import (
     Services,
@@ -136,6 +137,7 @@ async def main() -> None:
         weekly=settings.quota_free_weekly,
         monthly=settings.quota_sub_monthly,
     )
+    analytics_events = AnalyticsEvents(db)
     logger.info(
         "billing.boot public_mode=%s price_stars=%s quotas=%s/%s/%s",
         settings.public_mode, settings.subscription_price_stars,
@@ -255,6 +257,7 @@ async def main() -> None:
         morning_digest=MorningDigestStore(db),
         billing=billing_store,
         quota=quota_service,
+        analytics=analytics_events,
     )
 
     scheduler_task: asyncio.Task[None] | None = None
