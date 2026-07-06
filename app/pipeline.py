@@ -303,14 +303,18 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
 
         # Сохраняем транскрипт в markdown — его можно скачать кнопкой под
         # саммари (allowlist и подписчики). Ошибка записи не ломает job.
-        try:
-            saved = await asyncio.to_thread(
-                save_transcript_markdown,
-                services.settings.bot_data_dir, video_id, title, url, segments,
-            )
-            logger.info("job.transcript_md.saved job_id=%s path=%s", job_id, saved)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("job.transcript_md.save_failed job_id=%s error=%s", job_id, exc)
+        # Segment-mode (job.segment_spans) пишет лишь фрагмент ролика —
+        # сохранять его как канонический транскрипт video_id нельзя
+        # (аналогично _is_job_cacheable для кэша саммари).
+        if not job.segment_spans:
+            try:
+                saved = await asyncio.to_thread(
+                    save_transcript_markdown,
+                    services.settings.bot_data_dir, video_id, title, url, segments,
+                )
+                logger.info("job.transcript_md.saved job_id=%s path=%s", job_id, saved)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("job.transcript_md.save_failed job_id=%s error=%s", job_id, exc)
 
         active_model = await services.llm.active_model()
         chunk_size = services.settings.effective_chunk_max_chars(active_model=active_model)
