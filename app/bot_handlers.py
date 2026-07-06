@@ -129,6 +129,10 @@ def build_router(services: Services) -> Router:
                 "deep_link.start chat_id=%s video_id=%s source=browser_button",
                 message.chat.id, payload,
             )
+            if services.analytics is not None and not _is_allowed(message, services):
+                user_id = _message_user_id(message)
+                if user_id is not None:
+                    services.analytics.record_first_start(user_id, "deep_link")
             await _enqueue_summary_job(message, url, services)
             return
         if payload:
@@ -147,6 +151,10 @@ def build_router(services: Services) -> Router:
             )
             return
         s = services.settings
+        if services.analytics is not None:
+            user_id = _message_user_id(message)
+            if user_id is not None:
+                services.analytics.record_first_start(user_id, "organic")
         await message.answer(
             "👋 Привет! Я делаю саммари YouTube-видео.\n\n"
             "Пришли ссылку на ролик — верну сюда краткую выжимку (о чём видео, "
@@ -324,6 +332,16 @@ def build_router(services: Services) -> Router:
         services.billing.activate_subscription(
             user_id, until_unix=until, charge_id=payment.telegram_payment_charge_id
         )
+        if services.analytics is not None:
+            is_first = bool(
+                getattr(payment, "is_first_recurring", False)
+                or not getattr(payment, "is_recurring", False)
+            )
+            services.analytics.record(
+                user_id,
+                "sub_activated" if is_first else "sub_renewed",
+                detail=payment.telegram_payment_charge_id,
+            )
         until_text = datetime.datetime.fromtimestamp(until).strftime("%d.%m.%Y")
         await message.answer(
             f"Подписка активна до {until_text} — {services.settings.quota_sub_monthly} "
@@ -638,7 +656,18 @@ def build_router(services: Services) -> Router:
             f"Jobs за 30 дней (БД): ✅ {job_counts.get('done', 0)} · "
             f"❌ {job_counts.get('failed', 0)} · ⏹ {job_counts.get('cancelled', 0)}\n\n"
         )
-        await message.answer(db_line + text, parse_mode="HTML", disable_web_page_preview=True)
+        funnel_line = ""
+        if services.analytics is not None:
+            f = services.analytics.funnel(30)
+            funnel_line = (
+                "Воронка внешних пользователей (30 дн):\n"
+                f"/start: {f['first_starts']} → первая генерация: {f['first_generations']} → "
+                f"упёрлись в лимит: {f['quota_denied_users']} → подписка: {f['subs_activated']} "
+                f"(продлений: {f['sub_renewals']})\n\n"
+            )
+        await message.answer(
+            db_line + funnel_line + text, parse_mode="HTML", disable_web_page_preview=True
+        )
 
     @router.message(Command("llm_paid"))
     async def llm_paid(message: Message) -> None:

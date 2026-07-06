@@ -7,6 +7,7 @@ import re as _re  # локальный alias, чтобы не светить re 
 from aiogram import Bot
 from aiogram.types import Message
 
+from app.analytics_events import AnalyticsEvents
 from app.billing import BillingStore, QuotaService
 from app.config import Settings
 from app.channel_posts_store import ChannelPostsStore
@@ -112,6 +113,7 @@ class Services:
     morning_digest: "MorningDigestStore | None" = None
     billing: "BillingStore | None" = None
     quota: "QuotaService | None" = None
+    analytics: "AnalyticsEvents | None" = None
     # Двухшаговые админ-команды («введи /user_add — бот спросит — ты отвечаешь
     # данными в следующем сообщении»). Ключ — chat_id, значение —
     # PendingAdminInput. Не персистится: после рестарта диалог теряется,

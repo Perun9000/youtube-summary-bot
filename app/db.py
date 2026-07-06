@@ -96,6 +96,15 @@ CREATE TABLE IF NOT EXISTS usage_events (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_usage_user_time ON usage_events(user_id, created_at);
+CREATE TABLE IF NOT EXISTS analytics_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    event TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_analytics_user_event ON analytics_events(user_id, event);
+CREATE INDEX IF NOT EXISTS idx_analytics_event_time ON analytics_events(event, created_at);
 """
 
 
