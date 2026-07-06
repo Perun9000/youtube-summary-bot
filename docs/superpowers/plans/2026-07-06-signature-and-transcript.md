@@ -328,3 +328,160 @@ README, раздел «Монетизация»: пункт про кнопку 
 ```bash
 git add -A && git commit -m "Transcript (md) download button for subscribers and allowlist"
 ```
+
+---
+
+### Task 3: Троттлинг yt-dlp + суточный счётчик обращений
+
+**Files:**
+- Modify: `app/youtube_service.py`, `app/config.py`, `app/main.py`, `app/bot_handlers.py` (/stats), `.env.example`
+- Test: `tests/test_ytdlp_usage.py`
+
+**Interfaces:**
+- Consumes: `Database` (таблица `kv`), `YouTubeService.__init__(self, settings)` (app/youtube_service.py:24), его yt-dlp-методы: `fetch_metadata`, `resolve_channel` (:83), `download_audio` (:145), `fetch_top_comments` (:203). ВАЖНО: `fetch_transcript` yt-dlp НЕ использует (youtube-transcript-api) — его не троттлить и не считать.
+- Produces:
+  - Класс `YtdlpUsage` в `app/youtube_service.py`: `__init__(self, db, *, min_interval_sec: float, soft_daily_limit: int)`; `before_call(self) -> None` — блокирующе выдерживает минимальный интервал от предыдущего yt-dlp-вызова (threading.Lock + time.monotonic; вызывается из sync-методов, работающих в to_thread — блокировка потока допустима) и инкрементит суточный счётчик в kv (ключ `ytdlp_usage`, JSON `{"day": "YYYY-MM-DD" по UTC, "count": N}`, rollover при смене дня); при превышении soft_daily_limit — `logger.warning("ytdlp.soft_limit_exceeded count=... limit=...")` не чаще раза на превышение-день; `today_count(self) -> int`. Устойчив к db=None (все методы no-op).
+  - `YouTubeService.__init__(self, settings, db=None)` — создаёт `self._usage = YtdlpUsage(db, min_interval_sec=settings.ytdlp_min_interval_sec, soft_daily_limit=settings.ytdlp_soft_daily_limit)`; в начале каждого из 4 yt-dlp-методов — `self._usage.before_call()`.
+  - `Settings.ytdlp_min_interval_sec: float` (env `YTDLP_MIN_INTERVAL_SEC`, default "2"), `Settings.ytdlp_soft_daily_limit: int` (env `YTDLP_SOFT_DAILY_LIMIT`, default "150") — через env.float/env.int в hoisted-блоке.
+  - `/stats`: строка `yt-dlp сегодня: N обращений (мягкий лимит M)` — через `services.youtube._usage.today_count()`; добавить публичный метод `YouTubeService.ytdlp_today_count() -> int`, чтобы /stats не лез в приватное поле.
+
+- [ ] **Step 1: Failing tests**
+
+`tests/test_ytdlp_usage.py`:
+
+```python
+import time
+
+from app.db import Database
+from app.youtube_service import YtdlpUsage
+
+
+def test_counts_and_rollover(tmp_path, monkeypatch):
+    db = Database(tmp_path / "bot.db")
+    usage = YtdlpUsage(db, min_interval_sec=0, soft_daily_limit=100)
+    fake_day = {"value": "2026-07-06"}
+    monkeypatch.setattr(usage, "_today", lambda: fake_day["value"])
+    usage.before_call()
+    usage.before_call()
+    assert usage.today_count() == 2
+    fake_day["value"] = "2026-07-07"          # новый день — счётчик с нуля
+    usage.before_call()
+    assert usage.today_count() == 1
+
+
+def test_min_interval_enforced(tmp_path):
+    usage = YtdlpUsage(Database(tmp_path / "bot.db"), min_interval_sec=0.2, soft_daily_limit=100)
+    started = time.monotonic()
+    usage.before_call()
+    usage.before_call()   # должен подождать ~0.2 сек после первого
+    assert time.monotonic() - started >= 0.2
+
+
+def test_none_db_is_noop():
+    usage = YtdlpUsage(None, min_interval_sec=0, soft_daily_limit=100)
+    usage.before_call()
+    assert usage.today_count() == 0
+```
+
+Run — FAIL (`cannot import name 'YtdlpUsage'`).
+
+- [ ] **Step 2: Реализация**
+
+`YtdlpUsage` в youtube_service.py:
+
+```python
+class YtdlpUsage:
+    """Троттлинг и суточный счётчик yt-dlp-обращений.
+
+    Анти-бот YouTube смотрит на IP и темп запросов: всплески и параллелизм
+    триггерят «Sign in to confirm...». Минимальный интервал сглаживает темп,
+    счётчик в kv даёт раннее предупреждение (warning в лог + строка в /stats)
+    ДО того, как YouTube начнёт резать. Методы вызываются из sync-кода в
+    to_thread — блокирующий sleep допустим и не трогает event loop.
+    """
+
+    def __init__(self, db, *, min_interval_sec: float, soft_daily_limit: int) -> None:
+        self._db = db
+        self._min_interval_sec = min_interval_sec
+        self._soft_daily_limit = soft_daily_limit
+        self._lock = threading.Lock()
+        self._last_call_monotonic = 0.0
+        self._warned_day = ""
+
+    def _today(self) -> str:
+        return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+    def before_call(self) -> None:
+        with self._lock:
+            wait = self._min_interval_sec - (time.monotonic() - self._last_call_monotonic)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_call_monotonic = time.monotonic()
+        if self._db is None:
+            return
+        try:
+            day = self._today()
+            row = self._db.query_one("SELECT value FROM kv WHERE key = 'ytdlp_usage'")
+            state = json.loads(row["value"]) if row else {}
+            count = (state.get("count", 0) if state.get("day") == day else 0) + 1
+            self._db.execute(
+                "INSERT OR REPLACE INTO kv(key, value) VALUES ('ytdlp_usage', ?)",
+                (json.dumps({"day": day, "count": count}),),
+            )
+            if count > self._soft_daily_limit and self._warned_day != day:
+                self._warned_day = day
+                logger.warning(
+                    "ytdlp.soft_limit_exceeded count=%s limit=%s", count, self._soft_daily_limit
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ytdlp.usage_failed error=%s", exc)
+
+    def today_count(self) -> int:
+        if self._db is None:
+            return 0
+        try:
+            row = self._db.query_one("SELECT value FROM kv WHERE key = 'ytdlp_usage'")
+            if not row:
+                return 0
+            state = json.loads(row["value"])
+            return int(state.get("count", 0)) if state.get("day") == self._today() else 0
+        except Exception:  # noqa: BLE001
+            return 0
+```
+
+(+ импорты threading/json/datetime/time по необходимости; НЕ импортировать Database напрямую — duck-typing, db опционален.)
+
+`YouTubeService`: `__init__(self, settings, db=None)`; `self._usage = YtdlpUsage(db, min_interval_sec=settings.ytdlp_min_interval_sec, soft_daily_limit=settings.ytdlp_soft_daily_limit)`; `self._usage.before_call()` первой строкой в `fetch_metadata`, `resolve_channel`, `download_audio`, `fetch_top_comments`; публичный `def ytdlp_today_count(self) -> int: return self._usage.today_count()`.
+
+config.py: два поля + hoisted `ytdlp_min_interval_sec = env.float("YTDLP_MIN_INTERVAL_SEC", "2")`, `ytdlp_soft_daily_limit = env.int("YTDLP_SOFT_DAILY_LIMIT", "150")`.
+
+main.py: `YouTubeService(settings, db)` (db уже создан выше).
+
+/stats (bot_handlers): рядом с db_line/funnel_line:
+
+```python
+        ytdlp_line = (
+            f"yt-dlp сегодня: {services.youtube.ytdlp_today_count()} обращений "
+            f"(мягкий лимит {services.settings.ytdlp_soft_daily_limit})\n\n"
+        )
+```
+и приклеить к тексту статистики.
+
+.env.example — блок:
+
+```dotenv
+# Троттлинг yt-dlp: минимальный интервал между обращениями к YouTube (сек)
+# и мягкий суточный лимит (при превышении — warning в лог, /stats покажет).
+YTDLP_MIN_INTERVAL_SEC=2
+YTDLP_SOFT_DAILY_LIMIT=150
+```
+
+- [ ] **Step 3: Прогнать всё**
+
+`./.venv/bin/pytest tests/ -q` — 94 passed (91 + 3). `python3 -m compileall app/ -q`.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add -A && git commit -m "Throttle yt-dlp calls and track daily usage with soft-limit warning"
+```
