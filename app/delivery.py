@@ -43,6 +43,7 @@ def _format_telegram_summary(
     segment_spans: list[tuple[float, float]] | None = None,
     expert_matches: list[str] | None = None,
     top_comment: VideoComment | None = None,
+    bot_username: str | None = None,
 ) -> str:
     if channel_name and channel_url:
         channel_line = (
@@ -92,13 +93,24 @@ def _format_telegram_summary(
     if tags_line:
         blocks.append(tags_line)
 
+    # Подпись со ссылкой на бота. Именно @-упоминание видимым текстом (а не
+    # <a href> на слове): при копировании текста сообщения в комментарии
+    # Telegram href теряется, а @mention остаётся и авто-линкуется.
+    signature_line = f"<i>сделано @{bot_username}</i>" if bot_username else ""
+
     if top_comment is not None:
         base_text = "\n\n".join(blocks)
         separator_len = 2 if base_text else 0
-        available_chars = MAX_TELEGRAM_MESSAGE_CHARS - len(base_text) - separator_len
+        signature_cost = (len(signature_line) + 2) if signature_line else 0
+        available_chars = (
+            MAX_TELEGRAM_MESSAGE_CHARS - len(base_text) - separator_len - signature_cost
+        )
         top_comment_line = _format_top_comment_line(top_comment, available_chars)
         if top_comment_line:
             blocks.append(top_comment_line)
+
+    if signature_line:
+        blocks.append(signature_line)
 
     return _fit_telegram_message("\n\n".join(blocks))
 def _format_tags_line(tags: SummaryTags) -> str:
@@ -313,12 +325,17 @@ def _build_summary_keyboard(
 ) -> InlineKeyboardMarkup | None:
     """Собрать inline-клавиатуру под финальным саммари.
 
-    Обе кнопки идут в один ряд (Telegram сам сожмёт по ширине экрана):
+    Первые две кнопки идут в один ряд (Telegram сам сожмёт по ширине экрана):
       1. «подробное саммари» — ссылка на Telegra.ph. Видна всем.
       2. «Скачать аудио» — owner-only, callback на транскрипцию/отправку файла.
+    Третья кнопка — отдельным рядом:
+      3. «Транскрипт (md)» — callback, доступ проверяется в хендлере
+         (allowlist и подписчики); видна всем, чтобы не выдавать статус
+         подписки видимостью кнопки.
 
-    Возвращаем None, если ни одна кнопка не применима (нет telegraph_url и
-    получатель не owner) — тогда саммари уходит вообще без клавиатуры.
+    Возвращаем None, если ни одна кнопка не применима (нет telegraph_url,
+    получатель не owner и нет video_id) — тогда саммари уходит вообще без
+    клавиатуры.
     """
     row: list[InlineKeyboardButton] = []
     if telegraph_url:
@@ -332,9 +349,19 @@ def _build_summary_keyboard(
                 callback_data=f"download:{video_id}",
             )
         )
-    if not row:
+    rows: list[list[InlineKeyboardButton]] = []
+    if row:
+        rows.append(row)
+    if video_id:
+        rows.append([
+            InlineKeyboardButton(
+                text="📄 Транскрипт (md)",
+                callback_data=f"transcript:{video_id}",
+            )
+        ])
+    if not rows:
         return None
-    return InlineKeyboardMarkup(inline_keyboard=[row])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 def _is_job_cacheable(job: SummaryJob) -> bool:
     """We cache only canonical full-video summaries.
 
@@ -356,6 +383,7 @@ def _lookup_cached_summary(url: str, services: Services) -> CachedSummary | None
 def _format_cached_summary_text(
     cached: CachedSummary,
     override_top_comments: list[VideoComment] | None = None,
+    bot_username: str | None = None,
 ) -> str:
     """Render the cached summary identically to a fresh delivery — no header
     or "this is cached" marker. From the user's perspective, sending a link a
@@ -378,6 +406,7 @@ def _format_cached_summary_text(
         channel_name=cached.channel_name,
         channel_url=cached.channel_url,
         top_comment=comments[0] if comments else None,
+        bot_username=bot_username,
     )
 async def _refresh_cached_comments(
     cached: CachedSummary, services: Services, source_label: str
@@ -477,7 +506,9 @@ async def _send_cached_summary_to_chat(
 ) -> None:
     """Manual flow: respond to a user message with cached summary."""
     fresh_comments = await _refresh_cached_comments(cached, services, source_label="manual")
-    text = _format_cached_summary_text(cached, override_top_comments=fresh_comments)
+    text = _format_cached_summary_text(
+        cached, override_top_comments=fresh_comments, bot_username=services.bot_username,
+    )
     user_id = _message_user_id(message)
     reply_markup = _build_summary_keyboard(
         telegraph_url=cached.telegraph_url,
@@ -562,7 +593,9 @@ async def _deliver_cached_summary_for_job(
         ))
     else:
         fresh_comments = await _refresh_cached_comments(cached, services, source_label="job")
-        text = _format_cached_summary_text(cached, override_top_comments=fresh_comments)
+        text = _format_cached_summary_text(
+            cached, override_top_comments=fresh_comments, bot_username=services.bot_username,
+        )
         await _send_summary_delivery(
             services=services,
             job=job,

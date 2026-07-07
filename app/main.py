@@ -146,6 +146,12 @@ async def main() -> None:
 
     llm = create_llm_client(settings, db)
     bot = Bot(token=settings.telegram_bot_token)
+    try:
+        bot_username = (await bot.get_me()).username
+        logger.info("bot.boot username=@%s", bot_username)
+    except Exception:
+        logger.exception("bot.get_me_failed — подпись в саммари будет отключена")
+        bot_username = None
     groq_whisper = GroqWhisperService(settings)
     if groq_whisper.enabled:
         logger.info(
@@ -222,7 +228,7 @@ async def main() -> None:
         settings=settings,
         users=user_store,
         llm=llm,
-        youtube=YouTubeService(settings),
+        youtube=YouTubeService(settings, db),
         summarizer=Summarizer(
             llm,
             hierarchy_threshold=settings.synthesis_hierarchy_threshold,
@@ -242,6 +248,7 @@ async def main() -> None:
         summary_status_parse_modes={},
         summary_status_disable_previews={},
         bot=bot,
+        bot_username=bot_username,
         groq_whisper=groq_whisper,
         transcription_queue=asyncio.Queue(),
         transcription_queue_lock=asyncio.Lock(),
