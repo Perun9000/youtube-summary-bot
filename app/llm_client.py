@@ -21,6 +21,7 @@ LLM_GENERATE_TIMEOUT_SEC = 1200
 LLM_GENERATE_MAX_ATTEMPTS = 2
 LLM_GENERATE_RETRY_DELAY_SEC = 15
 OPENROUTER_BUDGET_EXCEEDED_MARKER = "OPENROUTER_BUDGET_EXCEEDED"
+FREE_CHAIN_EXHAUSTED_MARKER = "OPENROUTER_FREE_CHAIN_EXHAUSTED"
 
 
 class CircuitBreaker:
@@ -457,9 +458,12 @@ class OpenRouterClient:
             else "Попробуй позже или переключись на платную через /llm_paid."
         )
         self._breaker.record_failure()
+        # Маркер — машиночитаемый признак «free-цепочка исчерпана»: pipeline
+        # по нему подменяет техническое сообщение дружелюбным для внешних
+        # пользователей (владелец видит полный текст с подсказками).
         raise RuntimeError(
-            f"OpenRouter: все free-модели в цепочке отказались отвечать за {passes} проходов "
-            f"({models_tried}). Последняя ошибка: {last_error}. {suffix}"
+            f"{FREE_CHAIN_EXHAUSTED_MARKER}: все free-модели в цепочке отказались отвечать "
+            f"за {passes} проходов ({models_tried}). Последняя ошибка: {last_error}. {suffix}"
         )
 
     async def _generate_paid(

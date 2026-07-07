@@ -11,7 +11,11 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, FSInputFile
 
 from app.groq_whisper_service import GroqWhisperUnavailable
-from app.llm_client import GenerationUsage
+from app.llm_client import (
+    FREE_CHAIN_EXHAUSTED_MARKER,
+    OPENROUTER_BUDGET_EXCEEDED_MARKER,
+    GenerationUsage,
+)
 from app.models import VideoComment, VideoMetadata
 from app.monitoring_service import filter_segments_by_spans, format_spans_for_humans
 from app.morning_digest import MorningDigestItem
@@ -51,6 +55,39 @@ from app.delivery import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _user_facing_error_reason(exc: Exception, job: SummaryJob, services) -> str:
+    """Причина ошибки для сообщения пользователю.
+
+    Владелец/allowlist (quota_user_id is None) видят полный технический текст
+    с подсказками (/llm_paid, депозит OpenRouter). Внешним пользователям
+    технические маркеры подменяются человеческим объяснением: им не помочь
+    советом «переключись на платную модель» — у них либо подписка, либо
+    ожидание сброса дневного лимита free-tier (00:00 UTC = 03:00 МСК).
+    """
+    reason = str(exc)
+    if job.quota_user_id is None:
+        return reason
+    if FREE_CHAIN_EXHAUSTED_MARKER in reason:
+        is_sub = bool(
+            services.billing is not None
+            and services.billing.is_subscriber(job.quota_user_id)
+        )
+        if is_sub:
+            return (
+                "генерация временно недоступна (перегрузка моделей). "
+                "Попробуй ещё раз через несколько минут."
+            )
+        return (
+            "дневной лимит бесплатных генераций сервиса исчерпан. "
+            "Попробуй после 03:00 МСК или оформи подписку — /subscribe"
+        )
+    if OPENROUTER_BUDGET_EXCEEDED_MARKER in reason:
+        return (
+            "сервис временно исчерпал дневной бюджет генераций. Попробуй позже."
+        )
+    return reason
 
 
 def _llm_route_for_job(job: SummaryJob, services: Services) -> str:
@@ -561,7 +598,11 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
         await _send_summary_delivery(
             services=services,
             job=job,
-            text=_format_generation_error(video_url=url, title=title, reason=str(exc)),
+            text=_format_generation_error(
+                video_url=url,
+                title=title,
+                reason=_user_facing_error_reason(exc, job, services),
+            ),
         )
         _forget_service_status(services, chat_id)
         raise
