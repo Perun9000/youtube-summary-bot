@@ -46,29 +46,34 @@ class YtdlpUsage:
         return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
     def before_call(self) -> None:
+        # Весь метод под одним lock'ом: он сериализует и выдержку интервала,
+        # и kv-инкремент. SELECT → INSERT OR REPLACE вне lock'а — lost update:
+        # два to_thread-потока читают одинаковый count, и второй перезаписывает
+        # первого (недосчёт); мутация _warned_day вне lock'а давала бы двойной
+        # warning. db-запросы миллисекундные — удержание lock'а на них дёшево.
         with self._lock:
             wait = self._min_interval_sec - (time.monotonic() - self._last_call_monotonic)
             if wait > 0:
                 time.sleep(wait)
             self._last_call_monotonic = time.monotonic()
-        if self._db is None:
-            return
-        try:
-            day = self._today()
-            row = self._db.query_one("SELECT value FROM kv WHERE key = 'ytdlp_usage'")
-            state = json.loads(row["value"]) if row else {}
-            count = (state.get("count", 0) if state.get("day") == day else 0) + 1
-            self._db.execute(
-                "INSERT OR REPLACE INTO kv(key, value) VALUES ('ytdlp_usage', ?)",
-                (json.dumps({"day": day, "count": count}),),
-            )
-            if count > self._soft_daily_limit and self._warned_day != day:
-                self._warned_day = day
-                logger.warning(
-                    "ytdlp.soft_limit_exceeded count=%s limit=%s", count, self._soft_daily_limit
+            if self._db is None:
+                return
+            try:
+                day = self._today()
+                row = self._db.query_one("SELECT value FROM kv WHERE key = 'ytdlp_usage'")
+                state = json.loads(row["value"]) if row else {}
+                count = (state.get("count", 0) if state.get("day") == day else 0) + 1
+                self._db.execute(
+                    "INSERT OR REPLACE INTO kv(key, value) VALUES ('ytdlp_usage', ?)",
+                    (json.dumps({"day": day, "count": count}),),
                 )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("ytdlp.usage_failed error=%s", exc)
+                if count > self._soft_daily_limit and self._warned_day != day:
+                    self._warned_day = day
+                    logger.warning(
+                        "ytdlp.soft_limit_exceeded count=%s limit=%s", count, self._soft_daily_limit
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("ytdlp.usage_failed error=%s", exc)
 
     def today_count(self) -> int:
         if self._db is None:
