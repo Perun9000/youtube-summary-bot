@@ -105,6 +105,12 @@ CREATE TABLE IF NOT EXISTS analytics_events (
 );
 CREATE INDEX IF NOT EXISTS idx_analytics_user_event ON analytics_events(user_id, event);
 CREATE INDEX IF NOT EXISTS idx_analytics_event_time ON analytics_events(event, created_at);
+CREATE TABLE IF NOT EXISTS user_langs (
+    user_id INTEGER PRIMARY KEY,
+    lang TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'auto',
+    updated_at REAL NOT NULL DEFAULT 0
+);
 """
 
 
