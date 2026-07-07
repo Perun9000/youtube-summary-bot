@@ -24,6 +24,7 @@ from app.monitoring_service import MonitoringService, ScanProgress
 from app.summarizer import Summarizer
 from app.system_prompt_store import SystemPromptStore
 from app.telegraph_service import TelegraphService
+from app.user_lang_store import UserLangStore
 from app.user_store import UserStore
 from app.youtube_service import YouTubeService
 
@@ -115,6 +116,7 @@ class Services:
     billing: "BillingStore | None" = None
     quota: "QuotaService | None" = None
     analytics: "AnalyticsEvents | None" = None
+    user_langs: "UserLangStore | None" = None
     # Двухшаговые админ-команды («введи /user_add — бот спросит — ты отвечаешь
     # данными в следующем сообщении»). Ключ — chat_id, значение —
     # PendingAdminInput. Не персистится: после рестарта диалог теряется,
