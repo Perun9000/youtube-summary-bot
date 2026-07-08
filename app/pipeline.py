@@ -636,7 +636,7 @@ async def _process_transcription_job(job: SummaryJob, services: Services) -> Non
 
     # Status reporting: чтобы Telegram-сообщение жило, обновим его на "скачиваю аудио".
     await _set_service_status(
-        services, job.message, "Скачиваю аудио для распознавания через Groq...", job=job
+        services, job.message, t("status.audio_download", job.lang), job=job
     )
 
     download_started = time.monotonic()
@@ -647,7 +647,7 @@ async def _process_transcription_job(job: SummaryJob, services: Services) -> Non
         # ролик удалён, идущая прямая трансляция. В лог пишем как WARNING
         # (это не баг бота — мы физически не имеем доступа к ролику),
         # пользователю шлём человеческую причину.
-        reason = _classify_youtube_download_error(exc)
+        reason = _classify_youtube_download_error(exc, job.lang)
         download_duration = time.monotonic() - download_started
         logger.warning(
             "transcription_queue.audio_download.failed sequence=%s url=%s duration_sec=%.1f reason=%r error=%s",
@@ -662,7 +662,7 @@ async def _process_transcription_job(job: SummaryJob, services: Services) -> Non
     )
 
     await _set_service_status(
-        services, job.message, "Распознаю аудио через Groq Whisper Large v3 Turbo...", job=job
+        services, job.message, t("status.transcribing", job.lang), job=job
     )
 
     try:
@@ -674,7 +674,7 @@ async def _process_transcription_job(job: SummaryJob, services: Services) -> Non
         )
         await _send_transcription_failure(
             services, job,
-            f"Groq Whisper недоступен: {exc}",
+            t("error.groq_unavailable", job.lang, error=exc),
         )
         _cleanup_audio_file(audio_path)
         return
@@ -682,7 +682,7 @@ async def _process_transcription_job(job: SummaryJob, services: Services) -> Non
         logger.exception("transcription_queue.groq_failed sequence=%s", job.sequence)
         await _send_transcription_failure(
             services, job,
-            f"Ошибка распознавания на Groq: {exc}",
+            t("error.groq_failed", job.lang, error=exc),
         )
         _cleanup_audio_file(audio_path)
         return
@@ -696,7 +696,7 @@ async def _process_transcription_job(job: SummaryJob, services: Services) -> Non
             job.sequence, job.url,
         )
         await _send_transcription_failure(
-            services, job, "Groq вернул пустой транскрипт."
+            services, job, t("error.groq_empty", job.lang)
         )
         return
 
@@ -718,7 +718,7 @@ async def _process_transcription_job(job: SummaryJob, services: Services) -> Non
 
     await _set_service_status(
         services, job.message,
-        "Распознавание завершено. Возвращаю в очередь summary...", job=job,
+        t("status.transcribe_done", job.lang), job=job,
     )
 
     async with services.summary_queue_lock:
@@ -757,12 +757,12 @@ async def _send_transcription_failure(services: Services, job: SummaryJob, reaso
     После доставки финального сообщения чистим зависший status («Скачиваю
     аудио…» / «Распознаю…») — иначе у пользователя в чате висят сразу два
     сообщения: бесполезный статус и наш текст с причиной.
+
+    {link} — как в error.generation_failed — собирается ДО подстановки в
+    шаблон; здесь это plain-URL (title у транскрипционного отказа не всегда
+    известен, сообщение уходит без parse_mode).
     """
-    text = (
-        f"Не удалось получить транскрипт ролика.\n\n"
-        f"Причина: {reason}\n\n"
-        f"Ссылка: {job.url}"
-    )
+    text = t("error.transcript_failed", job.lang, reason=reason, link=job.url)
     try:
         if job.message is not None and not job.scheduled:
             await job.message.answer(text)
@@ -784,67 +784,26 @@ async def _send_transcription_failure(services: Services, job: SummaryJob, reaso
     # так что это и есть финализация статуса в БД.
     if services.job_store and job.db_id:
         services.job_store.set_status(job.db_id, "failed")
-# Подстроки → человеческая причина. Сравнение case-insensitive, на сообщении
-# исключения. Если ничего не подошло — отдадим первые 200 символов исходной
-# ошибки, чтобы не молчать.
+# Подстроки → ключ локали (ytdlp.*) с человеческой причиной. Сравнение
+# case-insensitive, на сообщении исключения. Если ничего не подошло — отдадим
+# первые 200 символов исходной ошибки, чтобы не молчать (ytdlp.download_failed).
 _YT_DLP_ERROR_HINTS: tuple[tuple[str, str], ...] = (
-    (
-        "members-only",
-        "Видео доступно только подписчикам канала (members-only). "
-        "Без аутентификации бот его не обработает.",
-    ),
-    (
-        "join this channel to get access",
-        "Видео доступно только подписчикам канала (members-only). "
-        "Без аутентификации бот его не обработает.",
-    ),
-    (
-        "private video",
-        "Ролик помечен как Private. Доступен только тем, у кого есть прямая ссылка-приглашение от автора.",
-    ),
-    (
-        "video unavailable",
-        "Ролик недоступен (удалён автором, заблокирован правообладателем или скрыт в этом регионе).",
-    ),
-    (
-        "removed by the uploader",
-        "Ролик удалён автором.",
-    ),
-    (
-        "this video has been removed",
-        "Ролик удалён с YouTube.",
-    ),
-    (
-        "sign in to confirm your age",
-        "Ролик с возрастным ограничением — YouTube требует логин. Бот его не обработает.",
-    ),
-    (
-        "sign in to confirm you",
-        "YouTube требует логин для просмотра (anti-bot или возрастная проверка). Бот не пройдёт.",
-    ),
-    (
-        "geo restricted",
-        "Ролик заблокирован в регионе, из которого работает бот.",
-    ),
-    (
-        "blocked it in your country",
-        "Ролик заблокирован правообладателем в регионе бота.",
-    ),
-    (
-        "live event",
-        "Это идущая прямая трансляция — её нельзя суммаризировать, пока не закончится.",
-    ),
-    (
-        "premiere",
-        "Это премьера, которая ещё не началась — ролика как такового пока нет.",
-    ),
-    (
-        "this live stream recording is not available",
-        "Запись прямой трансляции недоступна.",
-    ),
+    ("members-only", "ytdlp.members_only"),
+    ("join this channel to get access", "ytdlp.members_only"),
+    ("private video", "ytdlp.private"),
+    ("video unavailable", "ytdlp.unavailable"),
+    ("removed by the uploader", "ytdlp.removed_by_uploader"),
+    ("this video has been removed", "ytdlp.removed"),
+    ("sign in to confirm your age", "ytdlp.age_restricted"),
+    ("sign in to confirm you", "ytdlp.sign_in_required"),
+    ("geo restricted", "ytdlp.geo_restricted"),
+    ("blocked it in your country", "ytdlp.geo_blocked"),
+    ("live event", "ytdlp.live_event"),
+    ("premiere", "ytdlp.premiere_not_started"),
+    ("this live stream recording is not available", "ytdlp.stream_recording_unavailable"),
 )
-def _classify_youtube_download_error(exc: Exception) -> str:
-    """Map a yt-dlp exception to a friendly Russian reason for the user.
+def _classify_youtube_download_error(exc: Exception, lang: str = "ru") -> str:
+    """Map a yt-dlp exception to a friendly localized reason for the user.
 
     yt-dlp валит сразу в две слоя: ``ExtractorError`` (отказ на этапе
     разбора метаданных, например ``raise_no_formats``) и ``DownloadError``
@@ -853,15 +812,15 @@ def _classify_youtube_download_error(exc: Exception) -> str:
     """
     raw = str(exc) or exc.__class__.__name__
     lowered = raw.lower()
-    for needle, hint in _YT_DLP_ERROR_HINTS:
+    for needle, key in _YT_DLP_ERROR_HINTS:
         if needle in lowered:
-            return hint
+            return t(key, lang)
     # Никакой known-pattern не подошёл — отдадим обрезанный raw, всё-таки
     # это сообщение от yt-dlp, обычно осмысленное.
     snippet = raw.strip().replace("\n", " ")
     if len(snippet) > 200:
         snippet = snippet[:197].rstrip() + "..."
-    return f"yt-dlp не смог скачать аудио: {snippet}"
+    return t("ytdlp.download_failed", lang, snippet=snippet)
 async def _download_audio_to_chat(
     callback: CallbackQuery,
     video_id: str,

@@ -217,7 +217,7 @@ def _format_top_comment_line(top_comment: VideoComment, available_chars: int, la
     if available_chars <= 0:
         return ""
 
-    likes_label = _format_likes(top_comment.like_count)
+    likes_label = _format_likes(top_comment.like_count, lang)
     prefix = t("summary.top_comment", lang, likes=likes_label)
     open_quote = prefix[-1] if prefix else "«"
     close_quote = _QUOTE_PAIRS.get(open_quote, "»")
@@ -249,13 +249,18 @@ def _fit_escaped_text(text: str, max_chars: int) -> str:
         else:
             high = mid - 1
     return best or ellipsis[:max_chars]
-def _format_likes(count: int) -> str:
-    """Render like count with proper Russian declension: '1 лайк' / '2 лайка' / '5 лайков'.
+def _format_likes(count: int, lang: str = "ru") -> str:
+    """Render like count: ru — proper declension '1 лайк' / '2 лайка' / '5 лайков',
+    other languages — 'summary.likes' locale key ('{count} likes').
 
     Once we cross a thousand, we collapse the number to a compact ``1.2к`` /
     ``12к`` form because (a) it's easier on the eye in chat, and (b) once the
-    counter is big the exact number stops being interesting.
+    counter is big the exact number stops being interesting. Same pattern as
+    ``_format_elapsed_minutes``: ru keeps its declension logic verbatim.
     """
+    if lang != "ru":
+        label = _format_compact_count(count, lang) if count >= 1000 else str(count)
+        return t("summary.likes", lang, count=label)
     if count >= 1000:
         return f"{_format_compact_count(count)} лайков"
     last_two = count % 100
@@ -269,17 +274,23 @@ def _format_likes(count: int) -> str:
     else:
         word = "лайков"
     return f"{count} {word}"
-def _format_compact_count(count: int) -> str:
-    """Compact thousands/millions: 1500 → '1.5к', 12500 → '12к', 1_500_000 → '1.5м'."""
+def _format_compact_count(count: int, lang: str = "ru") -> str:
+    """Compact thousands/millions: 1500 → '1.5к', 12500 → '12к', 1_500_000 → '1.5м'.
+
+    Суффикс локализуется минимально: кириллические «к»/«м» только для ru,
+    остальные языки получают латинские K/M (общепринятые и для fa/ar/id,
+    где числа по Global Constraints — западные).
+    """
+    thousands_suffix, millions_suffix = ("к", "м") if lang == "ru" else ("K", "M")
     if count < 1000:
         return str(count)
     if count < 1_000_000:
         if count < 10_000:
             value = round(count / 1000, 1)
-            return f"{value:g}к"  # 1к, 1.2к, 9.9к
-        return f"{count // 1000}к"
+            return f"{value:g}{thousands_suffix}"  # 1к, 1.2к, 9.9к
+        return f"{count // 1000}{thousands_suffix}"
     value = round(count / 1_000_000, 1)
-    return f"{value:g}м"
+    return f"{value:g}{millions_suffix}"
 async def _send_summary_delivery(
     services: Services,
     job: SummaryJob,
