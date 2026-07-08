@@ -259,6 +259,8 @@ def _format_likes(count: int, lang: str = "ru") -> str:
     ``_format_elapsed_minutes``: ru keeps its declension logic verbatim.
     """
     if lang != "ru":
+        if count == 1:
+            return t("summary.likes_one", lang, count=count)
         label = _format_compact_count(count, lang) if count >= 1000 else str(count)
         return t("summary.likes", lang, count=label)
     if count >= 1000:

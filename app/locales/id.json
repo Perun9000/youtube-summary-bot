@@ -59,6 +59,7 @@
   "subscribe.unlimited_already": "Anda sudah memiliki akses tak terbatas 🎉",
   "summary.about": "<b>Tentang apa videonya:</b>",
   "summary.likes": "{count} suka",
+  "summary.likes_one": "{count} suka",
   "summary.made_by": "<i>dibuat oleh @{username}</i>",
   "summary.new_video": "Video baru",
   "summary.new_video_channel": "Video baru di kanal {channel}",

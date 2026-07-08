@@ -59,6 +59,7 @@
   "subscribe.unlimited_already": "Você já tem acesso ilimitado 🎉",
   "summary.about": "<b>Sobre o que é:</b>",
   "summary.likes": "{count} curtidas",
+  "summary.likes_one": "{count} curtida",
   "summary.made_by": "<i>feito por @{username}</i>",
   "summary.new_video": "Novo vídeo",
   "summary.new_video_channel": "Novo vídeo no canal {channel}",

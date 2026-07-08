@@ -59,6 +59,7 @@
   "subscribe.unlimited_already": "You already have unlimited access 🎉",
   "summary.about": "<b>What it's about:</b>",
   "summary.likes": "{count} likes",
+  "summary.likes_one": "{count} like",
   "summary.made_by": "<i>made by @{username}</i>",
   "summary.new_video": "New video",
   "summary.new_video_channel": "New video on channel {channel}",

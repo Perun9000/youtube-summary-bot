@@ -59,6 +59,7 @@
   "subscribe.unlimited_already": "از قبل دسترسی نامحدود داری 🎉",
   "summary.about": "<b>موضوع ویدیو:</b>",
   "summary.likes": "{count} لایک",
+  "summary.likes_one": "{count} لایک",
   "summary.made_by": "<i>ساخته‌شده توسط @{username}</i>",
   "summary.new_video": "ویدیوی جدید",
   "summary.new_video_channel": "ویدیوی جدید در کانال {channel}",

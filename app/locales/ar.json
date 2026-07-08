@@ -59,6 +59,7 @@
   "subscribe.unlimited_already": "لديك بالفعل وصول غير محدود 🎉",
   "summary.about": "<b>عن ماذا الفيديو:</b>",
   "summary.likes": "{count} إعجاب",
+  "summary.likes_one": "{count} إعجاب",
   "summary.made_by": "<i>بواسطة @{username}</i>",
   "summary.new_video": "فيديو جديد",
   "summary.new_video_channel": "فيديو جديد على قناة {channel}",
