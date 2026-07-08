@@ -25,12 +25,13 @@ class JobStore:
         scheduled: bool,
         disable_notification: bool,
         title_hint: str | None,
+        lang: str = "ru",
     ) -> int:
         now = time.time()
         return self._db.execute_returning_rowid(
-            "INSERT INTO jobs(url, chat_id, scheduled, disable_notification, title_hint, status, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)",
-            (url, chat_id, int(scheduled), int(disable_notification), title_hint, now, now),
+            "INSERT INTO jobs(url, chat_id, scheduled, disable_notification, title_hint, status, created_at, updated_at, lang) "
+            "VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
+            (url, chat_id, int(scheduled), int(disable_notification), title_hint, now, now, lang),
         )
 
     def set_status(self, job_id: int, status: str) -> None:

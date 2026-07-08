@@ -7,6 +7,7 @@
   "error.heavy_quota": "este vídeo não tem legendas e dura mais de uma hora — essa geração consome 2 unidades da cota, e restam {remaining}. Assine: /subscribe",
   "error.service_budget": "O serviço esgotou temporariamente seu orçamento diário de gerações. Tente mais tarde.",
   "error.temporary_overload": "a geração está temporariamente indisponível (sobrecarga dos modelos). Tente novamente em alguns minutos.",
+  "error.unknown_reason": "erro desconhecido",
   "help.external_extra": "/subscribe - assinatura\n/paysupport - questões de pagamento\n\nGrátis: {starter} resumos para começar, depois {weekly} por semana. Assinatura {price} ⭐/mês — {monthly} resumos por mês: /subscribe. Cota restante: /limits.",
   "help.public": "Comandos disponíveis:\n/start - começar\n/help - ajuda\n/last - últimos 20 resumos\n/limits - cota restante\n\nMe envie o link de um vídeo do YouTube — vou responder aqui com um resumo curto e publicar o desenvolvimento completo no Telegra.ph.",
   "lang.changed": "Idioma alterado para: {name}",

@@ -7,6 +7,7 @@
   "error.heavy_quota": "this video has no captions and is longer than an hour — that generation costs 2 quota units, and you have {remaining} left. Subscribe: /subscribe",
   "error.service_budget": "The service has temporarily used up its daily generation budget. Please try again later.",
   "error.temporary_overload": "generation is temporarily unavailable (model overload). Please try again in a few minutes.",
+  "error.unknown_reason": "unknown error",
   "help.external_extra": "/subscribe - subscription\n/paysupport - billing questions\n\nFree: {starter} summaries to start, then {weekly} per week. Subscription {price} ⭐/mo — {monthly} summaries a month: /subscribe. Remaining quota: /limits.",
   "help.public": "Available commands:\n/start - get started\n/help - help\n/last - last 20 summaries\n/limits - remaining quota\n\nSend me a YouTube video link — I'll reply here with a short summary and publish the full writeup to Telegra.ph.",
   "lang.changed": "Language switched to: {name}",

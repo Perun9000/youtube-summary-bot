@@ -7,6 +7,7 @@
   "error.heavy_quota": "este vídeo no tiene subtítulos y dura más de una hora — esa generación consume 2 unidades de la cuota, y te quedan {remaining}. Suscríbete: /subscribe",
   "error.service_budget": "El servicio agotó temporalmente su presupuesto diario de generaciones. Inténtalo más tarde.",
   "error.temporary_overload": "la generación no está disponible temporalmente (sobrecarga de modelos). Inténtalo de nuevo en unos minutos.",
+  "error.unknown_reason": "error desconocido",
   "help.external_extra": "/subscribe - suscripción\n/paysupport - preguntas de facturación\n\nGratis: {starter} resúmenes para empezar, luego {weekly} por semana. Suscripción {price} ⭐/mes — {monthly} resúmenes al mes: /subscribe. Cuota restante: /limits.",
   "help.public": "Comandos disponibles:\n/start - empezar\n/help - ayuda\n/last - últimos 20 resúmenes\n/limits - cuota restante\n\nEnvíame un enlace de vídeo de YouTube — te responderé aquí con un resumen breve y publicaré el desarrollo completo en Telegra.ph.",
   "lang.changed": "Idioma cambiado a: {name}",

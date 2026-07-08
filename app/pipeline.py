@@ -11,6 +11,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, FSInputFile
 
 from app.groq_whisper_service import GroqWhisperUnavailable
+from app.i18n import t
 from app.llm_client import (
     FREE_CHAIN_EXHAUSTED_MARKER,
     OPENROUTER_BUDGET_EXCEEDED_MARKER,
@@ -75,18 +76,10 @@ def _user_facing_error_reason(exc: Exception, job: SummaryJob, services) -> str:
             and services.billing.is_subscriber(job.quota_user_id)
         )
         if is_sub:
-            return (
-                "генерация временно недоступна (перегрузка моделей). "
-                "Попробуй ещё раз через несколько минут."
-            )
-        return (
-            "дневной лимит бесплатных генераций сервиса исчерпан. "
-            "Попробуй после 03:00 МСК или оформи подписку — /subscribe"
-        )
+            return t("error.temporary_overload", job.lang)
+        return t("error.daily_free_limit", job.lang)
     if OPENROUTER_BUDGET_EXCEEDED_MARKER in reason:
-        return (
-            "сервис временно исчерпал дневной бюджет генераций. Попробуй позже."
-        )
+        return t("error.service_budget", job.lang)
     return reason
 
 
@@ -154,10 +147,7 @@ async def _defer_premiere_job(
         await _send_summary_delivery(
             services=services,
             job=job,
-            text=(
-                f"Ролик {title_link} — премьера, он ещё не вышел. "
-                "Пришли ссылку ещё раз после выхода."
-            ),
+            text=t("premiere.no_store", job.lang, title_link=title_link),
         )
         await _delete_service_status(services, job.chat_id)
         return
@@ -173,15 +163,18 @@ async def _defer_premiere_job(
     )
 
     if release_ts:
-        text = (
-            f"Это премьера: ролик {title_link} выйдет {_format_local_time(services, release_ts)}. "
-            f"Вернусь с саммари примерно в {_format_local_time(services, run_after)} — "
-            f"через {services.settings.premiere_delay_hours} ч после выхода."
+        text = t(
+            "premiere.deferred", job.lang,
+            title_link=title_link,
+            release=_format_local_time(services, release_ts),
+            return_time=_format_local_time(services, run_after),
+            hours=services.settings.premiere_delay_hours,
         )
     else:
-        text = (
-            f"Ролик {title_link} — премьера, время выхода определить не удалось. "
-            f"Попробую сделать саммари в {_format_local_time(services, run_after)}."
+        text = t(
+            "premiere.unknown_release", job.lang,
+            title_link=title_link,
+            return_time=_format_local_time(services, run_after),
         )
     await _send_summary_delivery(services=services, job=job, text=text)
     await _delete_service_status(services, job.chat_id)
@@ -210,7 +203,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             await _deliver_cached_summary_for_job(job, services, cached)
             return
 
-    await _set_service_status(services, message, "Получаю данные ролика...", job=job)
+    await _set_service_status(services, message, t("status.fetching", job.lang), job=job)
     try:
         video_id = extract_video_id(url)
         logger.info(
@@ -263,7 +256,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             )
         else:
             try:
-                await _set_service_status(services, message, "Пробую получить готовые субтитры YouTube...", job=job)
+                await _set_service_status(services, message, t("status.captions", job.lang), job=job)
                 stage_started = time.monotonic()
                 segments = await asyncio.to_thread(services.youtube.fetch_transcript, video_id)
                 transcript_source = "youtube"
@@ -294,20 +287,18 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                     verdict = services.quota.check(job.quota_user_id, weight=2)
                     if not verdict.allowed:
                         raise RuntimeError(
-                            "у ролика нет субтитров, и он длиннее часа — такая "
-                            "генерация списывает 2 единицы лимита, а осталось "
-                            f"{verdict.remaining}. Подписка: /subscribe"
+                            t("error.heavy_quota", job.lang, remaining=verdict.remaining)
                         )
                     job.usage_weight = 2
                     await _set_service_status(
                         services, message,
-                        "Ролик без субтитров и длиннее часа — спишется 2 генерации.",
+                        t("status.heavy_charge", job.lang),
                         job=job,
                     )
                 await _set_service_status(
                     services,
                     message,
-                    "Субтитры недоступны. Отправляю в очередь распознавания через Groq Whisper...",
+                    t("status.transcribe_queue", job.lang),
                     job=job,
                 )
                 job.routed_to_transcription = True
@@ -398,7 +389,8 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
         if job.quota_user_id is not None:
             logger.info("job.llm_route job_id=%s route=%s", job_id, llm_route)
 
-        await _set_service_status(services, message, f"Генерирую summary через {services.llm.provider_name}...", job=job)
+        generating_text = t("status.generating", job.lang, provider=services.llm.provider_name)
+        await _set_service_status(services, message, generating_text, job=job)
         summary = await _run_with_telegram_status(
             services=services,
             source_message=message,
@@ -414,7 +406,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                 host_hint=host_hint,
                 llm_route=llm_route,
             ),
-            base_text=f"Генерирую summary через {services.llm.provider_name}...",
+            base_text=generating_text,
             job=job,
         )
 
@@ -432,7 +424,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
 
         if not comments_task.done():
             await _set_service_status(
-                services, message, "Дожидаюсь топ-комментариев...", job=job
+                services, message, t("status.waiting_comments", job.lang), job=job
             )
         try:
             top_comments = await comments_task
@@ -442,7 +434,8 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             logger.warning("job.comments.await_failed job_id=%s error=%s", job_id, exc)
             top_comments = []
 
-        await _set_service_status(services, message, "Публикую полный конспект в Telegra.ph...", job=job)
+        publishing_text = t("status.publishing", job.lang)
+        await _set_service_status(services, message, publishing_text, job=job)
         try:
             telegraph_url = await _run_with_telegram_status(
                 services=services,
@@ -453,7 +446,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                     summary=summary,
                     top_comments=top_comments,
                 ),
-                base_text="Публикую полный конспект в Telegra.ph...",
+                base_text=publishing_text,
                 job=job,
             )
         except Exception:
@@ -501,6 +494,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                 expert_matches=job.expert_matches,
                 top_comment=top_comments[0] if top_comments else None,
                 bot_username=services.bot_username,
+                lang=job.lang,
             )
             await _send_summary_delivery(
                 services=services,
@@ -586,7 +580,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
     except asyncio.CancelledError:
         logger.info("job.cancelled job_id=%s video_id=%s duration_sec=%.1f", job_id, video_id, time.monotonic() - started)
         try:
-            await _set_service_status(services, message, "Генерация summary остановлена.", job=job)
+            await _set_service_status(services, message, t("status.stopped", job.lang), job=job)
         except TelegramBadRequest as exc:
             if "message is not modified" not in str(exc).lower():
                 logger.warning("progress.edit.failed error=%s", exc)
@@ -594,7 +588,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
         raise
     except Exception as exc:
         logger.exception("job.failed job_id=%s video_id=%s duration_sec=%.1f", job_id, video_id, time.monotonic() - started)
-        await _set_service_status(services, message, "Генерация summary прервана.", job=job)
+        await _set_service_status(services, message, t("status.interrupted", job.lang), job=job)
         await _send_summary_delivery(
             services=services,
             job=job,
@@ -602,6 +596,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                 video_url=url,
                 title=title,
                 reason=_user_facing_error_reason(exc, job, services),
+                lang=job.lang,
             ),
         )
         _forget_service_status(services, chat_id)

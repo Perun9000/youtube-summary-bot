@@ -73,6 +73,12 @@ class SummaryJob:
     # Вес списания: 1 обычный ролик, 2 — тяжёлый (Groq-транскрипция, ≥1 ч).
     # Выставляется в pipeline, когда выясняется источник транскрипта.
     usage_weight: int = 1
+    # Язык, на котором нужно говорить с получателем (статусы, саммари,
+    # ошибки). Резолвится при постановке в очередь (_msg_lang) и едет вместе
+    # с job'ом — pipeline/delivery/status_messages читают job.lang, а не
+    # резолвят язык заново. Scheduled-задачи мониторинга — всегда "ru"
+    # (owner-контекст).
+    lang: str = "ru"
 @dataclass
 class Services:
     settings: Settings

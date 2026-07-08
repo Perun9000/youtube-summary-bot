@@ -13,6 +13,7 @@ from aiogram.types import (
 )
 
 from app.digest_service import DigestEntry, update_pin_for_user
+from app.i18n import t
 from app.morning_digest import MorningDigestItem
 from app.summary_cache import CachedSummary
 from app.tags_catalog import TagsCatalog
@@ -44,16 +45,17 @@ def _format_telegram_summary(
     expert_matches: list[str] | None = None,
     top_comment: VideoComment | None = None,
     bot_username: str | None = None,
+    lang: str = "ru",
 ) -> str:
     if channel_name and channel_url:
-        channel_line = (
-            f'Новое видео на канале <a href="{escape_html(channel_url)}">'
-            f"{escape_html(channel_name)}</a>"
+        channel_line = t(
+            "summary.new_video_channel_link", lang,
+            url=escape_html(channel_url), channel=escape_html(channel_name),
         )
     elif channel_name:
-        channel_line = f"Новое видео на канале {escape_html(channel_name)}"
+        channel_line = t("summary.new_video_channel", lang, channel=escape_html(channel_name))
     else:
-        channel_line = "Новое видео"
+        channel_line = t("summary.new_video", lang)
 
     title_line = f'<b><a href="{escape_html(video_url)}">{escape_html(title)}</a></b>'
 
@@ -69,8 +71,8 @@ def _format_telegram_summary(
         else:
             segment_line = f"<i>Фрагмент ролика: {escape_html(spans_text)}</i>"
 
-    overview_line = f"<b>О чем видео:</b>\n{escape_html(summary.overview)}"
-    reading_line = f"Время чтения: {_estimate_reading_time_minutes(summary)} мин"
+    overview_line = f"{t('summary.about', lang)}\n{escape_html(summary.overview)}"
+    reading_line = t("summary.reading_time", lang, minutes=_estimate_reading_time_minutes(summary))
 
     # Ссылка на полный конспект живёт и в inline-кнопке (_build_summary_keyboard),
     # и в теле сообщения: кнопка при пересылке сообщения не сохраняется,
@@ -79,7 +81,7 @@ def _format_telegram_summary(
     telegraph_line = ""
     if telegraph_url:
         telegraph_line = (
-            f'🔮 <a href="{escape_html(telegraph_url)}">подробное саммари</a>'
+            f'🔮 <a href="{escape_html(telegraph_url)}">{t("btn.details", lang)}</a>'
         )
 
     blocks = [channel_line, title_line]
@@ -96,7 +98,7 @@ def _format_telegram_summary(
     # Подпись со ссылкой на бота. Именно @-упоминание видимым текстом (а не
     # <a href> на слове): при копировании текста сообщения в комментарии
     # Telegram href теряется, а @mention остаётся и авто-линкуется.
-    signature_line = f"<i>сделано @{bot_username}</i>" if bot_username else ""
+    signature_line = t("summary.made_by", lang, username=bot_username) if bot_username else ""
 
     if top_comment is not None:
         base_text = "\n\n".join(blocks)
@@ -105,7 +107,7 @@ def _format_telegram_summary(
         available_chars = (
             MAX_TELEGRAM_MESSAGE_CHARS - len(base_text) - separator_len - signature_cost
         )
-        top_comment_line = _format_top_comment_line(top_comment, available_chars)
+        top_comment_line = _format_top_comment_line(top_comment, available_chars, lang)
         if top_comment_line:
             blocks.append(top_comment_line)
 
@@ -206,13 +208,20 @@ def _normalize_channel_simple(channel_name: str) -> str:
         return ""
     s = "_".join(s.split())
     return s[:1].upper() + s[1:]
-def _format_top_comment_line(top_comment: VideoComment, available_chars: int) -> str:
+# Пары открывающих/закрывающих кавычек по локали (см. summary.top_comment):
+# ru/ar/fa используют «елочки», остальные локали — типографские “ ”.
+_QUOTE_PAIRS: dict[str, str] = {"«": "»", "“": "”", '"': '"'}
+
+
+def _format_top_comment_line(top_comment: VideoComment, available_chars: int, lang: str = "ru") -> str:
     if available_chars <= 0:
         return ""
 
     likes_label = _format_likes(top_comment.like_count)
-    prefix = f"💬 <i>Топ-комментарий ({likes_label}):\n«"
-    suffix = "»</i>"
+    prefix = t("summary.top_comment", lang, likes=likes_label)
+    open_quote = prefix[-1] if prefix else "«"
+    close_quote = _QUOTE_PAIRS.get(open_quote, "»")
+    suffix = f"{close_quote}</i>"
     max_body_chars = min(TOP_COMMENT_MAX_CHARS, max(0, available_chars - len(prefix) - len(suffix)))
     if max_body_chars <= 0:
         return ""
@@ -284,13 +293,14 @@ async def _send_summary_delivery(
     with disable_notification=True so the user isn't pinged overnight.
 
     Attaches an inline keyboard:
-      • «📄 Саммари» → Telegra.ph URL (visible to everyone if telegraph_url is set),
-      • «Скачать аудио» → owner-only callback (visible only when recipient is owner).
+      • «📄 Транскрипт (md)» + «Скачать аудио» (owner-only) — top row,
+      • «подробное саммари» → Telegra.ph URL — full-width bottom row.
     """
     reply_markup = _build_summary_keyboard(
         telegraph_url=telegraph_url,
         video_id=video_id,
         is_owner=_job_is_owner(job, services),
+        lang=job.lang,
     )
     if job.message is not None and not job.scheduled:
         await job.message.answer(
@@ -322,42 +332,41 @@ def _build_summary_keyboard(
     telegraph_url: str | None,
     video_id: str | None,
     is_owner: bool,
+    lang: str = "ru",
 ) -> InlineKeyboardMarkup | None:
     """Собрать inline-клавиатуру под финальным саммари.
 
-    Первые две кнопки идут в один ряд (Telegram сам сожмёт по ширине экрана):
-      1. «подробное саммари» — ссылка на Telegra.ph. Видна всем.
-      2. «Скачать аудио» — owner-only, callback на транскрипцию/отправку файла.
-    Третья кнопка — отдельным рядом:
-      3. «Транскрипт (md)» — callback, доступ проверяется в хендлере
+    Ряд 1 (верхний, в одну строку) — если есть video_id:
+      1. «📄 Транскрипт (md)» — callback, доступ проверяется в хендлере
          (allowlist и подписчики); видна всем, чтобы не выдавать статус
          подписки видимостью кнопки.
+      2. «Скачать аудио» — owner-only, callback на транскрипцию/отправку файла.
+         Owner-поверхность — не локализуется.
+    Ряд 2 (нижний, во всю ширину) — если есть telegraph_url:
+      3. «подробное саммари» — ссылка на Telegra.ph. Видна всем.
 
-    Возвращаем None, если ни одна кнопка не применима (нет telegraph_url,
-    получатель не owner и нет video_id) — тогда саммари уходит вообще без
-    клавиатуры.
+    Возвращаем None, если ни одна кнопка не применима (нет telegraph_url и
+    нет video_id) — тогда саммари уходит вообще без клавиатуры.
     """
-    row: list[InlineKeyboardButton] = []
-    if telegraph_url:
-        row.append(
-            InlineKeyboardButton(text="подробное саммари", url=telegraph_url)
-        )
-    if is_owner and video_id:
-        row.append(
-            InlineKeyboardButton(
-                text="Скачать аудио",
-                callback_data=f"download:{video_id}",
-            )
-        )
     rows: list[list[InlineKeyboardButton]] = []
-    if row:
-        rows.append(row)
     if video_id:
-        rows.append([
+        row: list[InlineKeyboardButton] = [
             InlineKeyboardButton(
-                text="📄 Транскрипт (md)",
+                text=t("btn.transcript", lang),
                 callback_data=f"transcript:{video_id}",
             )
+        ]
+        if is_owner:
+            row.append(
+                InlineKeyboardButton(
+                    text="Скачать аудио",
+                    callback_data=f"download:{video_id}",
+                )
+            )
+        rows.append(row)
+    if telegraph_url:
+        rows.append([
+            InlineKeyboardButton(text=t("btn.details", lang), url=telegraph_url)
         ])
     if not rows:
         return None
@@ -384,6 +393,7 @@ def _format_cached_summary_text(
     cached: CachedSummary,
     override_top_comments: list[VideoComment] | None = None,
     bot_username: str | None = None,
+    lang: str = "ru",
 ) -> str:
     """Render the cached summary identically to a fresh delivery — no header
     or "this is cached" marker. From the user's perspective, sending a link a
@@ -407,6 +417,7 @@ def _format_cached_summary_text(
         channel_url=cached.channel_url,
         top_comment=comments[0] if comments else None,
         bot_username=bot_username,
+        lang=lang,
     )
 async def _refresh_cached_comments(
     cached: CachedSummary, services: Services, source_label: str
@@ -505,15 +516,18 @@ async def _send_cached_summary_to_chat(
     services: Services,
 ) -> None:
     """Manual flow: respond to a user message with cached summary."""
+    from app.bot_handlers import _msg_lang  # local: избегаем цикла bot_handlers<->delivery
+    lang = _msg_lang(message, services)
     fresh_comments = await _refresh_cached_comments(cached, services, source_label="manual")
     text = _format_cached_summary_text(
-        cached, override_top_comments=fresh_comments, bot_username=services.bot_username,
+        cached, override_top_comments=fresh_comments, bot_username=services.bot_username, lang=lang,
     )
     user_id = _message_user_id(message)
     reply_markup = _build_summary_keyboard(
         telegraph_url=cached.telegraph_url,
         video_id=cached.video_id,
         is_owner=user_id is not None and services.users.is_owner(user_id),
+        lang=lang,
     )
     await message.answer(
         text,
@@ -541,7 +555,7 @@ async def _send_cached_summary_to_chat(
             channel_name=cached.channel_name or "",
             created_at_unix=cached.created_at_unix or time.time(),
         )
-async def _send_quota_denied(message: Message, services: Services, verdict) -> None:
+async def _send_quota_denied(message: Message, services: Services, verdict, lang: str = "ru") -> None:
     """Отказ по квоте + кнопка оформления подписки.
 
     callback 'subscribe' обрабатывается в bot_handlers (шлёт Stars-инвойс) —
@@ -552,21 +566,16 @@ async def _send_quota_denied(message: Message, services: Services, verdict) -> N
         services.analytics.record(user_id, "quota_denied", detail=verdict.deny_reason)
     s = services.settings
     if verdict.deny_reason == "monthly_exhausted":
-        text = (
-            f"Лимит подписки на месяц исчерпан ({s.quota_sub_monthly} саммари). "
-            "Новые генерации станут доступны по мере «оттаивания» окна 30 дней — /limits."
-        )
+        text = t("quota.denied.monthly", lang, monthly=s.quota_sub_monthly)
         await message.answer(text)
         return
-    text = (
-        "Бесплатный лимит на эту неделю исчерпан.\n\n"
-        f"Подписка — {s.subscription_price_stars} ⭐/мес: "
-        f"{s.quota_sub_monthly} саммари в месяц, автопродление, отмена в любой момент.\n"
-        "Остаток лимитов: /limits."
+    text = t(
+        "quota.denied.weekly", lang,
+        price=s.subscription_price_stars, monthly=s.quota_sub_monthly,
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
-            text=f"Оформить подписку — {s.subscription_price_stars} ⭐",
+            text=t("quota.subscribe_button", lang, price=s.subscription_price_stars),
             callback_data="subscribe",
         )
     ]])
@@ -595,6 +604,7 @@ async def _deliver_cached_summary_for_job(
         fresh_comments = await _refresh_cached_comments(cached, services, source_label="job")
         text = _format_cached_summary_text(
             cached, override_top_comments=fresh_comments, bot_username=services.bot_username,
+            lang=job.lang,
         )
         await _send_summary_delivery(
             services=services,
@@ -676,13 +686,16 @@ def _save_summary_to_cache(
         tag_channel=summary.tags.channel,
     )
     services.summary_cache.put(entry)
-def _format_generation_error(video_url: str, title: str, reason: str) -> str:
+def _format_generation_error(video_url: str, title: str, reason: str, lang: str = "ru") -> str:
     label = title.strip() or video_url
-    reason_text = reason.strip() or "неизвестная ошибка"
-    return (
-        f'генерация саммари для видео <a href="{escape_html(video_url)}">'
-        f"{escape_html(label)}</a> прервана.\n\n"
-        f"Причина: {escape_html(reason_text)}"
+    if video_url:
+        link = f'<a href="{escape_html(video_url)}">{escape_html(label)}</a>'
+    else:
+        link = escape_html(label)
+    reason_text = reason.strip() or t("error.unknown_reason", lang)
+    return t(
+        "error.generation_failed", lang,
+        link=link, reason=escape_html(reason_text),
     )[:4000]
 def _estimate_reading_time_minutes(summary: Summary) -> int:
     parts: list[str] = [summary.overview]

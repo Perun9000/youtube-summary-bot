@@ -68,7 +68,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     status TEXT NOT NULL DEFAULT 'queued',
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
-    run_after REAL
+    run_after REAL,
+    lang TEXT NOT NULL DEFAULT 'ru'
 );
 CREATE TABLE IF NOT EXISTS morning_digest_items (
     video_id TEXT PRIMARY KEY,
@@ -130,6 +131,13 @@ class Database:
             try:
                 self._conn.execute("ALTER TABLE jobs ADD COLUMN run_after REAL")
                 logger.info("db.migrate jobs.run_after added")
+            except sqlite3.OperationalError:
+                pass  # колонка уже есть
+            # Миграция для баз, созданных до появления SummaryJob.lang: язык
+            # задачи едет вместе с job'ом (см. app/services_container.py).
+            try:
+                self._conn.execute("ALTER TABLE jobs ADD COLUMN lang TEXT NOT NULL DEFAULT 'ru'")
+                logger.info("db.migrate jobs.lang added")
             except sqlite3.OperationalError:
                 pass  # колонка уже есть
             self._conn.commit()
