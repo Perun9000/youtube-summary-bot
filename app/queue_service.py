@@ -36,7 +36,7 @@ async def _enqueue_summary_job(message: Message, url: str, services: Services) -
     try:
         # Cache hit fast-path: если по этому ролику уже было саммари, отдаём его
         # сразу, не занимая очередь и не дёргая LLM/Whisper.
-        cached = _lookup_cached_summary(url, services)
+        cached = _lookup_cached_summary(url, services, lang=lang)
         if cached is not None:
             logger.info(
                 "queue.cache.hit chat_id=%s video_id=%s telegraph_url=%s",

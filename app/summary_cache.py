@@ -39,6 +39,17 @@ def _seconds_in_days(days: int) -> int:
     return max(0, days) * 86400
 
 
+def _cache_key(video_id: str, lang: str) -> str:
+    """DB primary key for a cache entry.
+
+    ``ru`` keeps the legacy bare ``video_id`` key (so the existing production
+    cache keeps hitting unchanged); every other language gets a
+    ``video_id:lang`` composite key so the same video can be cached once per
+    language.
+    """
+    return video_id if lang == "ru" else f"{video_id}:{lang}"
+
+
 @dataclass
 class CachedSummary:
     """One persisted summary entry — round-trip serialisable to JSON."""
@@ -174,33 +185,44 @@ class SummaryCache:
         cutoff = time.time() - self._ttl_seconds
         self._db.execute("DELETE FROM summary_cache WHERE created_at_unix < ?", (cutoff,))
 
-    def get(self, video_id: str) -> CachedSummary | None:
+    def get(self, video_id: str, lang: str = "ru") -> CachedSummary | None:
+        key = _cache_key(video_id, lang)
         row = self._db.query_one(
-            "SELECT payload, created_at_unix FROM summary_cache WHERE video_id = ?", (video_id,)
+            "SELECT payload, created_at_unix FROM summary_cache WHERE video_id = ?", (key,)
         )
         if row is None:
             return None
         if self._ttl_seconds > 0 and (time.time() - row["created_at_unix"]) > self._ttl_seconds:
-            self._db.execute("DELETE FROM summary_cache WHERE video_id = ?", (video_id,))
-            logger.info("summary_cache.expired video_id=%s", video_id)
+            self._db.execute("DELETE FROM summary_cache WHERE video_id = ?", (key,))
+            logger.info("summary_cache.expired video_id=%s", key)
             return None
         try:
             return CachedSummary(**json.loads(row["payload"]))
         except (TypeError, KeyError, json.JSONDecodeError) as exc:
-            logger.warning("summary_cache.corrupt_entry video_id=%s error=%s", video_id, exc)
+            logger.warning("summary_cache.corrupt_entry video_id=%s error=%s", key, exc)
             return None
 
-    def put(self, entry: CachedSummary) -> None:
+    def put(self, entry: CachedSummary, lang: str = "ru") -> None:
+        key = _cache_key(entry.video_id, lang)
         self._db.execute(
             "INSERT OR REPLACE INTO summary_cache(video_id, payload, created_at_unix) VALUES (?, ?, ?)",
-            (entry.video_id, json.dumps(asdict(entry), ensure_ascii=False), entry.created_at_unix),
+            (key, json.dumps(asdict(entry), ensure_ascii=False), entry.created_at_unix),
         )
-        logger.info("summary_cache.stored video_id=%s telegraph_url=%s", entry.video_id, entry.telegraph_url)
+        logger.info(
+            "summary_cache.stored video_id=%s lang=%s telegraph_url=%s", entry.video_id, lang, entry.telegraph_url
+        )
 
     def delete(self, video_id: str) -> bool:
-        exists = self._db.query_one("SELECT 1 FROM summary_cache WHERE video_id = ?", (video_id,)) is not None
+        """Drop every cached language for this video (bare key + ``video_id:lang``)."""
+        exists = self._db.query_one(
+            "SELECT 1 FROM summary_cache WHERE video_id = ? OR video_id LIKE ? || ':%'",
+            (video_id, video_id),
+        ) is not None
         if exists:
-            self._db.execute("DELETE FROM summary_cache WHERE video_id = ?", (video_id,))
+            self._db.execute(
+                "DELETE FROM summary_cache WHERE video_id = ? OR video_id LIKE ? || ':%'",
+                (video_id, video_id),
+            )
         return exists
 
     def size(self) -> int:

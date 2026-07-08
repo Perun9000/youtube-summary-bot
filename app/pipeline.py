@@ -42,6 +42,7 @@ from app.delivery import (
     _format_telegram_summary,
     _is_job_cacheable,
     _lookup_cached_summary,
+    _normalize_channel_simple,
     _resolve_digest_target,
     _resolve_summary_tags,
     _save_summary_to_cache,
@@ -194,7 +195,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
     # Cache check at the very top — covers scheduled jobs + race-conditions
     # where the same video was queued twice in quick succession.
     if _is_job_cacheable(job):
-        cached = _lookup_cached_summary(url, services)
+        cached = _lookup_cached_summary(url, services, lang=job.lang)
         if cached is not None:
             logger.info(
                 "job.cache.hit job_id=%s chat_id=%s video_id=%s telegraph_url=%s",
@@ -405,22 +406,34 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                 speaker_hint=speaker_hint,
                 host_hint=host_hint,
                 llm_route=llm_route,
+                output_lang=job.lang,
             ),
             base_text=generating_text,
             job=job,
         )
 
         # Нормализуем теги через TagsCatalog (fuzzy match на каталог) и
-        # добавляем тег канала из metadata. Если каталога нет — оставляем
-        # как пришло от LLM. Получаем frozen Summary с готовыми тегами.
-        summary = dataclasses.replace(
-            summary,
-            tags=_resolve_summary_tags(
-                raw_tags=summary.tags,
-                channel_name=getattr(metadata, "channel_name", "") or "",
-                services=services,
-            ),
-        )
+        # добавляем тег канала из metadata. Каталог хранит русские
+        # темы/фамилии/форматы — прогонять через него теги не-ru саммари
+        # нельзя (LLM и так вернул их на языке саммари). Для не-ru оставляем
+        # raw-теги LLM как есть, канонизируя только имя канала.
+        if job.lang == "ru":
+            summary = dataclasses.replace(
+                summary,
+                tags=_resolve_summary_tags(
+                    raw_tags=summary.tags,
+                    channel_name=getattr(metadata, "channel_name", "") or "",
+                    services=services,
+                ),
+            )
+        else:
+            summary = dataclasses.replace(
+                summary,
+                tags=dataclasses.replace(
+                    summary.tags,
+                    channel=_normalize_channel_simple(getattr(metadata, "channel_name", "") or ""),
+                ),
+            )
 
         if not comments_task.done():
             await _set_service_status(
@@ -445,6 +458,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                     url=url,
                     summary=summary,
                     top_comments=top_comments,
+                    lang=job.lang,
                 ),
                 base_text=publishing_text,
                 job=job,
@@ -558,6 +572,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                     transcript_chars=len(transcript_text),
                     model=model_name,
                     top_comments=top_comments,
+                    lang=job.lang,
                 )
             except Exception:
                 logger.exception("job.cache.save_failed job_id=%s video_id=%s", job_id, video_id)

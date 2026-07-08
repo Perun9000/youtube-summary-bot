@@ -391,15 +391,15 @@ def _is_job_cacheable(job: SummaryJob) -> bool:
     when a later user requests the *whole* video.
     """
     return not (job.segment_spans and len(job.segment_spans) > 0)
-def _lookup_cached_summary(url: str, services: Services) -> CachedSummary | None:
-    """Resolve URL → video_id → cached entry, swallowing parse errors."""
+def _lookup_cached_summary(url: str, services: Services, lang: str = "ru") -> CachedSummary | None:
+    """Resolve URL → video_id → cached entry for ``lang``, swallowing parse errors."""
     if services.summary_cache is None:
         return None
     try:
         video_id = extract_video_id(url)
     except Exception:
         return None
-    return services.summary_cache.get(video_id)
+    return services.summary_cache.get(video_id, lang=lang)
 def _format_cached_summary_text(
     cached: CachedSummary,
     override_top_comments: list[VideoComment] | None = None,
@@ -431,7 +431,7 @@ def _format_cached_summary_text(
         lang=lang,
     )
 async def _refresh_cached_comments(
-    cached: CachedSummary, services: Services, source_label: str
+    cached: CachedSummary, services: Services, source_label: str, lang: str = "ru"
 ) -> list[VideoComment]:
     """Get fresh top-comments and, if they changed since the cache was made,
     rewrite the cached entry + edit the existing Telegra.ph page so all
@@ -477,6 +477,7 @@ async def _refresh_cached_comments(
             video_url=cached.url,
             summary=cached.to_summary(),
             top_comments=fresh,
+            lang=lang,
         )
         telegraph_updated = True
     except Exception:
@@ -496,7 +497,7 @@ async def _refresh_cached_comments(
             for c in fresh
         ]
         try:
-            services.summary_cache.put(cached)
+            services.summary_cache.put(cached, lang=lang)
         except Exception:
             logger.exception(
                 "cache.refresh_comments.cache_put_failed video_id=%s",
@@ -529,7 +530,7 @@ async def _send_cached_summary_to_chat(
     """Manual flow: respond to a user message with cached summary."""
     from app.bot_handlers import _msg_lang  # local: избегаем цикла bot_handlers<->delivery
     lang = _msg_lang(message, services)
-    fresh_comments = await _refresh_cached_comments(cached, services, source_label="manual")
+    fresh_comments = await _refresh_cached_comments(cached, services, source_label="manual", lang=lang)
     text = _format_cached_summary_text(
         cached, override_top_comments=fresh_comments, bot_username=services.bot_username, lang=lang,
     )
@@ -612,7 +613,7 @@ async def _deliver_cached_summary_for_job(
             created_at_unix=time.time(),
         ))
     else:
-        fresh_comments = await _refresh_cached_comments(cached, services, source_label="job")
+        fresh_comments = await _refresh_cached_comments(cached, services, source_label="job", lang=job.lang)
         text = _format_cached_summary_text(
             cached, override_top_comments=fresh_comments, bot_username=services.bot_username,
             lang=job.lang,
@@ -654,9 +655,10 @@ def _save_summary_to_cache(
     transcript_chars: int,
     model: str,
     top_comments: list[VideoComment] | None = None,
+    lang: str = "ru",
 ) -> None:
     """Persist a freshly-generated summary so future requests for the same
-    video_id are answered from cache."""
+    (video_id, lang) are answered from cache."""
     if services.summary_cache is None:
         return
     now = time.time()
@@ -696,7 +698,7 @@ def _save_summary_to_cache(
         tag_format=summary.tags.format,
         tag_channel=summary.tags.channel,
     )
-    services.summary_cache.put(entry)
+    services.summary_cache.put(entry, lang=lang)
 def _format_generation_error(video_url: str, title: str, reason: str, lang: str = "ru") -> str:
     label = title.strip() or video_url
     if video_url:
