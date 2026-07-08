@@ -40,6 +40,7 @@ from app.scheduler_service import run_monitoring_scheduler
 from app.summarizer import SUMMARY_SYSTEM_PROMPT, Summarizer
 from app.system_prompt_store import SystemPromptStore
 from app.telegraph_service import TelegraphService
+from app.user_lang_store import UserLangStore
 from app.user_store import UserStore
 from app.youtube_service import YouTubeService
 
@@ -54,6 +55,7 @@ PUBLIC_BOT_COMMANDS: list[BotCommand] = [
     BotCommand(command="limits", description="Остаток лимитов"),
     BotCommand(command="subscribe", description="Подписка"),
     BotCommand(command="paysupport", description="Вопросы по оплате"),
+    BotCommand(command="language", description="Язык / Language"),
 ]
 
 OWNER_BOT_COMMANDS: list[BotCommand] = [
@@ -265,6 +267,7 @@ async def main() -> None:
         billing=billing_store,
         quota=quota_service,
         analytics=analytics_events,
+        user_langs=UserLangStore(db),
     )
 
     scheduler_task: asyncio.Task[None] | None = None

@@ -6,6 +6,7 @@ import time
 
 from aiogram.types import Message
 
+from app.i18n import t
 from app.monitoring_service import ScheduledCandidate
 from app.morning_digest import maybe_send_morning_digest
 
@@ -25,7 +26,8 @@ logger = logging.getLogger(__name__)
 
 async def _enqueue_summary_job(message: Message, url: str, services: Services) -> None:
     # Внешний пользователь (не allowlist) в PUBLIC_MODE проходит через квоты.
-    from app.bot_handlers import _is_allowed  # local: избегаем цикла
+    from app.bot_handlers import _is_allowed, _msg_lang  # local: избегаем цикла
+    lang = _msg_lang(message, services)
     quota_user_id: int | None = None
     if not _is_allowed(message, services) and message.from_user is not None:
         quota_user_id = message.from_user.id
@@ -34,7 +36,7 @@ async def _enqueue_summary_job(message: Message, url: str, services: Services) -
     try:
         # Cache hit fast-path: если по этому ролику уже было саммари, отдаём его
         # сразу, не занимая очередь и не дёргая LLM/Whisper.
-        cached = _lookup_cached_summary(url, services)
+        cached = _lookup_cached_summary(url, services, lang=lang)
         if cached is not None:
             logger.info(
                 "queue.cache.hit chat_id=%s video_id=%s telegraph_url=%s",
@@ -47,7 +49,7 @@ async def _enqueue_summary_job(message: Message, url: str, services: Services) -
         if quota_user_id is not None and services.quota is not None:
             verdict = services.quota.check(quota_user_id)
             if not verdict.allowed:
-                await _send_quota_denied(message, services, verdict)
+                await _send_quota_denied(message, services, verdict, lang)
                 return  # сообщение пользователя НЕ удаляем — finally ниже пропустит
 
         active_job: SummaryJob | None
@@ -59,7 +61,8 @@ async def _enqueue_summary_job(message: Message, url: str, services: Services) -
             position = active_count + services.summary_queue.qsize() + 1
             db_id = (
                 services.job_store.add(
-                    url, message.chat.id, scheduled=False, disable_notification=False, title_hint=None
+                    url, message.chat.id, scheduled=False, disable_notification=False,
+                    title_hint=None, lang=lang,
                 )
                 if services.job_store
                 else None
@@ -72,6 +75,7 @@ async def _enqueue_summary_job(message: Message, url: str, services: Services) -
                 chat_id=message.chat.id,
                 db_id=db_id,
                 quota_user_id=quota_user_id,
+                lang=lang,
             )
             await services.summary_queue.put(job)
             enqueued = True
@@ -93,7 +97,7 @@ async def _enqueue_summary_job(message: Message, url: str, services: Services) -
             await _set_service_status(
                 services=services,
                 source_message=message,
-                text="Добавил ролик в очередь summary. Начинаю обработку.",
+                text=t("status.queued_first", lang),
                 job=job,
                 bump=True,
             )
@@ -103,7 +107,7 @@ async def _enqueue_summary_job(message: Message, url: str, services: Services) -
             await _set_service_status(
                 services=services,
                 source_message=message,
-                text=f"Добавил ролик в очередь summary. Позиция: {position}.",
+                text=t("status.queued_position", lang, position=position),
                 job=job,
                 bump=True,
             )
@@ -151,6 +155,7 @@ async def enqueue_scheduled_candidate(
                 scheduled=True,
                 disable_notification=True,
                 title_hint=title_hint,
+                lang="ru",
             )
             if services.job_store
             else None
@@ -171,6 +176,7 @@ async def enqueue_scheduled_candidate(
             expert_matches=list(candidate.expert_matches) or None,
             show_matches=list(candidate.show_matches) or None,
             db_id=db_id,
+            lang="ru",
         )
         await services.summary_queue.put(job)
         if services.summary_worker_task is None or services.summary_worker_task.done():
@@ -209,6 +215,7 @@ async def restore_pending_jobs(services: Services) -> int:
                 scheduled=bool(row["scheduled"]),
                 disable_notification=bool(row["disable_notification"]),
                 db_id=row["id"],
+                lang=row["lang"],
             )
             services.job_store.set_status(row["id"], "queued")
             await services.summary_queue.put(job)
@@ -260,6 +267,7 @@ async def _requeue_due_deferred(services: Services) -> None:
                 scheduled=bool(row["scheduled"]),
                 disable_notification=bool(row["disable_notification"]),
                 db_id=row["id"],
+                lang=row["lang"],
             )
             services.job_store.set_status(row["id"], "queued")
             await services.summary_queue.put(job)

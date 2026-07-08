@@ -7,6 +7,7 @@ import logging
 import re
 import time
 
+from app.i18n import LANG_ENGLISH_NAMES
 from app.models import Chapter, Summary, SummaryTags
 from app.llm_client import GenerationUsage, LLMClient
 
@@ -291,6 +292,9 @@ class Summarizer:
         # Маршрут LLM для текущей суммаризации; выставляется заново в начале
         # каждого summarize() (см. комментарий там про последовательность воркера).
         self._route: str = "default"
+        # Язык вывода на время текущего summarize(); "ru" — поведение как раньше
+        # (весь prompt-контент уже на русском, доп. директива не нужна).
+        self._output_lang: str = "ru"
 
     async def summarize(
         self,
@@ -304,10 +308,13 @@ class Summarizer:
         speaker_hint: str = "",
         host_hint: str = "",
         llm_route: str = "default",
+        output_lang: str = "ru",
     ) -> Summary:
-        # Маршрут LLM на время этой суммаризации. Инстанс-атрибут безопасен:
-        # summary-воркер строго последовательный, конкурирующих summarize нет.
+        # Маршрут LLM и язык вывода на время этой суммаризации. Инстанс-атрибуты
+        # безопасны: summary-воркер строго последовательный, конкурирующих
+        # summarize нет.
         self._route = llm_route
+        self._output_lang = output_lang
         started = time.monotonic()
         logger.info(
             "summary.start title=%r chunks=%s context_hint=%s tags_hints=%s",
@@ -588,6 +595,12 @@ class Summarizer:
 
     def _system_prompt_with_hint(self, context_hint: str | None) -> str:
         base = self._system_prompt_provider() or SUMMARY_SYSTEM_PROMPT
+        if self._output_lang != "ru":
+            lang_name = LANG_ENGLISH_NAMES.get(self._output_lang, self._output_lang)
+            base = (
+                f"{base}\n\nCRITICAL: Write ALL output text — overview, chapter titles, "
+                f"notes, and tags — strictly in {lang_name}. Do not use Russian."
+            )
         if not context_hint:
             return base
         hint = context_hint.strip()

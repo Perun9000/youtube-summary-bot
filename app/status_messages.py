@@ -9,6 +9,7 @@ from typing import Awaitable, TypeVar
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message
 
+from app.i18n import t
 from app.utils import escape_html, extract_video_id
 
 from app.services_container import (
@@ -260,7 +261,7 @@ async def _run_with_telegram_status(
             lines = [
                 base_text,
                 "",
-                f"Прошло: {_format_elapsed_minutes(elapsed)}",
+                t("status.elapsed", job.lang, elapsed=_format_elapsed_minutes(elapsed, job.lang)),
             ]
             progress_text = _format_job_progress(job, elapsed)
             if progress_text:
@@ -287,15 +288,23 @@ def _format_elapsed(seconds: int) -> str:
     if minutes:
         return f"{minutes} мин {secs:02d} сек"
     return f"{secs} сек"
-def _format_elapsed_minutes(seconds: int) -> str:
+def _format_elapsed_minutes(seconds: int, lang: str = "ru") -> str:
     total_seconds = max(0, seconds)
     hours, remainder = divmod(total_seconds, 3600)
     minutes = remainder // 60
+    if lang == "ru":
+        if hours:
+            return f"{hours} {_format_russian_hours(hours)} {minutes} мин"
+        if minutes:
+            return f"{minutes} мин"
+        return "меньше минуты"
+    unit_min = t("status.unit_min", lang)
+    unit_h = t("status.unit_h", lang)
     if hours:
-        return f"{hours} {_format_russian_hours(hours)} {minutes} мин"
+        return f"{hours} {unit_h} {minutes} {unit_min}"
     if minutes:
-        return f"{minutes} мин"
-    return "меньше минуты"
+        return f"{minutes} {unit_min}"
+    return t("status.elapsed_less_min", lang)
 _PROGRESS_BAR_CELLS = 10
 _PROGRESS_BAR_FULL = "▰"
 _PROGRESS_BAR_EMPTY = "▱"

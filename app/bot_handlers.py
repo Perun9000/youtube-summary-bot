@@ -21,6 +21,7 @@ from aiogram.types import (
 from app import log_analytics
 from app.billing import MONTH_SEC
 from app.digest_service import render_digest_html
+from app.i18n import LANG_NATIVE_NAMES, SUPPORTED_LANGS, normalize_language_code, t
 from app.llm_client import OpenRouterClient, health_check_with_reason
 from app.monitoring_service import ScanProgress
 from app.utils import (
@@ -50,7 +51,7 @@ from app.queue_service import (  # noqa: F401
 )
 from app.delivery import _message_user_id  # noqa: F401
 from app.pipeline import _download_audio_to_chat  # noqa: F401
-from app.transcript_export import transcript_path
+from app.transcript_export import pretty_transcript_filename, transcript_path
 
 
 logger = logging.getLogger(__name__)
@@ -73,7 +74,7 @@ def _subscription_until_from_payment(payment, now: float | None = None) -> float
     return now + MONTH_SEC
 
 
-async def _send_subscription_invoice(chat_id: int, services: Services) -> None:
+async def _send_subscription_invoice(chat_id: int, services: Services, lang: str) -> None:
     """Инвойс нативной Stars-подписки (валюта XTR, автопродление 30 дней).
 
     subscription_period поддерживается только в createInvoiceLink, поэтому
@@ -81,30 +82,80 @@ async def _send_subscription_invoice(chat_id: int, services: Services) -> None:
     """
     s = services.settings
     link = await services.bot.create_invoice_link(
-        title="Подписка на саммари",
-        description=(
-            f"{s.quota_sub_monthly} саммари в месяц. Автопродление каждые 30 дней, "
-            "отмена в любой момент в настройках Telegram."
-        ),
+        title=t("subscribe.invoice_title", lang),
+        description=t("subscribe.invoice_description", lang, monthly=s.quota_sub_monthly),
         payload=SUBSCRIPTION_PAYLOAD,
         currency="XTR",
-        prices=[LabeledPrice(label="Подписка на месяц", amount=s.subscription_price_stars)],
+        prices=[LabeledPrice(
+            label=t("subscribe.invoice_label", lang), amount=s.subscription_price_stars
+        )],
         subscription_period=2592000,
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
-            text=f"Оплатить {s.subscription_price_stars} ⭐", url=link
+            text=t("subscribe.pay_button", lang, price=s.subscription_price_stars), url=link
         )
     ]])
     await services.bot.send_message(
         chat_id=chat_id,
-        text=(
-            f"Подписка: {s.quota_sub_monthly} саммари в месяц за "
-            f"{s.subscription_price_stars} ⭐.\n"
-            "Вопросы по оплате: /paysupport."
+        text=t(
+            "subscribe.pitch",
+            lang,
+            monthly=s.quota_sub_monthly,
+            price=s.subscription_price_stars,
         ),
         reply_markup=keyboard,
     )
+
+
+def resolve_user_lang(
+    user_id: int | None, language_code: str | None, services: Services
+) -> str:
+    """Резолв языка пользователя: manual > сохранённый auto > autodetect > en.
+
+    Никогда не кидает — недоступный store или битый user_id просто
+    пропускают персист и падают на normalize_language_code.
+    """
+    store = getattr(services, "user_langs", None)
+    if user_id is not None and store is not None:
+        try:
+            existing = store.get(user_id)
+        except Exception:  # noqa: BLE001
+            existing = None
+        if existing is not None:
+            return existing[0]
+        lang = normalize_language_code(language_code)
+        try:
+            store.set(user_id, lang, "auto")
+        except Exception:  # noqa: BLE001
+            logger.exception("lang.auto_persist_failed user_id=%s", user_id)
+        return lang
+    return normalize_language_code(language_code)
+
+
+def _msg_lang(message: Message, services: Services) -> str:
+    return resolve_user_lang(
+        _message_user_id(message),
+        message.from_user.language_code if message.from_user else None,
+        services,
+    )
+
+
+def _cb_lang(callback: CallbackQuery, services: Services) -> str:
+    """Тот же резолв, что и `_msg_lang`, но для callback_query (кнопки)."""
+    user_id = callback.from_user.id if callback.from_user else None
+    language_code = callback.from_user.language_code if callback.from_user else None
+    return resolve_user_lang(user_id, language_code, services)
+
+
+def _language_keyboard() -> InlineKeyboardMarkup:
+    """7 кнопок выбора языка (LANG_NATIVE_NAMES), по 2 в ряд."""
+    buttons = [
+        InlineKeyboardButton(text=LANG_NATIVE_NAMES[code], callback_data=f"lang:{code}")
+        for code in SUPPORTED_LANGS
+    ]
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def build_router(services: Services) -> Router:
@@ -112,8 +163,9 @@ def build_router(services: Services) -> Router:
 
     @router.message(Command("start"))
     async def start(message: Message) -> None:
+        lang = _msg_lang(message, services)
         if not _has_access(message, services):
-            await message.answer("Этот бот закрыт для личного использования.")
+            await message.answer(t("access.closed", lang))
             return
         # Telegram передаёт payload deep-link'а как второй токен команды:
         # "/start <video_id>". Используется browser-extension'ом — кнопка
@@ -141,16 +193,10 @@ def build_router(services: Services) -> Router:
             # Что-то пришло, но не video_id. Не молчим — пользователь скорее
             # всего открыл криво сформированную ссылку из старой версии
             # extension'а или playlist-страницу.
-            await message.answer(
-                "Не разобрал параметр в ссылке. Открой ролик YouTube и нажми кнопку «Summary» ещё раз — "
-                "она должна слать 11-символьный video_id."
-            )
+            await message.answer(t("start.bad_deeplink", lang))
             return
         if _is_allowed(message, services):
-            await message.answer(
-                "Пришли ссылку на YouTube-ролик. Я верну краткое summary здесь "
-                "и полный конспект в Telegra.ph.\n\nУ тебя безлимитный доступ 🎉"
-            )
+            await message.answer(t("start.allowlist", lang))
             return
         s = services.settings
         if services.analytics is not None:
@@ -158,60 +204,34 @@ def build_router(services: Services) -> Router:
             if user_id is not None:
                 services.analytics.record_first_start(user_id, "organic")
         await message.answer(
-            "👋 Привет! Я делаю саммари YouTube-видео.\n\n"
-            "Пришли ссылку на ролик — верну сюда краткую выжимку (о чём видео, "
-            "время чтения, теги, топ-комментарий), а полный конспект по главам "
-            "опубликую в Telegra.ph.\n\n"
-            "<b>Что умею:</b>\n"
-            "• ролики без субтитров — распознаю речь сам\n"
-            "• премьеры — запомню и вернусь с саммари после выхода\n"
-            "• уже обработанные ролики отдаю мгновенно и бесплатно\n\n"
-            "<b>Тарифы:</b>\n"
-            f"🆓 <b>Бесплатно</b> — {s.quota_starter} саммари сразу "
-            f"и {s.quota_free_weekly} в неделю дальше\n"
-            f"⭐ <b>Подписка {s.subscription_price_stars} ⭐/мес</b> — "
-            f"{s.quota_sub_monthly} саммари в месяц и приоритетная скорость "
-            "генерации: /subscribe\n\n"
-            "Длинный ролик без субтитров (дольше часа) считается за 2 саммари.\n\n"
-            "/limits — остаток лимитов · /help — все команды",
+            t(
+                "start.onboarding",
+                lang,
+                starter=s.quota_starter,
+                weekly=s.quota_free_weekly,
+                price=s.subscription_price_stars,
+                monthly=s.quota_sub_monthly,
+            ),
             parse_mode="HTML",
         )
 
     @router.message(Command("help"))
     async def help_command(message: Message) -> None:
+        lang = _msg_lang(message, services)
         if not _has_access(message, services):
-            await message.answer("Этот бот закрыт для личного использования.")
+            await message.answer(t("access.closed", lang))
             return
         if not _is_owner(message, services):
-            text = (
-                "Доступные команды:\n"
-                "/start - начать работу\n"
-                "/help - помощь\n"
-                "/last - последние 20 саммари\n"
-                "/limits - остаток лимитов\n"
-            )
+            text = t("help.public", lang)
             if not _is_allowed(message, services):
                 s = services.settings
-                text += (
-                    "/subscribe - подписка\n"
-                    "/paysupport - вопросы по оплате\n\n"
-                    f"Бесплатно: {s.quota_starter} саммари сразу и "
-                    f"{s.quota_free_weekly} в неделю. Подписка "
-                    f"{s.subscription_price_stars} ⭐/мес — {s.quota_sub_monthly} "
-                    "саммари в месяц.\n"
-                )
-            text += (
-                "\nПришли ссылку на YouTube-ролик — я верну краткое summary здесь "
-                "и полный конспект в Telegra.ph."
-            )
-            if not _is_allowed(message, services):
-                text += (
-                    "\n\nБесплатно: "
-                    f"{services.settings.quota_starter} саммари на старте, "
-                    f"дальше {services.settings.quota_free_weekly} в неделю. "
-                    f"Подписка {services.settings.subscription_price_stars} ⭐/мес — "
-                    f"{services.settings.quota_sub_monthly} саммари в месяц: /subscribe. "
-                    "Остаток лимитов: /limits."
+                text += "\n\n" + t(
+                    "help.external_extra",
+                    lang,
+                    starter=s.quota_starter,
+                    weekly=s.quota_free_weekly,
+                    price=s.subscription_price_stars,
+                    monthly=s.quota_sub_monthly,
                 )
             await message.answer(text)
             return
@@ -238,8 +258,9 @@ def build_router(services: Services) -> Router:
 
     @router.message(Command("last"))
     async def last_command(message: Message) -> None:
+        lang = _msg_lang(message, services)
         if not _has_access(message, services):
-            await message.answer("Этот бот закрыт для личного использования.")
+            await message.answer(t("access.closed", lang))
             return
         user_id = _message_user_id(message)
         if user_id is None:
@@ -264,15 +285,16 @@ def build_router(services: Services) -> Router:
 
     @router.message(Command("limits"))
     async def limits(message: Message) -> None:
+        lang = _msg_lang(message, services)
         if not _has_access(message, services):
-            await message.answer("Этот бот закрыт для личного использования.")
+            await message.answer(t("access.closed", lang))
             return
         user_id = _message_user_id(message)
         if user_id is None or services.quota is None or services.billing is None:
             await message.answer("Лимиты не настроены.")
             return
         if _is_allowed(message, services):
-            await message.answer("У тебя безлимитный доступ 🎉")
+            await message.answer(t("limits.unlimited", lang))
             return
         s = services.settings
         verdict = services.quota.check(user_id)
@@ -280,43 +302,64 @@ def build_router(services: Services) -> Router:
             until = services.billing.subscription_until(user_id)
             until_text = datetime.datetime.fromtimestamp(until).strftime("%d.%m.%Y")
             await message.answer(
-                f"Подписка активна до {until_text}.\n"
-                f"Осталось в этом месяце: {verdict.remaining} из {s.quota_sub_monthly}."
+                t(
+                    "limits.subscriber",
+                    lang,
+                    date=until_text,
+                    remaining=verdict.remaining,
+                    monthly=s.quota_sub_monthly,
+                )
             )
             return
         if verdict.kind == "starter":
             await message.answer(
-                f"Стартовых саммари осталось: {verdict.remaining} из {s.quota_starter}.\n"
-                f"Дальше — {s.quota_free_weekly} в неделю бесплатно или подписка: /subscribe."
+                t(
+                    "limits.starter",
+                    lang,
+                    remaining=verdict.remaining,
+                    starter=s.quota_starter,
+                    weekly=s.quota_free_weekly,
+                    price=s.subscription_price_stars,
+                )
             )
             return
         if verdict.allowed:
             await message.answer(
-                f"Доступно бесплатных на этой неделе: {verdict.remaining} из {s.quota_free_weekly}.\n"
-                f"Больше — по подписке {s.subscription_price_stars} ⭐/мес: /subscribe."
+                t(
+                    "limits.weekly_available",
+                    lang,
+                    remaining=verdict.remaining,
+                    weekly=s.quota_free_weekly,
+                    price=s.subscription_price_stars,
+                )
             )
         else:
             await message.answer(
-                "Бесплатный лимит на эту неделю исчерпан.\n"
-                f"Подписка {s.subscription_price_stars} ⭐/мес — "
-                f"{s.quota_sub_monthly} саммари: /subscribe."
+                t(
+                    "limits.weekly_exhausted",
+                    lang,
+                    price=s.subscription_price_stars,
+                    monthly=s.quota_sub_monthly,
+                )
             )
 
     @router.message(Command("subscribe"))
     async def subscribe(message: Message) -> None:
+        lang = _msg_lang(message, services)
         if not _has_access(message, services):
-            await message.answer("Этот бот закрыт для личного использования.")
+            await message.answer(t("access.closed", lang))
             return
         if _is_allowed(message, services):
-            await message.answer("У тебя и так безлимитный доступ 🎉")
+            await message.answer(t("subscribe.unlimited_already", lang))
             return
-        await _send_subscription_invoice(message.chat.id, services)
+        await _send_subscription_invoice(message.chat.id, services, lang)
 
     @router.callback_query(F.data == "subscribe")
     async def subscribe_callback(callback: CallbackQuery) -> None:
         await callback.answer()
         if callback.message is not None:
-            await _send_subscription_invoice(callback.message.chat.id, services)
+            lang = _cb_lang(callback, services)
+            await _send_subscription_invoice(callback.message.chat.id, services, lang)
 
     @router.pre_checkout_query()
     async def pre_checkout(query: PreCheckoutQuery) -> None:
@@ -345,19 +388,25 @@ def build_router(services: Services) -> Router:
                 detail=payment.telegram_payment_charge_id,
             )
         until_text = datetime.datetime.fromtimestamp(until).strftime("%d.%m.%Y")
+        lang = _msg_lang(message, services)
         await message.answer(
-            f"Подписка активна до {until_text} — {services.settings.quota_sub_monthly} "
-            "саммари в месяц. Остаток: /limits. Спасибо! 🔮"
+            t(
+                "subscribe.activated",
+                lang,
+                date=until_text,
+                monthly=services.settings.quota_sub_monthly,
+            )
         )
 
     @router.message(Command("paysupport"))
     async def paysupport(message: Message) -> None:
         # Обязательная команда по ToS Telegram для ботов, принимающих Stars.
+        lang = _msg_lang(message, services)
         owner = services.settings.owner_user_id
-        contact = f'<a href="tg://user?id={owner}">владельцу бота</a>' if owner else "владельцу бота"
+        owner_label = t("paysupport.owner_label", lang)
+        contact = f'<a href="tg://user?id={owner}">{owner_label}</a>' if owner else owner_label
         await message.answer(
-            "По вопросам оплаты и возвратов напиши " + contact + ". "
-            "Возвраты выполняются вручную в течение 1–2 дней.",
+            t("paysupport.text", lang, contact=contact),
             parse_mode="HTML",
         )
 
@@ -752,28 +801,34 @@ def build_router(services: Services) -> Router:
         """
         video_id = (callback.data or "").split(":", 1)[1]
         user_id = callback.from_user.id if callback.from_user else None
+        lang = _cb_lang(callback, services)
         allowed = user_id is not None and (
             services.users.is_allowed(user_id)
             or (services.billing is not None and services.billing.is_subscriber(user_id))
         )
         if not allowed:
             await callback.answer(
-                "Скачивание транскрипта доступно по подписке — /subscribe",
+                t("transcript.subscribers_only", lang),
                 show_alert=True,
             )
             return
         path = transcript_path(services.settings.bot_data_dir, video_id)
         if not path.exists():
             await callback.answer(
-                "Транскрипт не сохранён для этого ролика (обработан до появления функции).",
+                t("transcript.not_saved", lang),
                 show_alert=True,
             )
             return
         await callback.answer()
+        filename = f"{video_id}.md"
+        if services.summary_cache is not None:
+            cached = services.summary_cache.get_any(video_id)
+            if cached is not None:
+                filename = pretty_transcript_filename(cached.channel_name, cached.title, video_id)
         if callback.message is not None:
             await services.bot.send_document(
                 chat_id=callback.message.chat.id,
-                document=FSInputFile(path, filename=f"{video_id}.md"),
+                document=FSInputFile(path, filename=filename),
                 disable_notification=True,
             )
 
@@ -789,8 +844,9 @@ def build_router(services: Services) -> Router:
 
     @router.message(F.text)
     async def text_message(message: Message) -> None:
+        lang = _msg_lang(message, services)
         if not _has_access(message, services):
-            await message.answer("Этот бот закрыт для личного использования.")
+            await message.answer(t("access.closed", lang))
             return
 
         # Если в этот чат недавно ввели команду без аргументов («/user_add»,
@@ -829,16 +885,14 @@ def build_router(services: Services) -> Router:
             kind = classify_youtube_url(url)
             if kind == "channel":
                 if not _is_owner(message, services):
-                    await message.answer("Пришли ссылку на отдельный YouTube-ролик.")
+                    await message.answer(t("text.channel_only_video", lang))
                     return
                 await _handle_channel_url(message, url, services)
                 return
             if kind == "video":
                 await _enqueue_summary_job(message, url, services)
                 return
-            await message.answer(
-                "Не разобрал ссылку. Пришли URL ролика или канала YouTube."
-            )
+            await message.answer(t("text.unparseable_link", lang))
             return
 
         # В тексте есть http(s)-URL, но не от YouTube — отвечаем конкретно,
@@ -850,17 +904,35 @@ def build_router(services: Services) -> Router:
             except Exception:  # noqa: BLE001
                 host = foreign_url
             await message.answer(
-                f"Это не YouTube-ссылка (<code>{escape_html(host)}</code>). "
-                "Я умею только YouTube — пришли URL ролика или канала.",
+                t("text.not_youtube", lang, host=escape_html(host)),
                 parse_mode="HTML",
                 disable_web_page_preview=True,
             )
             return
 
-        await message.answer(
-            "Я умею только саммари YouTube-роликов. Пришли ссылку на видео — "
-            "или /help, чтобы посмотреть команды."
-        )
+        await message.answer(t("text.send_link_hint", lang))
+
+    @router.message(Command("language"))
+    async def language_command(message: Message) -> None:
+        lang = _msg_lang(message, services)
+        if not _has_access(message, services):
+            await message.answer(t("access.closed", lang))
+            return
+        await message.answer(t("lang.prompt", lang), reply_markup=_language_keyboard())
+
+    @router.callback_query(F.data.startswith("lang:"))
+    async def language_callback(callback: CallbackQuery) -> None:
+        code = (callback.data or "").removeprefix("lang:").strip()
+        if code not in SUPPORTED_LANGS:
+            await callback.answer("Invalid language code.", show_alert=True)
+            return
+        user_id = callback.from_user.id if callback.from_user else None
+        if user_id is not None and services.user_langs is not None:
+            services.user_langs.set(user_id, code, "manual")
+        await callback.answer()
+        name = LANG_NATIVE_NAMES[code]
+        if callback.message is not None:
+            await callback.message.edit_text(t("lang.changed", code, name=name))
 
     return router
 
@@ -1108,7 +1180,7 @@ async def _handle_channel_url(message: Message, url: str, services: Services) ->
     await notice.edit_text(text)
 async def _answer_owner_only(message: Message, services: Services) -> None:
     if not _is_allowed(message, services):
-        await message.answer("Этот бот закрыт для личного использования.")
+        await message.answer(t("access.closed", _msg_lang(message, services)))
         return
     await message.answer("Эта команда доступна только владельцу бота.")
 async def _apply_user_add(message: Message, raw_args: str, services: Services) -> None:

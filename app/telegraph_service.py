@@ -9,6 +9,7 @@ from pathlib import Path
 import httpx
 
 from app.config import Settings
+from app.i18n import t
 from app.models import Summary, VideoComment
 
 
@@ -81,6 +82,7 @@ class TelegraphService:
         url: str,
         summary: Summary,
         top_comments: list[VideoComment] | None = None,
+        lang: str = "ru",
     ) -> str:
         started = time.monotonic()
         logger.info(
@@ -94,7 +96,7 @@ class TelegraphService:
             self._access_token = await self._create_account()
 
         content = _summary_to_nodes(
-            url, summary, top_comments=top_comments,
+            url, summary, top_comments=top_comments, lang=lang,
         )
         data = await self._post_with_retries(
             "createPage",
@@ -120,6 +122,7 @@ class TelegraphService:
         video_url: str,
         summary: Summary,
         top_comments: list[VideoComment] | None = None,
+        lang: str = "ru",
     ) -> str:
         """Re-publish an existing summary page with updated content.
 
@@ -141,7 +144,7 @@ class TelegraphService:
             page_path, len(top_comments) if top_comments else 0,
         )
         content = _summary_to_nodes(
-            video_url, summary, top_comments=top_comments,
+            video_url, summary, top_comments=top_comments, lang=lang,
         )
         data = await self._post_with_retries(
             "editPage",
@@ -185,9 +188,10 @@ def _summary_to_nodes(
     url: str,
     summary: Summary,
     top_comments: list[VideoComment] | None = None,
+    lang: str = "ru",
 ) -> list[dict | str]:
     header_children: list[dict | str] = [
-        {"tag": "a", "attrs": {"href": url}, "children": ["Оригинальный ролик"]},
+        {"tag": "a", "attrs": {"href": url}, "children": [t("telegraph.original", lang)]},
     ]
 
     nodes: list[dict | str] = [
@@ -207,7 +211,7 @@ def _summary_to_nodes(
 
     # Executive summary — рендерим всегда.
     nodes.extend([
-        {"tag": "h3", "children": ["Executive summary"]},
+        {"tag": "h3", "children": [t("telegraph.exec_summary", lang)]},
         {"tag": "p", "children": [summary.overview]},
     ])
 
@@ -217,9 +221,9 @@ def _summary_to_nodes(
     # «Ключевые тезисы» вообще не показываем. Раньше здесь дампился raw_text —
     # но это сырой JSON модели, читателю от него только хуже.
     if summary.chapters:
-        nodes.append({"tag": "h3", "children": ["Ключевые тезисы"]})
+        nodes.append({"tag": "h3", "children": [t("telegraph.chapters", lang)]})
         for chapter in summary.chapters:
-            heading = chapter.title.strip() or "Тезис"
+            heading = chapter.title.strip() or t("telegraph.chapter_placeholder", lang)
             nodes.append({"tag": "h4", "children": [heading]})
             for paragraph in [part.strip() for part in chapter.notes.split("\n\n") if part.strip()]:
                 nodes.append({"tag": "p", "children": [paragraph]})
@@ -227,15 +231,12 @@ def _summary_to_nodes(
         nodes.append({
             "tag": "p",
             "children": [
-                {"tag": "em", "children": [
-                    "Подробный разбор тезисов извлечь не удалось — модель "
-                    "вернула неполный ответ. Executive summary выше корректный."
-                ]},
+                {"tag": "em", "children": [t("telegraph.chapters_failed", lang)]},
             ],
         })
 
     if top_comments:
-        nodes.append({"tag": "h3", "children": ["Топ-комментарии"]})
+        nodes.append({"tag": "h3", "children": [t("telegraph.comments", lang)]})
         for c in top_comments:
             # Header line with author + like count + pinned marker
             pinned = "📌 " if c.is_pinned else ""

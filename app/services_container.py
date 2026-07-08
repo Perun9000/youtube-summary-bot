@@ -24,6 +24,7 @@ from app.monitoring_service import MonitoringService, ScanProgress
 from app.summarizer import Summarizer
 from app.system_prompt_store import SystemPromptStore
 from app.telegraph_service import TelegraphService
+from app.user_lang_store import UserLangStore
 from app.user_store import UserStore
 from app.youtube_service import YouTubeService
 
@@ -72,6 +73,12 @@ class SummaryJob:
     # Вес списания: 1 обычный ролик, 2 — тяжёлый (Groq-транскрипция, ≥1 ч).
     # Выставляется в pipeline, когда выясняется источник транскрипта.
     usage_weight: int = 1
+    # Язык, на котором нужно говорить с получателем (статусы, саммари,
+    # ошибки). Резолвится при постановке в очередь (_msg_lang) и едет вместе
+    # с job'ом — pipeline/delivery/status_messages читают job.lang, а не
+    # резолвят язык заново. Scheduled-задачи мониторинга — всегда "ru"
+    # (owner-контекст).
+    lang: str = "ru"
 @dataclass
 class Services:
     settings: Settings
@@ -115,6 +122,7 @@ class Services:
     billing: "BillingStore | None" = None
     quota: "QuotaService | None" = None
     analytics: "AnalyticsEvents | None" = None
+    user_langs: "UserLangStore | None" = None
     # Двухшаговые админ-команды («введи /user_add — бот спросит — ты отвечаешь
     # данными в следующем сообщении»). Ключ — chat_id, значение —
     # PendingAdminInput. Не персистится: после рестарта диалог теряется,

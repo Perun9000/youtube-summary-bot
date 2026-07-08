@@ -11,6 +11,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, FSInputFile
 
 from app.groq_whisper_service import GroqWhisperUnavailable
+from app.i18n import t
 from app.llm_client import (
     FREE_CHAIN_EXHAUSTED_MARKER,
     OPENROUTER_BUDGET_EXCEEDED_MARKER,
@@ -41,6 +42,7 @@ from app.delivery import (
     _format_telegram_summary,
     _is_job_cacheable,
     _lookup_cached_summary,
+    _normalize_channel_simple,
     _resolve_digest_target,
     _resolve_summary_tags,
     _save_summary_to_cache,
@@ -75,18 +77,10 @@ def _user_facing_error_reason(exc: Exception, job: SummaryJob, services) -> str:
             and services.billing.is_subscriber(job.quota_user_id)
         )
         if is_sub:
-            return (
-                "генерация временно недоступна (перегрузка моделей). "
-                "Попробуй ещё раз через несколько минут."
-            )
-        return (
-            "дневной лимит бесплатных генераций сервиса исчерпан. "
-            "Попробуй после 03:00 МСК или оформи подписку — /subscribe"
-        )
+            return t("error.temporary_overload", job.lang)
+        return t("error.daily_free_limit", job.lang)
     if OPENROUTER_BUDGET_EXCEEDED_MARKER in reason:
-        return (
-            "сервис временно исчерпал дневной бюджет генераций. Попробуй позже."
-        )
+        return t("error.service_budget", job.lang)
     return reason
 
 
@@ -154,10 +148,7 @@ async def _defer_premiere_job(
         await _send_summary_delivery(
             services=services,
             job=job,
-            text=(
-                f"Ролик {title_link} — премьера, он ещё не вышел. "
-                "Пришли ссылку ещё раз после выхода."
-            ),
+            text=t("premiere.no_store", job.lang, title_link=title_link),
         )
         await _delete_service_status(services, job.chat_id)
         return
@@ -173,15 +164,18 @@ async def _defer_premiere_job(
     )
 
     if release_ts:
-        text = (
-            f"Это премьера: ролик {title_link} выйдет {_format_local_time(services, release_ts)}. "
-            f"Вернусь с саммари примерно в {_format_local_time(services, run_after)} — "
-            f"через {services.settings.premiere_delay_hours} ч после выхода."
+        text = t(
+            "premiere.deferred", job.lang,
+            title_link=title_link,
+            release=_format_local_time(services, release_ts),
+            return_time=_format_local_time(services, run_after),
+            hours=services.settings.premiere_delay_hours,
         )
     else:
-        text = (
-            f"Ролик {title_link} — премьера, время выхода определить не удалось. "
-            f"Попробую сделать саммари в {_format_local_time(services, run_after)}."
+        text = t(
+            "premiere.unknown_release", job.lang,
+            title_link=title_link,
+            return_time=_format_local_time(services, run_after),
         )
     await _send_summary_delivery(services=services, job=job, text=text)
     await _delete_service_status(services, job.chat_id)
@@ -201,7 +195,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
     # Cache check at the very top — covers scheduled jobs + race-conditions
     # where the same video was queued twice in quick succession.
     if _is_job_cacheable(job):
-        cached = _lookup_cached_summary(url, services)
+        cached = _lookup_cached_summary(url, services, lang=job.lang)
         if cached is not None:
             logger.info(
                 "job.cache.hit job_id=%s chat_id=%s video_id=%s telegraph_url=%s",
@@ -210,7 +204,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             await _deliver_cached_summary_for_job(job, services, cached)
             return
 
-    await _set_service_status(services, message, "Получаю данные ролика...", job=job)
+    await _set_service_status(services, message, t("status.fetching", job.lang), job=job)
     try:
         video_id = extract_video_id(url)
         logger.info(
@@ -263,7 +257,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             )
         else:
             try:
-                await _set_service_status(services, message, "Пробую получить готовые субтитры YouTube...", job=job)
+                await _set_service_status(services, message, t("status.captions", job.lang), job=job)
                 stage_started = time.monotonic()
                 segments = await asyncio.to_thread(services.youtube.fetch_transcript, video_id)
                 transcript_source = "youtube"
@@ -294,20 +288,18 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                     verdict = services.quota.check(job.quota_user_id, weight=2)
                     if not verdict.allowed:
                         raise RuntimeError(
-                            "у ролика нет субтитров, и он длиннее часа — такая "
-                            "генерация списывает 2 единицы лимита, а осталось "
-                            f"{verdict.remaining}. Подписка: /subscribe"
+                            t("error.heavy_quota", job.lang, remaining=verdict.remaining)
                         )
                     job.usage_weight = 2
                     await _set_service_status(
                         services, message,
-                        "Ролик без субтитров и длиннее часа — спишется 2 генерации.",
+                        t("status.heavy_charge", job.lang),
                         job=job,
                     )
                 await _set_service_status(
                     services,
                     message,
-                    "Субтитры недоступны. Отправляю в очередь распознавания через Groq Whisper...",
+                    t("status.transcribe_queue", job.lang),
                     job=job,
                 )
                 job.routed_to_transcription = True
@@ -398,7 +390,8 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
         if job.quota_user_id is not None:
             logger.info("job.llm_route job_id=%s route=%s", job_id, llm_route)
 
-        await _set_service_status(services, message, f"Генерирую summary через {services.llm.provider_name}...", job=job)
+        generating_text = t("status.generating", job.lang, provider=services.llm.provider_name)
+        await _set_service_status(services, message, generating_text, job=job)
         summary = await _run_with_telegram_status(
             services=services,
             source_message=message,
@@ -413,26 +406,38 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                 speaker_hint=speaker_hint,
                 host_hint=host_hint,
                 llm_route=llm_route,
+                output_lang=job.lang,
             ),
-            base_text=f"Генерирую summary через {services.llm.provider_name}...",
+            base_text=generating_text,
             job=job,
         )
 
         # Нормализуем теги через TagsCatalog (fuzzy match на каталог) и
-        # добавляем тег канала из metadata. Если каталога нет — оставляем
-        # как пришло от LLM. Получаем frozen Summary с готовыми тегами.
-        summary = dataclasses.replace(
-            summary,
-            tags=_resolve_summary_tags(
-                raw_tags=summary.tags,
-                channel_name=getattr(metadata, "channel_name", "") or "",
-                services=services,
-            ),
-        )
+        # добавляем тег канала из metadata. Каталог хранит русские
+        # темы/фамилии/форматы — прогонять через него теги не-ru саммари
+        # нельзя (LLM и так вернул их на языке саммари). Для не-ru оставляем
+        # raw-теги LLM как есть, канонизируя только имя канала.
+        if job.lang == "ru":
+            summary = dataclasses.replace(
+                summary,
+                tags=_resolve_summary_tags(
+                    raw_tags=summary.tags,
+                    channel_name=getattr(metadata, "channel_name", "") or "",
+                    services=services,
+                ),
+            )
+        else:
+            summary = dataclasses.replace(
+                summary,
+                tags=dataclasses.replace(
+                    summary.tags,
+                    channel=_normalize_channel_simple(getattr(metadata, "channel_name", "") or ""),
+                ),
+            )
 
         if not comments_task.done():
             await _set_service_status(
-                services, message, "Дожидаюсь топ-комментариев...", job=job
+                services, message, t("status.waiting_comments", job.lang), job=job
             )
         try:
             top_comments = await comments_task
@@ -442,7 +447,8 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
             logger.warning("job.comments.await_failed job_id=%s error=%s", job_id, exc)
             top_comments = []
 
-        await _set_service_status(services, message, "Публикую полный конспект в Telegra.ph...", job=job)
+        publishing_text = t("status.publishing", job.lang)
+        await _set_service_status(services, message, publishing_text, job=job)
         try:
             telegraph_url = await _run_with_telegram_status(
                 services=services,
@@ -452,8 +458,9 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                     url=url,
                     summary=summary,
                     top_comments=top_comments,
+                    lang=job.lang,
                 ),
-                base_text="Публикую полный конспект в Telegra.ph...",
+                base_text=publishing_text,
                 job=job,
             )
         except Exception:
@@ -501,6 +508,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                 expert_matches=job.expert_matches,
                 top_comment=top_comments[0] if top_comments else None,
                 bot_username=services.bot_username,
+                lang=job.lang,
             )
             await _send_summary_delivery(
                 services=services,
@@ -564,6 +572,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                     transcript_chars=len(transcript_text),
                     model=model_name,
                     top_comments=top_comments,
+                    lang=job.lang,
                 )
             except Exception:
                 logger.exception("job.cache.save_failed job_id=%s video_id=%s", job_id, video_id)
@@ -586,7 +595,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
     except asyncio.CancelledError:
         logger.info("job.cancelled job_id=%s video_id=%s duration_sec=%.1f", job_id, video_id, time.monotonic() - started)
         try:
-            await _set_service_status(services, message, "Генерация summary остановлена.", job=job)
+            await _set_service_status(services, message, t("status.stopped", job.lang), job=job)
         except TelegramBadRequest as exc:
             if "message is not modified" not in str(exc).lower():
                 logger.warning("progress.edit.failed error=%s", exc)
@@ -594,7 +603,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
         raise
     except Exception as exc:
         logger.exception("job.failed job_id=%s video_id=%s duration_sec=%.1f", job_id, video_id, time.monotonic() - started)
-        await _set_service_status(services, message, "Генерация summary прервана.", job=job)
+        await _set_service_status(services, message, t("status.interrupted", job.lang), job=job)
         await _send_summary_delivery(
             services=services,
             job=job,
@@ -602,6 +611,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                 video_url=url,
                 title=title,
                 reason=_user_facing_error_reason(exc, job, services),
+                lang=job.lang,
             ),
         )
         _forget_service_status(services, chat_id)
@@ -641,7 +651,7 @@ async def _process_transcription_job(job: SummaryJob, services: Services) -> Non
 
     # Status reporting: чтобы Telegram-сообщение жило, обновим его на "скачиваю аудио".
     await _set_service_status(
-        services, job.message, "Скачиваю аудио для распознавания через Groq...", job=job
+        services, job.message, t("status.audio_download", job.lang), job=job
     )
 
     download_started = time.monotonic()
@@ -652,7 +662,7 @@ async def _process_transcription_job(job: SummaryJob, services: Services) -> Non
         # ролик удалён, идущая прямая трансляция. В лог пишем как WARNING
         # (это не баг бота — мы физически не имеем доступа к ролику),
         # пользователю шлём человеческую причину.
-        reason = _classify_youtube_download_error(exc)
+        reason = _classify_youtube_download_error(exc, job.lang)
         download_duration = time.monotonic() - download_started
         logger.warning(
             "transcription_queue.audio_download.failed sequence=%s url=%s duration_sec=%.1f reason=%r error=%s",
@@ -667,7 +677,7 @@ async def _process_transcription_job(job: SummaryJob, services: Services) -> Non
     )
 
     await _set_service_status(
-        services, job.message, "Распознаю аудио через Groq Whisper Large v3 Turbo...", job=job
+        services, job.message, t("status.transcribing", job.lang), job=job
     )
 
     try:
@@ -679,7 +689,7 @@ async def _process_transcription_job(job: SummaryJob, services: Services) -> Non
         )
         await _send_transcription_failure(
             services, job,
-            f"Groq Whisper недоступен: {exc}",
+            t("error.groq_unavailable", job.lang, error=exc),
         )
         _cleanup_audio_file(audio_path)
         return
@@ -687,7 +697,7 @@ async def _process_transcription_job(job: SummaryJob, services: Services) -> Non
         logger.exception("transcription_queue.groq_failed sequence=%s", job.sequence)
         await _send_transcription_failure(
             services, job,
-            f"Ошибка распознавания на Groq: {exc}",
+            t("error.groq_failed", job.lang, error=exc),
         )
         _cleanup_audio_file(audio_path)
         return
@@ -701,7 +711,7 @@ async def _process_transcription_job(job: SummaryJob, services: Services) -> Non
             job.sequence, job.url,
         )
         await _send_transcription_failure(
-            services, job, "Groq вернул пустой транскрипт."
+            services, job, t("error.groq_empty", job.lang)
         )
         return
 
@@ -723,7 +733,7 @@ async def _process_transcription_job(job: SummaryJob, services: Services) -> Non
 
     await _set_service_status(
         services, job.message,
-        "Распознавание завершено. Возвращаю в очередь summary...", job=job,
+        t("status.transcribe_done", job.lang), job=job,
     )
 
     async with services.summary_queue_lock:
@@ -762,12 +772,12 @@ async def _send_transcription_failure(services: Services, job: SummaryJob, reaso
     После доставки финального сообщения чистим зависший status («Скачиваю
     аудио…» / «Распознаю…») — иначе у пользователя в чате висят сразу два
     сообщения: бесполезный статус и наш текст с причиной.
+
+    {link} — как в error.generation_failed — собирается ДО подстановки в
+    шаблон; здесь это plain-URL (title у транскрипционного отказа не всегда
+    известен, сообщение уходит без parse_mode).
     """
-    text = (
-        f"Не удалось получить транскрипт ролика.\n\n"
-        f"Причина: {reason}\n\n"
-        f"Ссылка: {job.url}"
-    )
+    text = t("error.transcript_failed", job.lang, reason=reason, link=job.url)
     try:
         if job.message is not None and not job.scheduled:
             await job.message.answer(text)
@@ -789,67 +799,26 @@ async def _send_transcription_failure(services: Services, job: SummaryJob, reaso
     # так что это и есть финализация статуса в БД.
     if services.job_store and job.db_id:
         services.job_store.set_status(job.db_id, "failed")
-# Подстроки → человеческая причина. Сравнение case-insensitive, на сообщении
-# исключения. Если ничего не подошло — отдадим первые 200 символов исходной
-# ошибки, чтобы не молчать.
+# Подстроки → ключ локали (ytdlp.*) с человеческой причиной. Сравнение
+# case-insensitive, на сообщении исключения. Если ничего не подошло — отдадим
+# первые 200 символов исходной ошибки, чтобы не молчать (ytdlp.download_failed).
 _YT_DLP_ERROR_HINTS: tuple[tuple[str, str], ...] = (
-    (
-        "members-only",
-        "Видео доступно только подписчикам канала (members-only). "
-        "Без аутентификации бот его не обработает.",
-    ),
-    (
-        "join this channel to get access",
-        "Видео доступно только подписчикам канала (members-only). "
-        "Без аутентификации бот его не обработает.",
-    ),
-    (
-        "private video",
-        "Ролик помечен как Private. Доступен только тем, у кого есть прямая ссылка-приглашение от автора.",
-    ),
-    (
-        "video unavailable",
-        "Ролик недоступен (удалён автором, заблокирован правообладателем или скрыт в этом регионе).",
-    ),
-    (
-        "removed by the uploader",
-        "Ролик удалён автором.",
-    ),
-    (
-        "this video has been removed",
-        "Ролик удалён с YouTube.",
-    ),
-    (
-        "sign in to confirm your age",
-        "Ролик с возрастным ограничением — YouTube требует логин. Бот его не обработает.",
-    ),
-    (
-        "sign in to confirm you",
-        "YouTube требует логин для просмотра (anti-bot или возрастная проверка). Бот не пройдёт.",
-    ),
-    (
-        "geo restricted",
-        "Ролик заблокирован в регионе, из которого работает бот.",
-    ),
-    (
-        "blocked it in your country",
-        "Ролик заблокирован правообладателем в регионе бота.",
-    ),
-    (
-        "live event",
-        "Это идущая прямая трансляция — её нельзя суммаризировать, пока не закончится.",
-    ),
-    (
-        "premiere",
-        "Это премьера, которая ещё не началась — ролика как такового пока нет.",
-    ),
-    (
-        "this live stream recording is not available",
-        "Запись прямой трансляции недоступна.",
-    ),
+    ("members-only", "ytdlp.members_only"),
+    ("join this channel to get access", "ytdlp.members_only"),
+    ("private video", "ytdlp.private"),
+    ("video unavailable", "ytdlp.unavailable"),
+    ("removed by the uploader", "ytdlp.removed_by_uploader"),
+    ("this video has been removed", "ytdlp.removed"),
+    ("sign in to confirm your age", "ytdlp.age_restricted"),
+    ("sign in to confirm you", "ytdlp.sign_in_required"),
+    ("geo restricted", "ytdlp.geo_restricted"),
+    ("blocked it in your country", "ytdlp.geo_blocked"),
+    ("live event", "ytdlp.live_event"),
+    ("premiere", "ytdlp.premiere_not_started"),
+    ("this live stream recording is not available", "ytdlp.stream_recording_unavailable"),
 )
-def _classify_youtube_download_error(exc: Exception) -> str:
-    """Map a yt-dlp exception to a friendly Russian reason for the user.
+def _classify_youtube_download_error(exc: Exception, lang: str = "ru") -> str:
+    """Map a yt-dlp exception to a friendly localized reason for the user.
 
     yt-dlp валит сразу в две слоя: ``ExtractorError`` (отказ на этапе
     разбора метаданных, например ``raise_no_formats``) и ``DownloadError``
@@ -858,15 +827,15 @@ def _classify_youtube_download_error(exc: Exception) -> str:
     """
     raw = str(exc) or exc.__class__.__name__
     lowered = raw.lower()
-    for needle, hint in _YT_DLP_ERROR_HINTS:
+    for needle, key in _YT_DLP_ERROR_HINTS:
         if needle in lowered:
-            return hint
+            return t(key, lang)
     # Никакой known-pattern не подошёл — отдадим обрезанный raw, всё-таки
     # это сообщение от yt-dlp, обычно осмысленное.
     snippet = raw.strip().replace("\n", " ")
     if len(snippet) > 200:
         snippet = snippet[:197].rstrip() + "..."
-    return f"yt-dlp не смог скачать аудио: {snippet}"
+    return t("ytdlp.download_failed", lang, snippet=snippet)
 async def _download_audio_to_chat(
     callback: CallbackQuery,
     video_id: str,
