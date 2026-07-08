@@ -11,7 +11,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, FSInputFile
 
 from app.groq_whisper_service import GroqWhisperUnavailable
-from app.i18n import t
+from app.i18n import UserFacingError, t
 from app.llm_client import (
     FREE_CHAIN_EXHAUSTED_MARKER,
     OPENROUTER_BUDGET_EXCEEDED_MARKER,
@@ -67,9 +67,22 @@ def _user_facing_error_reason(exc: Exception, job: SummaryJob, services) -> str:
     технические маркеры подменяются человеческим объяснением: им не помочь
     советом «переключись на платную модель» — у них либо подписка, либо
     ожидание сброса дневного лимита free-tier (00:00 UTC = 03:00 МСК).
+
+    Три случая для внешних, по убыванию специфичности:
+    1. ``UserFacingError`` — текст уже собран через ``t(job.lang)`` выше по
+       стеку (например error.heavy_quota) — отдаём как есть, не трогаем.
+    2. Известные технические маркеры (free-chain/budget/GROQ_API_KEY) —
+       подменяем человеческим объяснением, как раньше.
+    3. Всё остальное — необработанное исключение (yt-dlp, LLM-провайдер,
+       Telegram и т.п.), внешнему пользователю сырой текст показывать нельзя
+       (не локализован, часто технический) — единый error.internal. Полный
+       exc всё равно попадает в лог через logger.exception чуть выше по
+       стеку — тут ничего не теряем.
     """
     reason = str(exc)
     if job.quota_user_id is None:
+        return reason
+    if isinstance(exc, UserFacingError):
         return reason
     if FREE_CHAIN_EXHAUSTED_MARKER in reason:
         is_sub = bool(
@@ -81,7 +94,9 @@ def _user_facing_error_reason(exc: Exception, job: SummaryJob, services) -> str:
         return t("error.daily_free_limit", job.lang)
     if OPENROUTER_BUDGET_EXCEEDED_MARKER in reason:
         return t("error.service_budget", job.lang)
-    return reason
+    if "GROQ_API_KEY" in reason:
+        return t("error.groq_unavailable", job.lang, error="GROQ_API_KEY not configured")
+    return t("error.internal", job.lang)
 
 
 def _llm_route_for_job(job: SummaryJob, services: Services) -> str:
@@ -287,7 +302,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                 ):
                     verdict = services.quota.check(job.quota_user_id, weight=2)
                     if not verdict.allowed:
-                        raise RuntimeError(
+                        raise UserFacingError(
                             t("error.heavy_quota", job.lang, remaining=verdict.remaining)
                         )
                     job.usage_weight = 2

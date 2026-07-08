@@ -982,7 +982,7 @@ def _format_llm_mode_status(services: Services) -> str:
             "Переключение режимов /llm_paid /llm_free доступно только для OpenRouter."
         )
 
-    mode = "platный" if llm.is_paid_mode() else "бесплатный (free)"
+    mode = "платный" if llm.is_paid_mode() else "бесплатный (free)"
     chain = llm.current_chain()
     chain_lines = "\n".join(f"  {i+1}. {m}" for i, m in enumerate(chain)) or "  (пусто)"
     snap = llm.budget.snapshot()

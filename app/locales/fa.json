@@ -8,6 +8,7 @@
   "error.groq_failed": "خطای تبدیل به متن در Groq: {error}",
   "error.groq_unavailable": "Groq Whisper در دسترس نیست: {error}",
   "error.heavy_quota": "این ویدیو زیرنویس ندارد و بیش از یک ساعت طول می‌کشد — این تولید 2 واحد از سهمیه کم می‌کند، و {remaining} باقی مانده است. اشتراک: /subscribe",
+  "error.internal": "مشکلی پیش آمد. لطفاً بعداً دوباره امتحان کنید.",
   "error.service_budget": "سرویس موقتاً بودجه‌ی روزانه‌ی تولید را تمام کرده است. کمی بعد دوباره امتحان کن.",
   "error.temporary_overload": "تولید موقتاً در دسترس نیست (شلوغی مدل‌ها). چند دقیقه‌ی دیگر دوباره امتحان کن.",
   "error.transcript_failed": "نتوانستم متن ویدیو را دریافت کنم.\n\nدلیل: {reason}\n\nلینک: {link}",

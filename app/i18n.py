@@ -44,6 +44,17 @@ def _load_locales() -> dict[str, dict[str, str]]:
 _LOCALES = _load_locales()
 
 
+class UserFacingError(RuntimeError):
+    """RuntimeError whose message is already localized user-facing text.
+
+    Raise this (instead of a bare RuntimeError) when the message was built
+    upstream via ``t(key, job.lang, ...)`` — code that turns exceptions into
+    text for the user (see ``pipeline._user_facing_error_reason``) treats it
+    as final and passes ``str(exc)`` through unchanged, rather than replacing
+    it with a generic "something went wrong" fallback.
+    """
+
+
 def normalize_language_code(code: str | None) -> str:
     """Telegram language_code (IETF, напр. 'pt-br') → поддерживаемый язык."""
     if not code:

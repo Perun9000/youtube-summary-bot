@@ -8,6 +8,7 @@
   "error.groq_failed": "خطأ في التفريغ على Groq: {error}",
   "error.groq_unavailable": "Groq Whisper غير متاح: {error}",
   "error.heavy_quota": "هذا الفيديو بلا ترجمة نصية وأطول من ساعة — هذا التوليد يستهلك وحدتين من الحصة، والمتبقي {remaining}. اشترك: /subscribe",
+  "error.internal": "حدث خطأ ما. حاول مرة أخرى لاحقًا.",
   "error.service_budget": "استنفدت الخدمة مؤقتًا موازنتها اليومية للتوليد. حاول مرة أخرى لاحقًا.",
   "error.temporary_overload": "التوليد غير متاح مؤقتًا (ازدحام في النماذج). حاول مرة أخرى بعد بضع دقائق.",
   "error.transcript_failed": "تعذّر الحصول على النص المفرَّغ للفيديو.\n\nالسبب: {reason}\n\nالرابط: {link}",

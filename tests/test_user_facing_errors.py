@@ -1,3 +1,4 @@
+from app.i18n import UserFacingError, t
 from app.llm_client import FREE_CHAIN_EXHAUSTED_MARKER, OPENROUTER_BUDGET_EXCEEDED_MARKER
 from app.pipeline import _user_facing_error_reason
 from app.services_container import SummaryJob
@@ -16,10 +17,10 @@ class _FakeServices:
         self.billing = _FakeBilling(subscriber_ids)
 
 
-def _job(quota_user_id=None):
+def _job(quota_user_id=None, lang="ru"):
     return SummaryJob(
         sequence=1, message=None, url="https://youtu.be/x",
-        enqueued_at=0.0, chat_id=1, quota_user_id=quota_user_id,
+        enqueued_at=0.0, chat_id=1, quota_user_id=quota_user_id, lang=lang,
     )
 
 
@@ -48,7 +49,32 @@ def test_budget_marker_masked_for_external():
     assert "бюджет" in reason and "OPENROUTER" not in reason
 
 
-def test_unknown_error_passes_through():
-    exc = RuntimeError("что-то нейтральное сломалось")
-    reason = _user_facing_error_reason(exc, _job(quota_user_id=99), _FakeServices())
-    assert reason == "что-то нейтральное сломалось"
+def test_groq_not_configured_gets_localized_text_for_external():
+    exc = RuntimeError(
+        "Субтитры YouTube недоступны для этого ролика, "
+        "а GROQ_API_KEY не настроен — облачное распознавание "
+        "выключено. Добавь ключ Groq в .env и перезапусти бот."
+    )
+    reason = _user_facing_error_reason(exc, _job(quota_user_id=99, lang="es"), _FakeServices())
+    assert reason == t("error.groq_unavailable", "es", error="GROQ_API_KEY not configured")
+    assert "GROQ_API_KEY не настроен" not in reason
+
+
+def test_generic_exception_gets_internal_error_for_external():
+    exc = Exception("boom")
+    reason = _user_facing_error_reason(exc, _job(quota_user_id=99, lang="es"), _FakeServices())
+    assert reason == t("error.internal", "es")
+    assert "boom" not in reason
+
+
+def test_user_facing_error_passes_through_unchanged_for_external():
+    already_localized = t("error.heavy_quota", "es", remaining=3)
+    exc = UserFacingError(already_localized)
+    reason = _user_facing_error_reason(exc, _job(quota_user_id=99, lang="es"), _FakeServices())
+    assert reason == already_localized
+
+
+def test_owner_sees_raw_generic_exception_unchanged():
+    exc = Exception("boom")
+    reason = _user_facing_error_reason(exc, _job(quota_user_id=None), _FakeServices())
+    assert reason == "boom"

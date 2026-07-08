@@ -8,6 +8,7 @@
   "error.groq_failed": "Error de transcripción en Groq: {error}",
   "error.groq_unavailable": "Groq Whisper no está disponible: {error}",
   "error.heavy_quota": "este vídeo no tiene subtítulos y dura más de una hora — esa generación consume 2 unidades de la cuota, y te quedan {remaining}. Suscríbete: /subscribe",
+  "error.internal": "Algo salió mal. Inténtalo de nuevo más tarde.",
   "error.service_budget": "El servicio agotó temporalmente su presupuesto diario de generaciones. Inténtalo más tarde.",
   "error.temporary_overload": "la generación no está disponible temporalmente (sobrecarga de modelos). Inténtalo de nuevo en unos minutos.",
   "error.transcript_failed": "No pude obtener la transcripción del vídeo.\n\nMotivo: {reason}\n\nEnlace: {link}",

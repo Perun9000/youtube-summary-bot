@@ -8,6 +8,7 @@
   "error.groq_failed": "Transcription error on Groq: {error}",
   "error.groq_unavailable": "Groq Whisper is unavailable: {error}",
   "error.heavy_quota": "this video has no captions and is longer than an hour — that generation costs 2 quota units, and you have {remaining} left. Subscribe: /subscribe",
+  "error.internal": "Something went wrong. Please try again later.",
   "error.service_budget": "The service has temporarily used up its daily generation budget. Please try again later.",
   "error.temporary_overload": "generation is temporarily unavailable (model overload). Please try again in a few minutes.",
   "error.transcript_failed": "Couldn't get the video transcript.\n\nReason: {reason}\n\nLink: {link}",

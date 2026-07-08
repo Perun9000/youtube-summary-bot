@@ -8,6 +8,7 @@
   "error.groq_failed": "Kesalahan transkripsi di Groq: {error}",
   "error.groq_unavailable": "Groq Whisper tidak tersedia: {error}",
   "error.heavy_quota": "video ini tidak punya teks dan lebih dari satu jam — pembuatan ini memotong 2 unit kuota, dan sisa {remaining}. Berlangganan: /subscribe",
+  "error.internal": "Terjadi kesalahan. Coba lagi nanti.",
   "error.service_budget": "Layanan untuk sementara telah menghabiskan anggaran harian pembuatannya. Coba lagi nanti.",
   "error.temporary_overload": "pembuatan sementara tidak tersedia (model kelebihan beban). Coba lagi beberapa menit lagi.",
   "error.transcript_failed": "Tidak bisa mendapatkan transkrip video.\n\nAlasan: {reason}\n\nLink: {link}",
