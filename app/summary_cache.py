@@ -202,6 +202,28 @@ class SummaryCache:
             logger.warning("summary_cache.corrupt_entry video_id=%s error=%s", key, exc)
             return None
 
+    def get_any(self, video_id: str) -> CachedSummary | None:
+        """Найти запись ролика на ЛЮБОМ языке — сначала голый ключ, затем
+        первую по порядку ``video_id:lang`` из ``SUPPORTED_LANGS``.
+
+        Используется там, где нужны только видео-метаданные (channel_name,
+        title), а язык получателя не важен — например, для человекочитаемого
+        имени файла транскрипта.
+
+        GLOB, а не LIKE: video_id допускает ``_`` — см. docstring ``delete``.
+        """
+        row = self._db.query_one(
+            "SELECT payload FROM summary_cache WHERE video_id = ? OR video_id GLOB ? || ':*' LIMIT 1",
+            (video_id, video_id),
+        )
+        if row is None:
+            return None
+        try:
+            return CachedSummary(**json.loads(row["payload"]))
+        except (TypeError, KeyError, json.JSONDecodeError) as exc:
+            logger.warning("summary_cache.corrupt_entry video_id=%s error=%s", video_id, exc)
+            return None
+
     def put(self, entry: CachedSummary, lang: str = "ru") -> None:
         key = _cache_key(entry.video_id, lang)
         self._db.execute(

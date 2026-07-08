@@ -51,7 +51,7 @@ from app.queue_service import (  # noqa: F401
 )
 from app.delivery import _message_user_id  # noqa: F401
 from app.pipeline import _download_audio_to_chat  # noqa: F401
-from app.transcript_export import transcript_path
+from app.transcript_export import pretty_transcript_filename, transcript_path
 
 
 logger = logging.getLogger(__name__)
@@ -820,10 +820,15 @@ def build_router(services: Services) -> Router:
             )
             return
         await callback.answer()
+        filename = f"{video_id}.md"
+        if services.summary_cache is not None:
+            cached = services.summary_cache.get_any(video_id)
+            if cached is not None:
+                filename = pretty_transcript_filename(cached.channel_name, cached.title, video_id)
         if callback.message is not None:
             await services.bot.send_document(
                 chat_id=callback.message.chat.id,
-                document=FSInputFile(path, filename=f"{video_id}.md"),
+                document=FSInputFile(path, filename=filename),
                 disable_notification=True,
             )
 

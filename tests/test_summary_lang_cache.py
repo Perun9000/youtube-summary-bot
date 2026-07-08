@@ -47,6 +47,33 @@ def test_delete_does_not_match_underscore_as_wildcard(tmp_path):
     assert cache.get("dQw4w9XgXcQ", lang="fa") is not None
 
 
+def test_get_any_finds_bare_ru_key(tmp_path):
+    cache = SummaryCache(Database(tmp_path / "bot.db"))
+    cache.put(make_cached(overview="русское"), lang="ru")
+    found = cache.get_any("dQw4w9WgXcQ")
+    assert found is not None
+    assert found.summary_overview == "русское"
+
+
+def test_get_any_finds_non_ru_composite_key(tmp_path):
+    cache = SummaryCache(Database(tmp_path / "bot.db"))
+    cache.put(make_cached(overview="english"), lang="en")
+    found = cache.get_any("dQw4w9WgXcQ")
+    assert found is not None
+    assert found.summary_overview == "english"
+
+
+def test_get_any_returns_none_when_missing(tmp_path):
+    cache = SummaryCache(Database(tmp_path / "bot.db"))
+    assert cache.get_any("missingvid1") is None
+
+
+def test_get_any_does_not_match_underscore_as_wildcard(tmp_path):
+    cache = SummaryCache(Database(tmp_path / "bot.db"))
+    cache.put(make_cached(vid="dQw4w9XgXcQ"), lang="en")
+    assert cache.get_any("dQw4w9_gXcQ") is None
+
+
 def test_delete_drops_all_languages(tmp_path):
     cache = SummaryCache(Database(tmp_path / "bot.db"))
     cache.put(make_cached(), lang="ru")
