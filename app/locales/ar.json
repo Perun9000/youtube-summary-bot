@@ -65,6 +65,7 @@
   "summary.new_video_channel_link": "فيديو جديد على قناة <a href=\"{url}\">{channel}</a>",
   "summary.reading_time": "وقت القراءة: {minutes} دقيقة",
   "summary.top_comment": "💬 <i>أفضل تعليق ({likes}):\n«",
+  "telegraph.chapter_placeholder": "نقطة رئيسية",
   "telegraph.chapters": "النقاط الرئيسية",
   "telegraph.chapters_failed": "تعذّر استخراج شرح تفصيلي للنقاط الرئيسية — أعاد النموذج ردًا غير مكتمل. الملخص التنفيذي أعلاه لا يزال صحيحًا.",
   "telegraph.comments": "أفضل التعليقات",

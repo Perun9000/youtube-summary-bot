@@ -213,14 +213,20 @@ class SummaryCache:
         )
 
     def delete(self, video_id: str) -> bool:
-        """Drop every cached language for this video (bare key + ``video_id:lang``)."""
+        """Drop every cached language for this video (bare key + ``video_id:lang``).
+
+        GLOB, а не LIKE: video_id допускает ``_`` ([A-Za-z0-9_-]{11}), а LIKE
+        трактует ``_`` как одиночный wildcard — удаление ролика ``dQw4w9_gXcQ``
+        задело бы чужой ``dQw4w9XgXcQ:en``. Алфавит video_id не содержит
+        GLOB-метасимволов ``*?[]``, так что GLOB-паттерн точен by construction.
+        """
         exists = self._db.query_one(
-            "SELECT 1 FROM summary_cache WHERE video_id = ? OR video_id LIKE ? || ':%'",
+            "SELECT 1 FROM summary_cache WHERE video_id = ? OR video_id GLOB ? || ':*'",
             (video_id, video_id),
         ) is not None
         if exists:
             self._db.execute(
-                "DELETE FROM summary_cache WHERE video_id = ? OR video_id LIKE ? || ':%'",
+                "DELETE FROM summary_cache WHERE video_id = ? OR video_id GLOB ? || ':*'",
                 (video_id, video_id),
             )
         return exists

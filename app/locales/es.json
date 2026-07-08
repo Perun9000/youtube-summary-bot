@@ -65,6 +65,7 @@
   "summary.new_video_channel_link": "Nuevo vídeo en el canal <a href=\"{url}\">{channel}</a>",
   "summary.reading_time": "Tiempo de lectura: {minutes} min",
   "summary.top_comment": "💬 <i>Comentario destacado ({likes}):\n“",
+  "telegraph.chapter_placeholder": "Punto clave",
   "telegraph.chapters": "Puntos clave",
   "telegraph.chapters_failed": "No se pudo extraer un desarrollo detallado de los puntos clave — el modelo devolvió una respuesta incompleta. El resumen ejecutivo de arriba sigue siendo válido.",
   "telegraph.comments": "Comentarios destacados",

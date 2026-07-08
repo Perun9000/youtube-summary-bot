@@ -223,7 +223,7 @@ def _summary_to_nodes(
     if summary.chapters:
         nodes.append({"tag": "h3", "children": [t("telegraph.chapters", lang)]})
         for chapter in summary.chapters:
-            heading = chapter.title.strip() or "Тезис"
+            heading = chapter.title.strip() or t("telegraph.chapter_placeholder", lang)
             nodes.append({"tag": "h4", "children": [heading]})
             for paragraph in [part.strip() for part in chapter.notes.split("\n\n") if part.strip()]:
                 nodes.append({"tag": "p", "children": [paragraph]})

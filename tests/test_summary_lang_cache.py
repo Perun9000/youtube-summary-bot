@@ -31,6 +31,22 @@ def test_legacy_ru_rows_still_found(tmp_path):
     assert row["video_id"] == "dQw4w9WgXcQ"
 
 
+def test_delete_does_not_match_underscore_as_wildcard(tmp_path):
+    # video_id может содержать `_`, а SQLite LIKE трактует `_` как wildcard
+    # «любой один символ». Удаление кэша ролика dQw4w9_gXcQ не должно задевать
+    # записи ролика dQw4w9XgXcQ (отличается ровно в позиции `_`).
+    cache = SummaryCache(Database(tmp_path / "bot.db"))
+    cache.put(make_cached(vid="dQw4w9_gXcQ"), lang="ru")
+    cache.put(make_cached(vid="dQw4w9_gXcQ"), lang="en")
+    cache.put(make_cached(vid="dQw4w9XgXcQ"), lang="en")
+    cache.put(make_cached(vid="dQw4w9XgXcQ"), lang="fa")
+    assert cache.delete("dQw4w9_gXcQ") is True
+    assert cache.get("dQw4w9_gXcQ", lang="ru") is None
+    assert cache.get("dQw4w9_gXcQ", lang="en") is None
+    assert cache.get("dQw4w9XgXcQ", lang="en") is not None
+    assert cache.get("dQw4w9XgXcQ", lang="fa") is not None
+
+
 def test_delete_drops_all_languages(tmp_path):
     cache = SummaryCache(Database(tmp_path / "bot.db"))
     cache.put(make_cached(), lang="ru")

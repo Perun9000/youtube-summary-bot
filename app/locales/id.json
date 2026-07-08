@@ -65,6 +65,7 @@
   "summary.new_video_channel_link": "Video baru di kanal <a href=\"{url}\">{channel}</a>",
   "summary.reading_time": "Waktu baca: {minutes} menit",
   "summary.top_comment": "💬 <i>Komentar teratas ({likes}):\n“",
+  "telegraph.chapter_placeholder": "Poin utama",
   "telegraph.chapters": "Poin-poin utama",
   "telegraph.chapters_failed": "Tidak bisa mengekstrak uraian detail poin-poin utama — model mengembalikan respons yang tidak lengkap. Executive summary di atas tetap valid.",
   "telegraph.comments": "Komentar teratas",

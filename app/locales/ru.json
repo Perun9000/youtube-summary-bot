@@ -65,6 +65,7 @@
   "summary.new_video_channel_link": "Новое видео на канале <a href=\"{url}\">{channel}</a>",
   "summary.reading_time": "Время чтения: {minutes} мин",
   "summary.top_comment": "💬 <i>Топ-комментарий ({likes}):\n«",
+  "telegraph.chapter_placeholder": "Тезис",
   "telegraph.chapters": "Ключевые тезисы",
   "telegraph.chapters_failed": "Подробный разбор тезисов извлечь не удалось — модель вернула неполный ответ. Executive summary выше корректный.",
   "telegraph.comments": "Топ-комментарии",
