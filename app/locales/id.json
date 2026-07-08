@@ -64,6 +64,7 @@
   "text.channel_only_video": "Kirim link satu video YouTube saja.",
   "text.not_youtube": "Itu bukan link YouTube (<code>{host}</code>). Saya hanya bisa menangani YouTube — kirim URL video atau kanal.",
   "text.send_link_hint": "Saya hanya membuat ringkasan video YouTube. Kirim link video — atau /help untuk melihat daftar perintah.",
+  "text.unparseable_link": "Tidak bisa membaca tautan itu. Kirim URL video atau channel YouTube.",
   "transcript.not_saved": "Transkrip tidak disimpan untuk video ini (diproses sebelum fitur ini ada).",
   "transcript.subscribers_only": "Mengunduh transkrip memerlukan langganan — /subscribe"
 }

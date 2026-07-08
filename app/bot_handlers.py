@@ -887,9 +887,7 @@ def build_router(services: Services) -> Router:
             if kind == "video":
                 await _enqueue_summary_job(message, url, services)
                 return
-            await message.answer(
-                "Не разобрал ссылку. Пришли URL ролика или канала YouTube."
-            )
+            await message.answer(t("text.unparseable_link", lang))
             return
 
         # В тексте есть http(s)-URL, но не от YouTube — отвечаем конкретно,

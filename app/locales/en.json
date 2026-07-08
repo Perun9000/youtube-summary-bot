@@ -64,6 +64,7 @@
   "text.channel_only_video": "Send a link to a single YouTube video.",
   "text.not_youtube": "That's not a YouTube link (<code>{host}</code>). I only handle YouTube — send a video or channel URL.",
   "text.send_link_hint": "I only make summaries of YouTube videos. Send me a video link — or /help to see the commands.",
+  "text.unparseable_link": "Couldn't parse that link. Send a YouTube video or channel URL.",
   "transcript.not_saved": "The transcript wasn't saved for this video (processed before this feature existed).",
   "transcript.subscribers_only": "Downloading the transcript requires a subscription — /subscribe"
 }

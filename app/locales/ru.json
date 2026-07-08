@@ -64,6 +64,7 @@
   "text.channel_only_video": "Пришли ссылку на отдельный YouTube-ролик.",
   "text.not_youtube": "Это не YouTube-ссылка (<code>{host}</code>). Я умею только YouTube — пришли URL ролика или канала.",
   "text.send_link_hint": "Я умею только саммари YouTube-роликов. Пришли ссылку на видео — или /help, чтобы посмотреть команды.",
+  "text.unparseable_link": "Не разобрал ссылку. Пришли URL ролика или канала YouTube.",
   "transcript.not_saved": "Транскрипт не сохранён для этого ролика (обработан до появления функции).",
   "transcript.subscribers_only": "Скачивание транскрипта доступно по подписке — /subscribe"
 }
