@@ -16,7 +16,7 @@
 
   // Маркер версии content script'а: виден со страницы, позволяет отличить
   // «код не перезагрузился» от «в новом коде баг» при отладке.
-  const SCRIPT_VERSION = '0.2.3';
+  const SCRIPT_VERSION = '0.2.4';
   document.documentElement.dataset.ytSummaryExt = SCRIPT_VERSION;
 
   const api = globalThis.browser ?? globalThis.chrome;
