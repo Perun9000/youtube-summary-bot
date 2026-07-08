@@ -720,8 +720,11 @@ def build_router(services: Services) -> Router:
             f"yt-dlp сегодня: {services.youtube.ytdlp_today_count()} обращений "
             f"(мягкий лимит {services.settings.ytdlp_soft_daily_limit})\n\n"
         )
+        cookies_line = _format_cookie_accounts_line(services)
         await message.answer(
-            db_line + funnel_line + ytdlp_line + text, parse_mode="HTML", disable_web_page_preview=True
+            db_line + funnel_line + ytdlp_line + cookies_line + text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
         )
 
     @router.message(Command("llm_paid"))
@@ -972,6 +975,28 @@ def _compute_stats_for_telegram(services: Services, days: int) -> str:
         name_resolver=_name_resolver,
         summary_cache=services.summary_cache,
     )
+
+
+def _format_cookie_accounts_line(services: Services) -> str:
+    """Render per-account cookie-rotation usage for /stats.
+
+    Empty string when rotation isn't active (single-cookie/no-cookie legacy
+    mode, i.e. data/cookies/ is empty or missing) — keeps /stats unchanged
+    for the current single-account live setup.
+    """
+    youtube = services.youtube
+    if not youtube.cookie_rotation_enabled():
+        return ""
+    lines = ["Cookie-аккаунты:"]
+    for entry in youtube.cookie_account_status():
+        state = "активен"
+        if entry["cooldown"]:
+            hours = entry["cooldown_remaining_sec"] / 3600
+            state = f"cooldown ещё {hours:.1f} ч"
+        lines.append(f"  {entry['name']}: {entry['count_today']} обращений сегодня, {state}")
+    return "\n".join(lines) + "\n\n"
+
+
 def _format_llm_mode_status(services: Services) -> str:
     """Render the active LLM provider/mode for /llm_mode."""
     llm = services.llm

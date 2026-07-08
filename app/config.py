@@ -49,6 +49,7 @@ class Settings:
     telegraph_access_token: str | None
     telegraph_author_name: str
     ytdlp_cookies_path: Path | None
+    ytdlp_cookies_dir: Path
     ytdlp_min_interval_sec: float
     ytdlp_soft_daily_limit: int
     bot_data_dir: Path
@@ -176,6 +177,13 @@ def load_settings() -> Settings:
     ).expanduser()
     cookies_raw = os.getenv("YTDLP_COOKIES_PATH", "").strip()
     cookies_path = Path(cookies_raw).expanduser() if cookies_raw else None
+    # Ротация cookie-аккаунтов: если в этой директории лежат *.txt-файлы,
+    # YouTubeService переключается в multi-account режим (round-robin +
+    # cooldown при бане); пустая/отсутствующая директория — прежний
+    # одиночный режим на ytdlp_cookies_path.
+    ytdlp_cookies_dir = Path(
+        os.getenv("YTDLP_COOKIES_DIR", str(data_dir / "cookies"))
+    ).expanduser()
 
     monitoring_config_path = Path(
         os.getenv("MONITORING_CONFIG_PATH", str(data_dir / "monitoring.yaml"))
@@ -369,6 +377,7 @@ def load_settings() -> Settings:
         telegraph_access_token=os.getenv("TELEGRAPH_ACCESS_TOKEN", "").strip() or None,
         telegraph_author_name=os.getenv("TELEGRAPH_AUTHOR_NAME", "YouTube Summary Bot"),
         ytdlp_cookies_path=cookies_path,
+        ytdlp_cookies_dir=ytdlp_cookies_dir,
         ytdlp_min_interval_sec=ytdlp_min_interval_sec,
         ytdlp_soft_daily_limit=ytdlp_soft_daily_limit,
         bot_data_dir=data_dir,
