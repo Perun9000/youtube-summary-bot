@@ -73,6 +73,9 @@ class GenerationUsage:
     total_tokens: int = 0
     calls: int = 0
     duration_sec: float = 0.0
+    # finish_reason последнего вызова: "length" означает обрыв по max_tokens —
+    # downstream (summarizer) по нему отличает зацикленную модель от битого JSON.
+    last_finish_reason: str | None = None
 
     def add(
         self,
@@ -420,6 +423,7 @@ class OpenRouterClient:
         passes = self._settings.openrouter_fallback_retry_passes + 1
         delay = self._settings.openrouter_fallback_retry_delay_sec
         last_error: Exception | None = None
+        truncated_text: str | None = None
         for pass_idx in range(passes):
             for model in chain:
                 try:
@@ -430,6 +434,8 @@ class OpenRouterClient:
                     return result
                 except _OpenRouterRetriable as exc:
                     last_error = exc.cause
+                    if isinstance(exc, _OpenRouterTruncated):
+                        truncated_text = exc.text
                     logger.warning(
                         "llm.generate.fallback provider=openrouter model=%s pass=%s/%s "
                         "trying_next reason=%s",
@@ -442,6 +448,16 @@ class OpenRouterClient:
                     pass_idx + 1, passes, delay,
                 )
                 await asyncio.sleep(delay)
+
+        if truncated_text is not None:
+            # Вся цепочка либо отказала, либо обрезала ответ по max_tokens.
+            # Обрезанный текст — лучшее, что есть: отдаём его, downstream-парсер
+            # (damaged-JSON recovery в summarizer) решит, пригоден ли он.
+            logger.warning(
+                "llm.generate.truncated_last_resort provider=openrouter chars=%s",
+                len(truncated_text),
+            )
+            return truncated_text
 
         models_tried = ", ".join(chain)
         # Если последняя ошибка — 402, это почти всегда дневной USD-cap
@@ -555,6 +571,14 @@ class OpenRouterClient:
                 return await self._generate_one_attempt(
                     model, prompt, system, usage, max_tokens
                 )
+            except _OpenRouterTruncated as exc:
+                # Одиночная модель без цепочки: альтернативы нет, повтор того же
+                # запроса вряд ли поможет — отдаём обрезанный текст downstream'у.
+                logger.warning(
+                    "llm.generate.truncated provider=openrouter model=%s chars=%s",
+                    model, len(exc.text),
+                )
+                return exc.text
             except _OpenRouterRetriable as exc:
                 last_exc = exc.cause
                 if attempt >= LLM_GENERATE_MAX_ATTEMPTS:
@@ -648,9 +672,11 @@ class OpenRouterClient:
         choices = data.get("choices", [])
         if not choices:
             result = ""
+            finish_reason = ""
         else:
             message = choices[0].get("message", {})
             result = _strip_thinking(str(message.get("content", ""))).strip()
+            finish_reason = str(choices[0].get("finish_reason") or "")
 
         usage_info = _extract_openrouter_usage(data.get("usage") or {})
         if usage is not None:
@@ -660,6 +686,7 @@ class OpenRouterClient:
                 total_tokens=usage_info.total_tokens,
                 duration_sec=duration_sec,
             )
+            usage.last_finish_reason = finish_reason or None
 
         self._budget.record(usage_info.cost_usd)
         snap = self._budget.snapshot()
@@ -667,7 +694,7 @@ class OpenRouterClient:
         logger.info(
             "llm.generate.done provider=openrouter model=%s prompt_chars=%s response_chars=%s "
             "prompt_tokens=%s completion_tokens=%s total_tokens=%s cost_usd=%.6f "
-            "duration_sec=%.1f budget_today_usd=%.4f budget_today_requests=%s "
+            "duration_sec=%.1f finish_reason=%s budget_today_usd=%.4f budget_today_requests=%s "
             "mode=%s",
             model,
             len(prompt),
@@ -677,10 +704,15 @@ class OpenRouterClient:
             usage_info.total_tokens,
             usage_info.cost_usd,
             duration_sec,
+            finish_reason or "-",
             float(snap.get("spent_usd", 0.0)),
             int(snap.get("request_count", 0)),
             "paid" if self.is_paid_mode() else "free",
         )
+        if finish_reason == "length":
+            # Модель упёрлась в лимит completion-токенов: вывод обрезан и почти
+            # наверняка непригоден (частый случай — зацикленный reasoning).
+            raise _OpenRouterTruncated(result)
         return result
 
     async def list_models(self) -> list[str]:
@@ -757,6 +789,22 @@ class _OpenRouterRetriable(Exception):
         super().__init__(short_reason)
         self.short_reason = short_reason
         self.cause = cause
+
+
+class _OpenRouterTruncated(_OpenRouterRetriable):
+    """Ответ обрезан по max_tokens (finish_reason=length).
+
+    Типичный сценарий — reasoning-модель зациклилась и выжгла весь лимит,
+    не дойдя до полезного вывода. Free-цепочка пробует следующую модель;
+    обрезанный текст сохраняется как last resort на случай, когда вся
+    цепочка вернула такой же брак.
+    """
+
+    def __init__(self, text: str) -> None:
+        super().__init__(
+            "truncated_at_max_tokens", RuntimeError("finish_reason=length")
+        )
+        self.text = text
 
 
 def _extract_openrouter_usage(usage_data: dict) -> _OpenRouterUsageInfo:
@@ -889,9 +937,13 @@ class LMStudioClient:
         choices = data.get("choices", [])
         if not choices:
             result = ""
+            finish_reason = ""
         else:
             message = choices[0].get("message", {})
             result = _strip_thinking(str(message.get("content", ""))).strip()
+            finish_reason = str(choices[0].get("finish_reason") or "")
+        if usage is not None:
+            usage.last_finish_reason = finish_reason or None
 
         usage_data = data.get("usage") or {}
         prompt_tokens = int(usage_data.get("prompt_tokens") or 0)

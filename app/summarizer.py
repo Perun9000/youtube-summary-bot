@@ -264,6 +264,15 @@ class SummaryParseError(ValueError):
     pass
 
 
+class SummaryUnusableError(RuntimeError):
+    """Модель после всех повторов не вернула пригодный JSON summary.
+
+    Публиковать нечего: сырой ответ (например, зацикленный chain-of-thought
+    reasoning-модели) не должен уходить пользователям и в канал — job честно
+    падает, pipeline отправляет стандартное сообщение об ошибке.
+    """
+
+
 class Summarizer:
     def __init__(
         self,
@@ -346,7 +355,12 @@ class Summarizer:
             try:
                 summary = self._parse_summary(raw)
             except SummaryParseError as exc:
-                logger.warning("summary.parse_json.failed mode=single raw_chars=%s error=%s", len(raw), exc)
+                logger.warning(
+                    "summary.parse_json.failed mode=single raw_chars=%s finish_reason=%s error=%s",
+                    len(raw),
+                    usage.last_finish_reason if usage else None,
+                    exc,
+                )
                 if progress:
                     progress.start_step("компактный повтор")
                 retry_raw = await self._llm.generate(
@@ -366,8 +380,9 @@ class Summarizer:
                     summary = self._parse_summary(raw)
                 except SummaryParseError as retry_exc:
                     logger.warning(
-                        "summary.parse_json.fallback mode=single raw_chars=%s error=%s",
+                        "summary.parse_json.fallback mode=single raw_chars=%s finish_reason=%s error=%s",
                         len(raw),
+                        usage.last_finish_reason if usage else None,
                         retry_exc,
                     )
                     summary = _fallback_summary_from_raw(raw)
@@ -929,20 +944,10 @@ def _fallback_summary_from_raw(raw: str) -> Summary:
     if recovered is not None:
         return recovered
 
-    cleaned = _clean_json_text(raw)
-    if cleaned.startswith("{"):
-        overview = (
-            "Модель вернула summary в повреждённом JSON-формате. "
-            "Полный ответ модели опубликован в Telegra.ph."
-        )
-    else:
-        overview = _truncate_text(cleaned, 1200) or "Модель не вернула пригодный текст summary."
-
-    return Summary(
-        overview=overview,
-        key_points=[],
-        chapters=[],
-        raw_text=cleaned or raw,
+    # Из ответа не извлекается ни overview, ни главы — это не summary, а мусор
+    # (чаще всего сырой reasoning зацикленной модели). Публиковать его нельзя.
+    raise SummaryUnusableError(
+        f"LLM не вернул пригодный JSON summary после повторов (raw_chars={len(raw)})"
     )
 
 

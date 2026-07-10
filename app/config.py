@@ -80,6 +80,8 @@ class Settings:
     digests_path: Path
     digest_pins_path: Path
     system_prompt_path: Path
+    local_api_token: str
+    local_api_port: int
 
     def effective_chunk_max_chars(self, active_model: str | None = None) -> int:
         """Pick the chunk size that best fits the LLM that will actually run.
@@ -342,6 +344,11 @@ def load_settings() -> Settings:
     ytdlp_min_interval_sec = env.float("YTDLP_MIN_INTERVAL_SEC", "2")
     ytdlp_soft_daily_limit = env.int("YTDLP_SOFT_DAILY_LIMIT", "150")
 
+    # Локальный HTTP API для кнопки расширения (тихая постановка без deep-link).
+    # Пустой токен → сервер не стартует, фича выключена (см. app/local_api.py).
+    local_api_token = os.getenv("LOCAL_API_TOKEN", "").strip()
+    local_api_port = env.int("LOCAL_API_PORT", "8799")
+
     env.raise_if_errors()
 
     return Settings(
@@ -408,4 +415,6 @@ def load_settings() -> Settings:
         digests_path=digests_path,
         digest_pins_path=digest_pins_path,
         system_prompt_path=system_prompt_path,
+        local_api_token=local_api_token,
+        local_api_port=local_api_port,
     )

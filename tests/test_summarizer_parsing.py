@@ -1,5 +1,13 @@
 from app.models import Summary
-from app.summarizer import _clean_json_text, _load_json, _summary_from_damaged_json, SummaryParseError
+from app.summarizer import (
+    Summarizer,
+    SummaryParseError,
+    SummaryUnusableError,
+    _clean_json_text,
+    _fallback_summary_from_raw,
+    _load_json,
+    _summary_from_damaged_json,
+)
 
 import pytest
 
@@ -57,3 +65,46 @@ def test_damaged_json_escaped_quotes_in_notes():
     summary = _summary_from_damaged_json(raw)
     assert summary is not None
     assert summary.chapters[0].notes == 'Он сказал: "да".'
+
+
+# --- Guard: сырой текст модели не должен публиковаться как summary ---
+
+REASONING_PROSE = (
+    "We need to produce JSON with overview and chapters. The transcript is a bit "
+    "messy, but we need to extract main ideas. Also mention that some experts note..."
+)
+
+
+def test_fallback_raises_on_reasoning_prose():
+    # Ответ без JSON-структуры (chain-of-thought reasoning-модели) — брак,
+    # его нельзя отдавать в канал как overview.
+    with pytest.raises(SummaryUnusableError):
+        _fallback_summary_from_raw(REASONING_PROSE)
+
+
+def test_fallback_raises_on_unrecoverable_json():
+    # JSON-объект без единого полезного поля тоже не публикуем.
+    with pytest.raises(SummaryUnusableError):
+        _fallback_summary_from_raw('{"foo": 1, "bar": [')
+
+
+def test_fallback_still_recovers_damaged_json():
+    summary = _fallback_summary_from_raw('{"overview": "Спасённый обзор", "chapters": [')
+    assert summary.overview == "Спасённый обзор"
+
+
+class _ReasoningOnlyLLM:
+    """Фейковый LLM, который всегда отвечает reasoning-прозой вместо JSON."""
+
+    @property
+    def provider_name(self) -> str:
+        return "fake"
+
+    async def generate(self, prompt, system=None, usage=None, max_tokens=None, route="default"):
+        return REASONING_PROSE
+
+
+async def test_single_chunk_reasoning_output_fails_summarize():
+    summarizer = Summarizer(_ReasoningOnlyLLM(), system_prompt_provider=lambda: "sys")
+    with pytest.raises(SummaryUnusableError):
+        await summarizer.summarize(url="https://youtu.be/x", title="t", chunks=["один чанк"])

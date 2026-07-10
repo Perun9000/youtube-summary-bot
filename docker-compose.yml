@@ -5,6 +5,8 @@ services:
       - .env
     volumes:
       - ./data:/data
+    ports:
+      - "127.0.0.1:8799:8799"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
