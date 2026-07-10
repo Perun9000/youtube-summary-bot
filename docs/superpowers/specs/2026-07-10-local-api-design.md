@@ -32,7 +32,7 @@
 
 - Options-страница: новое поле «Local API token» (пустое по умолчанию), хранится в `storage.sync` (dual-form, как остальные настройки). Пустой токен → расширение ведёт себя как раньше (только deep-link), никаких fetch.
 - По клику кнопки (оба места: страница видео и превью-карточки):
-  1. Если токен задан — `fetch('http://127.0.0.1:8799/enqueue', {method:'POST', headers:{'Content-Type':'application/json','X-Auth-Token':token}, body:{video_id}, signal: AbortSignal.timeout(1500)})`.
+  1. Если токен задан — fetch к `http://127.0.0.1:8799/enqueue` выполняет **background service worker** (content-script шлёт ему runtime-сообщение): Chrome блокирует запросы публичных страниц к loopback (Private Network Access), а background-контекст с `host_permissions` от этого свободен. Таймаут 1500 мс.
   2. `200` → кнопка на ~2 сек показывает «✅» (queued) и возвращается в исходный вид; фокус остаётся на YouTube.
   3. Не-200 / сетевые ошибки / таймаут → fallback: открыть старый `https://t.me/...?start=<id>` deep-link (текущее поведение).
 - `manifest.json`: `host_permissions` += `"http://127.0.0.1:8799/*"`; bump версии (0.2.5). После выката владелец перезагружает расширение.
