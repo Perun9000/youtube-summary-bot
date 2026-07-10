@@ -85,6 +85,26 @@ async def test_all_models_truncated_returns_last_resort_text(client, monkeypatch
     assert usage.last_finish_reason == "length"
 
 
+async def test_payload_asks_to_exclude_reasoning(client, monkeypatch):
+    """Reasoning-модели не должны возвращать рассуждения в content.
+
+    Нерассуждающие модели параметр игнорируют, поэтому он ставится глобально.
+    """
+    captured: list[dict] = []
+
+    async def fake_post(self, url, headers=None, json=None):
+        captured.append(json)
+        return httpx.Response(
+            200,
+            json=_completion('{"overview": "ок"}', "stop"),
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    await client.generate("p")
+    assert captured and captured[0]["reasoning"] == {"exclude": True}
+
+
 async def test_normal_response_keeps_finish_reason_stop(client, monkeypatch):
     _wire_responses(
         monkeypatch,

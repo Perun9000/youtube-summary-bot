@@ -631,6 +631,10 @@ class OpenRouterClient:
             "max_tokens": effective_max_tokens,
             "stream": False,
             "usage": {"include": True},
+            # Reasoning-модели (nemotron, gpt-oss) рассуждают, но рассуждения
+            # не возвращаются в content — иначе они загрязняют JSON-ответ.
+            # Нерассуждающие модели параметр игнорируют.
+            "reasoning": {"exclude": True},
         }
 
         async with httpx.AsyncClient(timeout=LLM_GENERATE_TIMEOUT_SEC) as client:
