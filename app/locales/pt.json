@@ -1,6 +1,6 @@
 {
   "access.closed": "Este bot é fechado para uso pessoal.",
-  "btn.details": "• Resumo detalhado •",
+  "btn.details": "❖ Resumo detalhado ❖",
   "btn.transcript": "📄 Transcrição (md)",
   "error.daily_free_limit": "o limite diário de gerações gratuitas do serviço acabou. Tente novamente depois das 00:00 UTC, ou assine — /subscribe",
   "error.generation_failed": "a geração do resumo para o vídeo {link} foi interrompida.\n\nMotivo: {reason}",

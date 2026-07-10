@@ -1,6 +1,6 @@
 {
   "access.closed": "این بات برای استفاده‌ی شخصی بسته است.",
-  "btn.details": "• خلاصه‌ی کامل •",
+  "btn.details": "❖ خلاصه‌ی کامل ❖",
   "btn.transcript": "📄 متن پیاده‌شده (md)",
   "error.daily_free_limit": "سهمیه‌ی روزانه‌ی تولیدهای رایگان سرویس تمام شده است. پس از ساعت 00:00 UTC دوباره امتحان کن یا اشتراک بگیر — /subscribe",
   "error.generation_failed": "تولید خلاصه برای ویدیوی {link} قطع شد.\n\nدلیل: {reason}",
