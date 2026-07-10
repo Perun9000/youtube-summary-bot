@@ -36,20 +36,24 @@ function storageSyncSet(items) {
 }
 
 function load() {
-  storageSyncGet({ botHandle: DEFAULT_HANDLE })
+  storageSyncGet({ botHandle: DEFAULT_HANDLE, localApiToken: "" })
     .then((items) => {
       document.getElementById("handle").value =
         (items && items.botHandle) || DEFAULT_HANDLE;
+      document.getElementById("localApiToken").value =
+        (items && items.localApiToken) || "";
     })
     .catch(() => {
       document.getElementById("handle").value = DEFAULT_HANDLE;
+      document.getElementById("localApiToken").value = "";
     });
 }
 
 document.getElementById("save").addEventListener("click", () => {
   const value = document.getElementById("handle").value.trim().replace(/^@/, "") || DEFAULT_HANDLE;
+  const localApiToken = document.getElementById("localApiToken").value.trim();
   const status = document.getElementById("status");
-  storageSyncSet({ botHandle: value })
+  storageSyncSet({ botHandle: value, localApiToken })
     .then(() => {
       status.textContent = "Сохранено";
       setTimeout(() => (status.textContent = ""), 1500);

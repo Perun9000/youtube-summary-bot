@@ -6,6 +6,9 @@
 <body>
   <label for="handle">Telegram-хэндл бота (без @):</label>
   <input id="handle" placeholder="YouTube_Sum_mary_bot">
+  <label for="localApiToken" style="margin-top:14px">Local API token:</label>
+  <input id="localApiToken" type="password" placeholder="">
+  <p style="font-size:12px;color:#666;margin:4px 0 0">Токен из LOCAL_API_TOKEN в .env бота. Пусто — кнопка работает через Telegram deep-link, как раньше.</p>
   <button id="save">Сохранить</button><span id="status"></span>
   <script src="options.js"></script>
 </body>

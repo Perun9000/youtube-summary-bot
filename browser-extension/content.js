@@ -16,7 +16,7 @@
 
   // Маркер версии content script'а: виден со страницы, позволяет отличить
   // «код не перезагрузился» от «в новом коде баг» при отладке.
-  const SCRIPT_VERSION = '0.2.4';
+  const SCRIPT_VERSION = '0.2.5';
   document.documentElement.dataset.ytSummaryExt = SCRIPT_VERSION;
 
   const api = globalThis.browser ?? globalThis.chrome;
@@ -45,6 +45,30 @@
         resolve(DEFAULT_BOT_HANDLE);
       }
     });
+  }
+
+  // Пытается поставить ролик через локальный API бота (background SW
+  // делает fetch — обходит CORS/Private-Network-Access-ограничения на
+  // запросы страницы youtube.com к 127.0.0.1). true — успех, кнопка
+  // остаётся на YouTube; false — нужен deep-link fallback (токен не
+  // задан в options, бот выключен/недоступен или таймаут).
+  function tryLocalEnqueue(videoId) {
+    return new Promise((resolve) => {
+      try {
+        api.runtime.sendMessage({ type: 'yt-summary-enqueue', videoId }, (resp) => {
+          if (api.runtime.lastError || !resp) { resolve(false); return; }
+          resolve(!!resp.ok);
+        });
+      } catch {
+        resolve(false);
+      }
+    });
+  }
+
+  // Показывает «✅» на кнопке ~2 сек, затем возвращает исходный текст.
+  function flashButton(btn, originalText) {
+    btn.textContent = '✅';
+    setTimeout(() => { btn.textContent = originalText; }, 2000);
   }
 
   // ───────────────────────────── helpers ─────────────────────────────
@@ -89,6 +113,11 @@
       const id = extractVideoId();
       if (!id) {
         showToast('Открой ролик YouTube и нажми снова — это не страница с видео.');
+        return;
+      }
+      const okLocal = await tryLocalEnqueue(id);
+      if (okLocal) {
+        flashButton(btn, '🔮 Summary');
         return;
       }
       const handle = await getBotHandle();
@@ -230,6 +259,12 @@
       // сайдбара при SPA-переходах, и ссылка могла смениться.
       const id = extractIdFromHref(anchor.href);
       if (!id) return;
+      const originalText = btn.textContent;
+      const okLocal = await tryLocalEnqueue(id);
+      if (okLocal) {
+        flashButton(btn, originalText);
+        return;
+      }
       const handle = await getBotHandle();
       const url = `https://t.me/${handle}?start=${encodeURIComponent(id)}`;
       window.open(url, '_blank', 'noopener,noreferrer');
