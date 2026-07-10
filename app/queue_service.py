@@ -17,7 +17,12 @@ from app.status_messages import (
     _prefetch_job_title,
     _set_service_status,
 )
-from app.delivery import _lookup_cached_summary, _send_cached_summary_to_chat, _send_quota_denied
+from app.delivery import (
+    _deliver_cached_summary_for_job,
+    _lookup_cached_summary,
+    _send_cached_summary_to_chat,
+    _send_quota_denied,
+)
 from app.pipeline import _process_transcription_job, _process_youtube_job
 
 
@@ -225,6 +230,59 @@ async def restore_pending_jobs(services: Services) -> int:
     if restored:
         logger.info("queue.restored jobs=%s", restored)
     return restored
+
+
+async def enqueue_local_api_job(video_id: str, services: Services) -> str:
+    """Постановка от локального API (кнопка расширения, HTTP без Message).
+
+    Аналог восстановленных задач: message=None, доставка и статусы идут через
+    bot.send_message(chat_id владельца). Квоты не применяются (owner).
+    Возвращает "cached" (отдано из кэша) или "queued".
+    """
+    owner_id = services.settings.owner_user_id
+    if owner_id is None:
+        raise RuntimeError("owner_not_configured")
+    lang = "ru"
+    if services.user_langs is not None:
+        stored = services.user_langs.get(owner_id)
+        if stored is not None:
+            lang = stored[0]
+    url = f"https://www.youtube.com/watch?v={video_id}"
+
+    cached = _lookup_cached_summary(url, services, lang=lang)
+    if cached is not None:
+        probe = SummaryJob(
+            sequence=0, message=None, url=url,
+            enqueued_at=time.monotonic(), chat_id=owner_id, lang=lang,
+        )
+        await _deliver_cached_summary_for_job(probe, services, cached)
+        logger.info("local_api.cache.hit video_id=%s", video_id)
+        return "cached"
+
+    async with services.summary_queue_lock:
+        services.summary_next_sequence += 1
+        db_id = (
+            services.job_store.add(
+                url, owner_id, scheduled=False, disable_notification=False,
+                title_hint=None, lang=lang,
+            )
+            if services.job_store
+            else None
+        )
+        job = SummaryJob(
+            sequence=services.summary_next_sequence,
+            message=None,
+            url=url,
+            enqueued_at=time.monotonic(),
+            chat_id=owner_id,
+            db_id=db_id,
+            lang=lang,
+        )
+        await services.summary_queue.put(job)
+        if services.summary_worker_task is None or services.summary_worker_task.done():
+            services.summary_worker_task = asyncio.create_task(_summary_queue_worker(services))
+    logger.info("local_api.job.enqueued sequence=%s video_id=%s", job.sequence, video_id)
+    return "queued"
 
 
 # Как часто deferred-scheduler проверяет, не пришло ли время отложенных
