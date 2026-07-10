@@ -1,6 +1,6 @@
 {
   "access.closed": "This bot is closed for personal use.",
-  "btn.details": "detailed summary",
+  "btn.details": "• Detailed summary •",
   "btn.transcript": "📄 Transcript (md)",
   "error.daily_free_limit": "the service's daily free-generation limit is used up. Try again after 00:00 UTC, or subscribe — /subscribe",
   "error.generation_failed": "summary generation for the video {link} was interrupted.\n\nReason: {reason}",

@@ -1,6 +1,6 @@
 {
   "access.closed": "Bot ini tertutup untuk penggunaan pribadi.",
-  "btn.details": "ringkasan detail",
+  "btn.details": "• Ringkasan detail •",
   "btn.transcript": "📄 Transkrip (md)",
   "error.daily_free_limit": "kuota harian pembuatan gratis layanan sudah habis. Coba lagi setelah pukul 00:00 UTC, atau berlangganan — /subscribe",
   "error.generation_failed": "pembuatan ringkasan untuk video {link} terhenti.\n\nAlasan: {reason}",
