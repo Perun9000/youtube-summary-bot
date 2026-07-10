@@ -81,7 +81,7 @@ def _format_telegram_summary(
     telegraph_line = ""
     if telegraph_url:
         telegraph_line = (
-            f'🔮 <a href="{escape_html(telegraph_url)}">{t("btn.details", lang)}</a>'
+            f'🔮 <a href="{escape_html(telegraph_url)}">{t("summary.details_link", lang)}</a>'
         )
 
     blocks = [channel_line, title_line]

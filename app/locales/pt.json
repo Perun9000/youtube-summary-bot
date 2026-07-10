@@ -1,6 +1,6 @@
 {
   "access.closed": "Este bot é fechado para uso pessoal.",
-  "btn.details": "❖ Resumo detalhado ❖",
+  "btn.details": "• Resumo detalhado •",
   "btn.transcript": "📄 Transcrição (md)",
   "error.daily_free_limit": "o limite diário de gerações gratuitas do serviço acabou. Tente novamente depois das 00:00 UTC, ou assine — /subscribe",
   "error.generation_failed": "a geração do resumo para o vídeo {link} foi interrompida.\n\nMotivo: {reason}",
@@ -59,6 +59,7 @@
   "subscribe.pitch": "Assinatura: {monthly} resumos por mês por {price} ⭐.\nQuestões de pagamento: /paysupport.",
   "subscribe.unlimited_already": "Você já tem acesso ilimitado 🎉",
   "summary.about": "<b>Sobre o que é:</b>",
+  "summary.details_link": "resumo detalhado",
   "summary.likes": "{count} curtidas",
   "summary.likes_one": "{count} curtida",
   "summary.made_by": "<i>feito por @{username}</i>",

@@ -1,6 +1,6 @@
 {
   "access.closed": "Bot ini tertutup untuk penggunaan pribadi.",
-  "btn.details": "❖ Ringkasan detail ❖",
+  "btn.details": "• Ringkasan detail •",
   "btn.transcript": "📄 Transkrip (md)",
   "error.daily_free_limit": "kuota harian pembuatan gratis layanan sudah habis. Coba lagi setelah pukul 00:00 UTC, atau berlangganan — /subscribe",
   "error.generation_failed": "pembuatan ringkasan untuk video {link} terhenti.\n\nAlasan: {reason}",
@@ -59,6 +59,7 @@
   "subscribe.pitch": "Langganan: {monthly} ringkasan per bulan seharga {price} ⭐.\nPertanyaan pembayaran: /paysupport.",
   "subscribe.unlimited_already": "Anda sudah memiliki akses tak terbatas 🎉",
   "summary.about": "<b>Tentang apa videonya:</b>",
+  "summary.details_link": "ringkasan detail",
   "summary.likes": "{count} suka",
   "summary.likes_one": "{count} suka",
   "summary.made_by": "<i>dibuat oleh @{username}</i>",

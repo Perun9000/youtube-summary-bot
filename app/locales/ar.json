@@ -1,6 +1,6 @@
 {
   "access.closed": "هذا البوت مغلق للاستخدام الشخصي.",
-  "btn.details": "❖ الملخص التفصيلي ❖",
+  "btn.details": "• الملخص التفصيلي •",
   "btn.transcript": "📄 النص المفرَّغ (md)",
   "error.daily_free_limit": "انتهت الحصة اليومية المجانية للخدمة. حاول مرة أخرى بعد الساعة 00:00 UTC، أو اشترك — /subscribe",
   "error.generation_failed": "تم مقاطعة توليد الملخص لفيديو {link}.\n\nالسبب: {reason}",
@@ -59,6 +59,7 @@
   "subscribe.pitch": "اشتراك: {monthly} ملخص شهريًا بسعر {price} ⭐.\nأسئلة الدفع: /paysupport.",
   "subscribe.unlimited_already": "لديك بالفعل وصول غير محدود 🎉",
   "summary.about": "<b>عن ماذا الفيديو:</b>",
+  "summary.details_link": "الملخص التفصيلي",
   "summary.likes": "{count} إعجاب",
   "summary.likes_one": "{count} إعجاب",
   "summary.made_by": "<i>بواسطة @{username}</i>",

@@ -1,6 +1,6 @@
 {
   "access.closed": "Этот бот закрыт для личного использования.",
-  "btn.details": "❖ Подробное саммари ❖",
+  "btn.details": "• Подробное саммари •",
   "btn.transcript": "📄 Транскрипт (md)",
   "error.daily_free_limit": "дневной лимит бесплатных генераций сервиса исчерпан. Попробуй после 03:00 МСК или оформи подписку — /subscribe",
   "error.generation_failed": "генерация саммари для видео {link} прервана.\n\nПричина: {reason}",
@@ -59,6 +59,7 @@
   "subscribe.pitch": "Подписка: {monthly} саммари в месяц за {price} ⭐.\nВопросы по оплате: /paysupport.",
   "subscribe.unlimited_already": "У тебя и так безлимитный доступ 🎉",
   "summary.about": "<b>О чем видео:</b>",
+  "summary.details_link": "подробное саммари",
   "summary.likes": "{count} лайков",
   "summary.likes_one": "{count} лайк",
   "summary.made_by": "<i>сделано @{username}</i>",

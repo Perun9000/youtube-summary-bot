@@ -1,6 +1,6 @@
 {
   "access.closed": "This bot is closed for personal use.",
-  "btn.details": "❖ Detailed summary ❖",
+  "btn.details": "• Detailed summary •",
   "btn.transcript": "📄 Transcript (md)",
   "error.daily_free_limit": "the service's daily free-generation limit is used up. Try again after 00:00 UTC, or subscribe — /subscribe",
   "error.generation_failed": "summary generation for the video {link} was interrupted.\n\nReason: {reason}",
@@ -59,6 +59,7 @@
   "subscribe.pitch": "Subscription: {monthly} summaries a month for {price} ⭐.\nBilling questions: /paysupport.",
   "subscribe.unlimited_already": "You already have unlimited access 🎉",
   "summary.about": "<b>What it's about:</b>",
+  "summary.details_link": "detailed summary",
   "summary.likes": "{count} likes",
   "summary.likes_one": "{count} like",
   "summary.made_by": "<i>made by @{username}</i>",
