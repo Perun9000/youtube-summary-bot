@@ -8,7 +8,33 @@ import pytest
 
 from app.config import load_settings
 from app.db import Database
-from app.llm_client import _select_dynamic_tail
+from app.llm_client import OpenRouterClient, _select_dynamic_tail
+
+
+@pytest.fixture
+def client(tmp_path, monkeypatch):
+    monkeypatch.setattr("app.config.load_dotenv", lambda *a, **k: None)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "1:x")
+    monkeypatch.setenv("BOT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("OPENROUTER_MODEL_FREE_CHAIN", "chain/model-1,chain/model-2")
+    monkeypatch.setenv("OPENROUTER_FALLBACK_RETRY_PASSES", "0")
+    settings = load_settings()
+    c = OpenRouterClient(settings, Database(tmp_path / "bot.db"))
+    c.set_paid_mode(False)
+    return c
+
+
+def _wire_catalog(monkeypatch, models: list[dict], counter: list[int]):
+    async def fake_get(self, url, headers=None):
+        counter[0] += 1
+        return httpx.Response(
+            200, json={"data": models}, request=httpx.Request("GET", url)
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
 
 
 def _entry(model_id: str, ctx: int) -> dict:
@@ -56,3 +82,12 @@ def test_selector_orders_by_context_desc():
     ]
     tail = _select_dynamic_tail(catalog, exclude_ids=set())
     assert tail == ["b/model-two:free", "c/model-three:free", "a/model-one:free"]
+
+
+async def test_catalog_cached_within_ttl(client, monkeypatch):
+    counter = [0]
+    _wire_catalog(monkeypatch, [_entry("x/model:free", 200000)], counter)
+    first = await client._catalog_models()
+    second = await client._catalog_models()
+    assert counter[0] == 1
+    assert first == second == [{"id": "x/model:free", "context_length": 200000}]

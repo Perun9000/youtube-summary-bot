@@ -347,6 +347,9 @@ class OpenRouterClient:
             legacy_json_path=settings.openrouter_budget_state_path,
         )
         self._runtime = OpenRouterRuntimeState(db, legacy_json_path=settings.openrouter_runtime_state_path)
+        # Кэш каталога /models для динамического хвоста (см. _catalog_models).
+        self._catalog_cache: list[dict] | None = None
+        self._catalog_fetched_at = 0.0
         self._cached_context_length: dict[str, int] = {}
         self._breaker = CircuitBreaker()
 
@@ -721,6 +724,30 @@ class OpenRouterClient:
             # наверняка непригоден (частый случай — зацикленный reasoning).
             raise _OpenRouterTruncated(result)
         return result
+
+    async def _catalog_models(self) -> list[dict]:
+        """Сырой каталог /models с in-memory кэшем на MODELS_CATALOG_TTL_SEC.
+
+        TTL защищает каталог от долбёжки, когда во время шторма 429
+        цепочка исчерпывается на каждом job'е подряд.
+        """
+        now = time.monotonic()
+        if (
+            self._catalog_cache is not None
+            and now - self._catalog_fetched_at < MODELS_CATALOG_TTL_SEC
+        ):
+            return self._catalog_cache
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                f"{self._settings.openrouter_base_url}/models",
+                headers=self._headers(),
+            )
+            _raise_for_status(response, "OpenRouter")
+            data = response.json()
+        models = [m for m in data.get("data", []) if isinstance(m, dict)]
+        self._catalog_cache = models
+        self._catalog_fetched_at = now
+        return models
 
     async def list_models(self) -> list[str]:
         async with httpx.AsyncClient(timeout=30) as client:
