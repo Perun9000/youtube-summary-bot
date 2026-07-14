@@ -85,6 +85,32 @@ async def test_all_models_truncated_returns_last_resort_text(client, monkeypatch
     assert usage.last_finish_reason == "length"
 
 
+async def test_model_gone_404_falls_through_to_next_model(client, monkeypatch):
+    """OpenRouter периодически убирает free-тариф у моделей (404 «This model
+    is unavailable for free») — одна умершая модель не должна ронять job."""
+    calls: list[str] = []
+
+    async def fake_post(self, url, headers=None, json=None):
+        model = json["model"]
+        calls.append(model)
+        if model == "chain/model-1":
+            return httpx.Response(
+                404,
+                json={"error": {"message": "This model is unavailable for free.", "code": 404}},
+                request=httpx.Request("POST", url),
+            )
+        return httpx.Response(
+            200,
+            json=_completion('{"overview": "ок"}', "stop"),
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    result = await client.generate("p")
+    assert result == '{"overview": "ок"}'
+    assert calls == ["chain/model-1", "chain/model-2"]
+
+
 async def test_payload_asks_to_exclude_reasoning(client, monkeypatch):
     """Reasoning-модели не должны возвращать рассуждения в content.
 

@@ -259,8 +259,9 @@ def load_settings() -> Settings:
     else:
         openrouter_model_free_chain = (
             "qwen/qwen3-next-80b-a3b-instruct:free",
-            "openai/gpt-oss-120b:free",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
             "nvidia/nemotron-3-super-120b-a12b:free",
+            "tencent/hy3:free",
             "meta-llama/llama-3.3-70b-instruct:free",
         )
     if not openrouter_model_free_chain:

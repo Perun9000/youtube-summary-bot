@@ -659,8 +659,11 @@ class OpenRouterClient:
             #   Chutes, DeepInfra) упёрся в свой суточный USD-cap для free-trafic.
             #   У разных моделей в цепочке — разные провайдеры, поэтому
             #   следующая в chain'е может ответить нормально.
+            # - 404: модель убрана из каталога (OpenRouter периодически снимает
+            #   free-тариф — «This model is unavailable for free»). Умершая
+            #   модель не должна ронять job: следующая в цепочке живая.
             # - 5xx: серверные сбои.
-            if status == 429 or status == 402 or 500 <= status < 600:
+            if status in (429, 402, 404) or 500 <= status < 600:
                 detail = response.text.strip().replace("\n", " ")[:300]
                 exc = RuntimeError(f"OpenRouter HTTP {status}: {detail}")
                 raise _OpenRouterRetriable(f"http_{status}", exc)

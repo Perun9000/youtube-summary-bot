@@ -62,34 +62,37 @@ logger = logging.getLogger(__name__)
 def _user_facing_error_reason(exc: Exception, job: SummaryJob, services) -> str:
     """Причина ошибки для сообщения пользователю.
 
-    Владелец/allowlist (quota_user_id is None) видят полный технический текст
-    с подсказками (/llm_paid, депозит OpenRouter). Внешним пользователям
-    технические маркеры подменяются человеческим объяснением: им не помочь
-    советом «переключись на платную модель» — у них либо подписка, либо
-    ожидание сброса дневного лимита free-tier (00:00 UTC = 03:00 МСК).
+    Полный технический текст (HTTP-коды, подсказки /llm_paid, депозит
+    OpenRouter) видит ТОЛЬКО владелец — job'ы из его чата. Всем остальным,
+    включая allowlist (quota_user_id is None, но чат не владельца),
+    технические подробности не показываем: им не помочь советом
+    «переключись на платную модель», а сырой текст не локализован.
 
-    Три случая для внешних, по убыванию специфичности:
+    Случаи для не-владельца, по убыванию специфичности:
     1. ``UserFacingError`` — текст уже собран через ``t(job.lang)`` выше по
        стеку (например error.heavy_quota) — отдаём как есть, не трогаем.
     2. Известные технические маркеры (free-chain/budget/GROQ_API_KEY) —
        подменяем человеческим объяснением, как раньше.
     3. Всё остальное — необработанное исключение (yt-dlp, LLM-провайдер,
-       Telegram и т.п.), внешнему пользователю сырой текст показывать нельзя
-       (не локализован, часто технический) — единый error.internal. Полный
-       exc всё равно попадает в лог через logger.exception чуть выше по
-       стеку — тут ничего не теряем.
+       Telegram и т.п.) — единый error.internal. Полный exc всё равно
+       попадает в лог через logger.exception чуть выше по стеку — тут
+       ничего не теряем.
     """
     reason = str(exc)
-    if job.quota_user_id is None:
+    owner_id = services.settings.owner_user_id if services.settings else None
+    if owner_id is not None and job.chat_id == owner_id:
         return reason
     if isinstance(exc, UserFacingError):
         return reason
     if FREE_CHAIN_EXHAUSTED_MARKER in reason:
+        # allowlist (quota_user_id is None) и подписчики — без питча /subscribe:
+        # первым подписка не нужна, у вторых она уже есть.
         is_sub = bool(
-            services.billing is not None
+            job.quota_user_id is not None
+            and services.billing is not None
             and services.billing.is_subscriber(job.quota_user_id)
         )
-        if is_sub:
+        if is_sub or job.quota_user_id is None:
             return t("error.temporary_overload", job.lang)
         return t("error.daily_free_limit", job.lang)
     if OPENROUTER_BUDGET_EXCEEDED_MARKER in reason:
