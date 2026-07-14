@@ -129,8 +129,35 @@ async def test_enqueue_local_api_job_cache_hit_returns_cached(monkeypatch):
 
     assert result == "cached"
     assert services.summary_queue.qsize() == 0
+    await asyncio.sleep(0)  # доставка идёт фоновой задачей — дать ей тик
     assert len(delivered) == 1
     assert delivered[0][2] is sentinel_cached
+
+
+async def test_enqueue_local_api_job_cache_hit_does_not_block_on_delivery(monkeypatch):
+    """Кэш-хит должен отвечать мгновенно: доставка в Telegram — это несколько
+    bot.send_message (секунды), а расширение ждёт HTTP-ответ всего 1.5 сек.
+    Медленная доставка обязана уходить в фоновую asyncio-задачу, иначе кнопка
+    по таймауту откатывается на deep-link и Telegram открывается зря."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_deliver(job, services, cached):
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(queue_service, "_deliver_cached_summary_for_job", slow_deliver)
+    services = _FakeServices(
+        user_langs=_FakeUserLangs({OWNER_ID: ("ru", "manual")}),
+        summary_cache=_FakeSummaryCache(object()),
+    )
+
+    result = await asyncio.wait_for(enqueue_local_api_job(VIDEO_ID, services), timeout=0.5)
+
+    assert result == "cached"
+    await asyncio.wait_for(started.wait(), timeout=1)  # доставка реально стартовала
+    release.set()
+    await asyncio.sleep(0)  # дать фоновой задаче завершиться до teardown'а
 
 
 async def test_enqueue_local_api_job_without_owner_raises():

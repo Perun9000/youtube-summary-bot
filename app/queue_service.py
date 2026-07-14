@@ -255,7 +255,15 @@ async def enqueue_local_api_job(video_id: str, services: Services) -> str:
             sequence=0, message=None, url=url,
             enqueued_at=time.monotonic(), chat_id=owner_id, lang=lang,
         )
-        await _deliver_cached_summary_for_job(probe, services, cached)
+        # Доставка — несколько Telegram-вызовов (секунды), а расширение ждёт
+        # HTTP-ответ всего 1.5 сек: превысим — кнопка откатится на deep-link
+        # и Telegram откроется зря. Поэтому доставляем в фоновой задаче,
+        # ответ отдаём сразу.
+        task = asyncio.create_task(
+            _deliver_cached_for_local_api(probe, services, cached, video_id)
+        )
+        _local_api_delivery_tasks.add(task)
+        task.add_done_callback(_local_api_delivery_tasks.discard)
         logger.info("local_api.cache.hit video_id=%s", video_id)
         return "cached"
 
@@ -283,6 +291,18 @@ async def enqueue_local_api_job(video_id: str, services: Services) -> str:
             services.summary_worker_task = asyncio.create_task(_summary_queue_worker(services))
     logger.info("local_api.job.enqueued sequence=%s video_id=%s", job.sequence, video_id)
     return "queued"
+
+
+# Сильные ссылки на фоновые задачи доставки кэша: голый create_task без
+# ссылки может быть собран GC до завершения.
+_local_api_delivery_tasks: set[asyncio.Task] = set()
+
+
+async def _deliver_cached_for_local_api(job, services, cached, video_id: str) -> None:
+    try:
+        await _deliver_cached_summary_for_job(job, services, cached)
+    except Exception:  # noqa: BLE001
+        logger.exception("local_api.cached_delivery_failed video_id=%s", video_id)
 
 
 # Как часто deferred-scheduler проверяет, не пришло ли время отложенных
