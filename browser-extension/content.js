@@ -16,7 +16,7 @@
 
   // Маркер версии content script'а: виден со страницы, позволяет отличить
   // «код не перезагрузился» от «в новом коде баг» при отладке.
-  const SCRIPT_VERSION = '0.2.5';
+  const SCRIPT_VERSION = '0.2.6';
   document.documentElement.dataset.ytSummaryExt = SCRIPT_VERSION;
 
   const api = globalThis.browser ?? globalThis.chrome;
@@ -121,7 +121,7 @@
         return;
       }
       const handle = await getBotHandle();
-      const url = `https://t.me/${handle}?start=${encodeURIComponent(id)}`;
+      const url = `https://telegram.me/${handle}?start=${encodeURIComponent(id)}`;
       window.open(url, '_blank', 'noopener,noreferrer');
     });
     return btn;
@@ -266,7 +266,7 @@
         return;
       }
       const handle = await getBotHandle();
-      const url = `https://t.me/${handle}?start=${encodeURIComponent(id)}`;
+      const url = `https://telegram.me/${handle}?start=${encodeURIComponent(id)}`;
       window.open(url, '_blank', 'noopener,noreferrer');
     });
     return btn;
