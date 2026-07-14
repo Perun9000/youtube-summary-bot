@@ -1162,6 +1162,41 @@ def _raise_for_status(response: httpx.Response, provider: str) -> None:
         raise RuntimeError(f"{provider} вернул HTTP {response.status_code}: {detail}") from exc
 
 
+# Динамический хвост free-цепочки: когда сконфигурированные модели исчерпаны,
+# пробуем ещё несколько живых free-моделей из каталога (см. спеку
+# docs/superpowers/specs/2026-07-14-dynamic-free-chain-tail-design.md).
+DYNAMIC_TAIL_MAX_MODELS = 3
+DYNAMIC_TAIL_MIN_CONTEXT = 131072
+DYNAMIC_TAIL_EXCLUDE_SUBSTRINGS = ("coder", "code", "safety", "vl", "vision", "guard")
+MODELS_CATALOG_TTL_SEC = 3600
+
+
+def _select_dynamic_tail(catalog: list[dict], exclude_ids: set[str]) -> list[str]:
+    """Отобрать free-модели для динамического хвоста.
+
+    Только универсальные chat-модели: спец-модели (код, safety, vision)
+    и маленький контекст дают корявые русские саммари, guards от которых
+    не спасают (валидный JSON с плохим текстом публикуется).
+    """
+    candidates: list[tuple[int, str]] = []
+    for entry in catalog:
+        model_id = str(entry.get("id", ""))
+        if not model_id.endswith(":free") or model_id in exclude_ids:
+            continue
+        name_part = model_id.split("/", 1)[-1].lower()
+        if any(bad in name_part for bad in DYNAMIC_TAIL_EXCLUDE_SUBSTRINGS):
+            continue
+        try:
+            context = int(entry.get("context_length") or 0)
+        except (TypeError, ValueError):
+            context = 0
+        if context < DYNAMIC_TAIL_MIN_CONTEXT:
+            continue
+        candidates.append((context, model_id))
+    candidates.sort(key=lambda pair: -pair[0])
+    return [model_id for _, model_id in candidates[:DYNAMIC_TAIL_MAX_MODELS]]
+
+
 def _strip_thinking(text: str) -> str:
     while "<think>" in text and "</think>" in text:
         start = text.find("<think>")
