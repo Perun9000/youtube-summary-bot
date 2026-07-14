@@ -8,7 +8,11 @@ import pytest
 
 from app.config import load_settings
 from app.db import Database
-from app.llm_client import OpenRouterClient, _select_dynamic_tail
+from app.llm_client import (
+    FREE_CHAIN_EXHAUSTED_MARKER,
+    OpenRouterClient,
+    _select_dynamic_tail,
+)
 
 
 @pytest.fixture
@@ -91,3 +95,85 @@ async def test_catalog_cached_within_ttl(client, monkeypatch):
     second = await client._catalog_models()
     assert counter[0] == 1
     assert first == second == [{"id": "x/model:free", "context_length": 200000}]
+
+
+def _completion(content: str, finish_reason: str = "stop") -> dict:
+    return {
+        "choices": [{"message": {"content": content}, "finish_reason": finish_reason}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+    }
+
+
+def _wire_posts(monkeypatch, responses_by_model: dict, calls: list[str]):
+    """POST-ответы по payload['model']; значение — dict (200) или int (код ошибки)."""
+
+    async def fake_post(self, url, headers=None, json=None):
+        model = json["model"]
+        calls.append(model)
+        spec = responses_by_model[model]
+        if isinstance(spec, int):
+            return httpx.Response(
+                spec, json={"error": {"code": spec}}, request=httpx.Request("POST", url)
+            )
+        return httpx.Response(200, json=spec, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+
+async def test_tail_rescues_exhausted_chain(client, monkeypatch):
+    counter = [0]
+    _wire_catalog(monkeypatch, [_entry("tail/rescue-model:free", 200000)], counter)
+    calls: list[str] = []
+    _wire_posts(
+        monkeypatch,
+        {
+            "chain/model-1": 429,
+            "chain/model-2": 429,
+            "tail/rescue-model:free": _completion('{"overview": "ок"}'),
+        },
+        calls,
+    )
+    result = await client.generate("p")
+    assert result == '{"overview": "ок"}'
+    assert calls == ["chain/model-1", "chain/model-2", "tail/rescue-model:free"]
+
+
+async def test_tail_failure_raises_exhausted_with_tail_note(client, monkeypatch):
+    counter = [0]
+    _wire_catalog(monkeypatch, [_entry("tail/rescue-model:free", 200000)], counter)
+    calls: list[str] = []
+    _wire_posts(
+        monkeypatch,
+        {
+            "chain/model-1": 429,
+            "chain/model-2": 429,
+            "tail/rescue-model:free": 429,
+        },
+        calls,
+    )
+    with pytest.raises(RuntimeError, match=FREE_CHAIN_EXHAUSTED_MARKER) as exc_info:
+        await client.generate("p")
+    assert "хвост" in str(exc_info.value)
+    assert calls[-1] == "tail/rescue-model:free"
+
+
+async def test_catalog_error_keeps_old_behavior(client, monkeypatch):
+    async def broken_get(self, url, headers=None):
+        raise httpx.ConnectError("boom")
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", broken_get)
+    calls: list[str] = []
+    _wire_posts(monkeypatch, {"chain/model-1": 429, "chain/model-2": 429}, calls)
+    with pytest.raises(RuntimeError, match=FREE_CHAIN_EXHAUSTED_MARKER):
+        await client.generate("p")
+
+
+async def test_tail_not_used_when_chain_alive(client, monkeypatch):
+    counter = [0]
+    _wire_catalog(monkeypatch, [_entry("tail/rescue-model:free", 200000)], counter)
+    calls: list[str] = []
+    _wire_posts(monkeypatch, {"chain/model-1": _completion('{"a": 1}')}, calls)
+    result = await client.generate("p")
+    assert result == '{"a": 1}'
+    assert calls == ["chain/model-1"]
+    assert counter[0] == 0  # каталог даже не запрашивали

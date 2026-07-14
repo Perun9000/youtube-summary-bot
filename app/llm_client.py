@@ -452,6 +452,36 @@ class OpenRouterClient:
                 )
                 await asyncio.sleep(delay)
 
+        # Сконфигурированная цепочка исчерпана — последний рубеж: до
+        # DYNAMIC_TAIL_MAX_MODELS живых free-моделей из каталога. Breaker
+        # хвост не трогает: его успех ничего не говорит о здоровье цепочки.
+        tail_note = "динамический хвост пропущен"
+        try:
+            catalog = await self._catalog_models()
+        except Exception as exc:  # noqa: BLE001 — хвост не новая точка отказа
+            logger.warning(
+                "llm.generate.dynamic_tail.skipped reason=catalog_error error=%s", exc
+            )
+        else:
+            tail = _select_dynamic_tail(catalog, exclude_ids=set(chain))
+            if not tail:
+                logger.info("llm.generate.dynamic_tail.skipped reason=empty")
+            for model in tail:
+                logger.warning("llm.generate.dynamic_tail.try model=%s", model)
+                try:
+                    result = await self._generate_one_attempt(
+                        model, prompt, system, usage, max_tokens
+                    )
+                    logger.info("llm.generate.dynamic_tail.success model=%s", model)
+                    return result
+                except _OpenRouterRetriable as exc:
+                    last_error = exc.cause
+                    if isinstance(exc, _OpenRouterTruncated):
+                        truncated_text = exc.text
+                    continue
+            if tail:
+                tail_note = f"динамический хвост тоже отказал ({len(tail)} моделей)"
+
         if truncated_text is not None:
             # Вся цепочка либо отказала, либо обрезала ответ по max_tokens.
             # Обрезанный текст — лучшее, что есть: отдаём его, downstream-парсер
@@ -482,7 +512,8 @@ class OpenRouterClient:
         # пользователей (владелец видит полный текст с подсказками).
         raise RuntimeError(
             f"{FREE_CHAIN_EXHAUSTED_MARKER}: все free-модели в цепочке отказались отвечать "
-            f"за {passes} проходов ({models_tried}). Последняя ошибка: {last_error}. {suffix}"
+            f"за {passes} проходов ({models_tried}); {tail_note}. "
+            f"Последняя ошибка: {last_error}. {suffix}"
         )
 
     async def _generate_paid(

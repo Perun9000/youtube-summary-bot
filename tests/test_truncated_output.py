@@ -69,6 +69,14 @@ async def test_truncated_response_falls_through_to_next_model(client, monkeypatc
 
 
 async def test_all_models_truncated_returns_last_resort_text(client, monkeypatch):
+    # Динамический хвост при исчерпании цепочки запрашивает каталог /models —
+    # мокаем пустым, чтобы тест не ходил в сеть и проверял именно last resort.
+    async def empty_catalog(self, url, headers=None):
+        return httpx.Response(
+            200, json={"data": []}, request=httpx.Request("GET", url)
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", empty_catalog)
     calls = _wire_responses(
         monkeypatch,
         {
