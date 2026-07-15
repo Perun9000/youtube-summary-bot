@@ -93,5 +93,6 @@
   "ytdlp.removed_by_uploader": "El vídeo fue eliminado por el autor.",
   "ytdlp.sign_in_required": "YouTube exige iniciar sesión para verlo (anti-bot o verificación de edad). El bot no puede pasar.",
   "ytdlp.stream_recording_unavailable": "La grabación de la transmisión en vivo no está disponible.",
-  "ytdlp.unavailable": "El vídeo no está disponible (eliminado por el autor, bloqueado por el titular de los derechos u oculto en esta región)."
+  "ytdlp.unavailable": "El vídeo no está disponible (eliminado por el autor, bloqueado por el titular de los derechos u oculto en esta región).",
+  "ref.pitch": "Envíame cualquier enlace de YouTube y haré el mismo tipo de resumen. Gratis: {weekly} por semana."
 }

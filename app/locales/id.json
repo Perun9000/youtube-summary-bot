@@ -93,5 +93,6 @@
   "ytdlp.removed_by_uploader": "Video dihapus oleh pembuatnya.",
   "ytdlp.sign_in_required": "YouTube meminta login untuk menonton (anti-bot atau pemeriksaan usia). Bot tidak bisa melewatinya.",
   "ytdlp.stream_recording_unavailable": "Rekaman siaran langsung tidak tersedia.",
-  "ytdlp.unavailable": "Video tidak tersedia (dihapus pembuatnya, diblokir pemegang hak cipta, atau disembunyikan di wilayah ini)."
+  "ytdlp.unavailable": "Video tidak tersedia (dihapus pembuatnya, diblokir pemegang hak cipta, atau disembunyikan di wilayah ini).",
+  "ref.pitch": "Kirimkan tautan video YouTube apa pun dan aku akan membuat ringkasan seperti ini. Gratis: {weekly} per minggu."
 }

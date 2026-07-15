@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+import re
 import time
 from urllib.parse import urlparse
 
@@ -49,7 +50,11 @@ from app.queue_service import (  # noqa: F401
     _format_queue_status,
     _stop_summary_queue,
 )
-from app.delivery import _message_user_id  # noqa: F401
+from app.delivery import (  # noqa: F401
+    _message_user_id,
+    _send_cached_summary_to_chat,
+    build_share_message,
+)
 from app.pipeline import _download_audio_to_chat  # noqa: F401
 from app.transcript_export import pretty_transcript_filename, transcript_path
 
@@ -59,6 +64,17 @@ logger = logging.getLogger(__name__)
 MAX_SYSTEM_PROMPT_CHARS = 8000
 
 SUBSCRIPTION_PAYLOAD = "monthly_summary_subscription"
+
+# Реф-ссылка ступени 0: /start r<uid>_<video_id>
+# (см. docs/superpowers/specs/2026-07-15-referral-share-step0-design.md).
+_REF_PAYLOAD_RE = re.compile(r"^r(\d{1,12})_([A-Za-z0-9_-]{11})$")
+
+
+def _parse_ref_payload(payload: str) -> tuple[int, str] | None:
+    match = _REF_PAYLOAD_RE.fullmatch(payload)
+    if not match:
+        return None
+    return int(match.group(1)), match.group(2)
 
 
 def _subscription_until_from_payment(payment, now: float | None = None) -> float:
@@ -177,6 +193,34 @@ def build_router(services: Services) -> Router:
             tokens = text.split(maxsplit=1)
             if len(tokens) == 2:
                 payload = tokens[1].strip()
+        ref = _parse_ref_payload(payload) if payload else None
+        if ref is not None:
+            referrer_id, video_id = ref
+            user_id = _message_user_id(message)
+            logger.info(
+                "ref.start chat_id=%s user_id=%s referrer_id=%s video_id=%s",
+                message.chat.id, user_id, referrer_id, video_id,
+            )
+            if services.analytics is not None and user_id is not None:
+                is_first = services.analytics.record_first_start(user_id, "referral")
+                services.analytics.record(
+                    user_id, "ref_start", f"{referrer_id}:{video_id}"
+                )
+                if is_first and services.referrals is not None:
+                    services.referrals.bind(user_id, referrer_id, video_id)
+            cached = (
+                services.summary_cache.get(video_id, lang)
+                or services.summary_cache.get_any(video_id)
+            ) if services.summary_cache is not None else None
+            if cached is not None:
+                await _send_cached_summary_to_chat(message, cached, services)
+            else:
+                url = f"https://www.youtube.com/watch?v={video_id}"
+                await _enqueue_summary_job(message, url, services)
+            await message.answer(
+                t("ref.pitch", lang, weekly=services.settings.quota_free_weekly)
+            )
+            return
         if payload and _YOUTUBE_VIDEO_ID_RE.fullmatch(payload):
             url = f"https://www.youtube.com/watch?v={payload}"
             logger.info(
@@ -794,6 +838,36 @@ def build_router(services: Services) -> Router:
         # Подтверждаем нажатие сразу — иначе у Telegram спиннер крутится 30 сек.
         await callback.answer("Готовлю аудио...")
         asyncio.create_task(_download_audio_to_chat(callback, video_id, services))
+
+    @router.callback_query(F.data.startswith("share:"))
+    async def share_callback(callback: CallbackQuery) -> None:
+        """Кнопка под саммари (owner-only): прислать форвардабельное
+        шер-сообщение с реф-ссылкой (ступень 0 реф-шеринга)."""
+        user_id = callback.from_user.id if callback.from_user else None
+        if user_id is None or not services.users.is_owner(user_id):
+            await callback.answer()
+            return
+        video_id = (callback.data or "").split(":", 1)[1]
+        cached = (
+            services.summary_cache.get_any(video_id)
+            if services.summary_cache is not None
+            else None
+        )
+        if cached is None:
+            await callback.answer(
+                "Саммари уже не в кэше — перегенерируй ролик.", show_alert=True
+            )
+            return
+        text = build_share_message(
+            cached, bot_username=services.bot_username or "", referrer_id=user_id
+        )
+        if callback.message is not None:
+            await callback.message.answer(
+                text, parse_mode="HTML", disable_web_page_preview=True
+            )
+        if services.analytics is not None:
+            services.analytics.record(user_id, "share_button", video_id)
+        await callback.answer("Готово — форвардни сообщение в чат")
 
     @router.callback_query(F.data.startswith("transcript:"))
     async def transcript_callback(callback: CallbackQuery) -> None:

@@ -3,8 +3,20 @@
 Спека: docs/superpowers/specs/2026-07-15-referral-share-step0-design.md
 """
 
+from app.bot_handlers import _parse_ref_payload
 from app.delivery import _build_summary_keyboard, build_share_message
 from app.summary_cache import CachedSummary
+
+
+def test_parse_ref_payload_valid():
+    assert _parse_ref_payload("r42_abcABC12345") == (42, "abcABC12345")
+
+
+def test_parse_ref_payload_rejects_garbage():
+    assert _parse_ref_payload("abcABC12345") is None          # голый video_id
+    assert _parse_ref_payload("r42_short") is None            # короткий id
+    assert _parse_ref_payload("rX_abcABC12345") is None       # uid не число
+    assert _parse_ref_payload("r42-abcABC12345") is None      # нет разделителя _
 
 
 def _cached(**overrides):
