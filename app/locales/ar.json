@@ -42,6 +42,7 @@
   "status.heavy_charge": "هذا الفيديو بلا ترجمة نصية وأطول من ساعة — سيُخصم كملخصين.",
   "status.interrupted": "تمت مقاطعة توليد الملخص.",
   "status.publishing": "أنشر الشرح الكامل على Telegra.ph...",
+  "status.queue_line": "قائمة الانتظار: {position}/{total}",
   "status.queued_first": "أضفت الفيديو إلى قائمة انتظار التلخيص. أبدأ المعالجة.",
   "status.queued_position": "أضفت الفيديو إلى قائمة الانتظار. الموضع: {position}.",
   "status.stopped": "تم إيقاف توليد الملخص.",

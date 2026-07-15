@@ -42,6 +42,7 @@
   "status.heavy_charge": "این ویدیو زیرنویس ندارد و بیش از یک ساعت است — 2 خلاصه کسر می‌شود.",
   "status.interrupted": "تولید خلاصه قطع شد.",
   "status.publishing": "در حال انتشار توضیح کامل در Telegra.ph...",
+  "status.queue_line": "صف: {position}/{total}",
   "status.queued_first": "ویدیو را به صف خلاصه‌سازی افزودم. شروع پردازش.",
   "status.queued_position": "ویدیو را به صف افزودم. موقعیت: {position}.",
   "status.stopped": "تولید خلاصه متوقف شد.",

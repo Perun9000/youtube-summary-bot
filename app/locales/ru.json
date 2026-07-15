@@ -42,6 +42,7 @@
   "status.heavy_charge": "Ролик без субтитров и длиннее часа — спишется 2 генерации.",
   "status.interrupted": "Генерация summary прервана.",
   "status.publishing": "Публикую полный конспект в Telegra.ph...",
+  "status.queue_line": "очередь: {position}/{total}",
   "status.queued_first": "Добавил ролик в очередь summary. Начинаю обработку.",
   "status.queued_position": "Добавил ролик в очередь summary. Позиция: {position}.",
   "status.stopped": "Генерация summary остановлена.",

@@ -42,6 +42,7 @@
   "status.heavy_charge": "Video ini tidak punya teks dan lebih dari satu jam — akan memotong 2 ringkasan.",
   "status.interrupted": "Pembuatan ringkasan terhenti.",
   "status.publishing": "Menerbitkan uraian lengkap di Telegra.ph...",
+  "status.queue_line": "antrean: {position}/{total}",
   "status.queued_first": "Video sudah ditambahkan ke antrean ringkasan. Mulai memproses.",
   "status.queued_position": "Video sudah ditambahkan ke antrean. Posisi: {position}.",
   "status.stopped": "Pembuatan ringkasan dihentikan.",

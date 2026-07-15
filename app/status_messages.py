@@ -177,16 +177,27 @@ def _format_job_header(job: SummaryJob | None) -> str:
     safe_url = escape_html(job.url)
     return f'<a href="{safe_url}">{safe_label}</a>'
 async def _queue_block(services: Services, job: SummaryJob | None) -> str:
+    """Блок «очередь» под статусом. Приватность: получатель видит позицию
+    своего ролика и СВОИ ожидающие ролики — чужие заголовки не показываем
+    (в PUBLIC_MODE очередь общая на всех пользователей)."""
     if job is None:
         return ""
     async with services.summary_queue_lock:
-        total = services.summary_next_sequence
+        active_job = services.summary_active_job
         pending_jobs = list(services.summary_queue._queue)
+
+    queue_all = ([active_job] if active_job is not None else []) + pending_jobs
+    total = len(queue_all)
     if total <= 1:
         return ""
+    position = next(
+        (i for i, queued in enumerate(queue_all, start=1) if queued is job), 1
+    )
 
-    lines = [f"очередь: {job.sequence}/{total}"]
+    lines = [t("status.queue_line", job.lang, position=position, total=total)]
     for queued_job in pending_jobs:
+        if queued_job is job or queued_job.chat_id != job.chat_id:
+            continue
         lines.append(f"- {_job_label(queued_job)}")
     return "\n".join(lines)
 async def _prefetch_job_title(job: SummaryJob, services: Services) -> None:

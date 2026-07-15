@@ -42,6 +42,7 @@
   "status.heavy_charge": "Este vídeo não tem legendas e dura mais de uma hora — vai descontar 2 gerações.",
   "status.interrupted": "Geração do resumo interrompida.",
   "status.publishing": "Publicando o desenvolvimento completo no Telegra.ph...",
+  "status.queue_line": "fila: {position}/{total}",
   "status.queued_first": "Adicionei o vídeo à fila de resumos. Começando o processamento.",
   "status.queued_position": "Adicionei o vídeo à fila. Posição: {position}.",
   "status.stopped": "Geração do resumo parada.",

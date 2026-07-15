@@ -42,6 +42,7 @@
   "status.heavy_charge": "Este vídeo no tiene subtítulos y dura más de una hora — se descontarán 2 generaciones.",
   "status.interrupted": "Generación del resumen interrumpida.",
   "status.publishing": "Publicando el desarrollo completo en Telegra.ph...",
+  "status.queue_line": "cola: {position}/{total}",
   "status.queued_first": "Añadí el vídeo a la cola de resúmenes. Empiezo a procesarlo.",
   "status.queued_position": "Añadí el vídeo a la cola. Posición: {position}.",
   "status.stopped": "Generación del resumen detenida.",

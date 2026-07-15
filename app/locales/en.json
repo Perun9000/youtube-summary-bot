@@ -42,6 +42,7 @@
   "status.heavy_charge": "This video has no captions and is over an hour long — it will use 2 generations.",
   "status.interrupted": "Summary generation interrupted.",
   "status.publishing": "Publishing the full writeup to Telegra.ph...",
+  "status.queue_line": "queue: {position}/{total}",
   "status.queued_first": "Added the video to the summary queue. Starting processing.",
   "status.queued_position": "Added the video to the queue. Position: {position}.",
   "status.stopped": "Summary generation stopped.",
