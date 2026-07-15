@@ -46,10 +46,11 @@ def test_share_message_has_ref_link_and_escaping():
 
 def test_share_message_trims_overview_to_sentences():
     text = build_share_message(_cached(), bot_username="TestBot", referrer_id=42)
-    assert "Первое предложение о главном тезисе ролика." in text
+    assert "Первое предложение о главном тезисе ролика" in text
     assert "не влезает в тизер" not in text
-    # обрезка по границе предложения — нет оборванных хвостов перед точкой
-    assert "…" not in text or text.count(".") >= 1
+    # Обрезка по границе предложения: тизер заканчивается точкой, а не «…».
+    teaser_line = text.split("\n")[3]
+    assert teaser_line.endswith(".")
 
 
 def test_share_button_only_for_owner():
