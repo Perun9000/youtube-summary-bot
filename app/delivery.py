@@ -377,6 +377,15 @@ def _build_summary_keyboard(
                 )
             )
         rows.append(row)
+        if is_owner:
+            # Реф-шеринг, ступень 0: кнопка видна только владельцу
+            # (owner-поверхность — не локализуется).
+            rows.append([
+                InlineKeyboardButton(
+                    text="📤 Поделиться",
+                    callback_data=f"share:{video_id}",
+                )
+            ])
     if telegraph_url:
         rows.append([
             InlineKeyboardButton(text=t("btn.details", lang), url=telegraph_url)
@@ -712,6 +721,46 @@ def _format_generation_error(video_url: str, title: str, reason: str, lang: str 
         "error.generation_failed", lang,
         link=link, reason=escape_html(reason_text),
     )[:4000]
+# Тизер шер-сообщения: первые предложения overview, не больше этого объёма.
+_SHARE_OVERVIEW_MAX_CHARS = 300
+
+
+def _first_sentences(text: str, max_chars: int) -> str:
+    """Первые предложения текста до max_chars, обрезка по границе предложения."""
+    text = " ".join(text.split())
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max_chars]
+    for stop in (". ", "! ", "? "):
+        idx = cut.rfind(stop)
+        if idx > 40:
+            return cut[: idx + 1].strip()
+    return cut.rstrip() + "…"
+
+
+def build_share_message(cached: CachedSummary, bot_username: str, referrer_id: int) -> str:
+    """Форвардабельное шер-сообщение: польза чату + реф-ссылка текстом.
+
+    Без inline-кнопок: Telegram срезает их при форварде, а ссылка текстом
+    переживает и форвард, и копипаст (спека реф-шеринга, ступень 0).
+    """
+    ref_link = f"https://t.me/{bot_username}?start=r{referrer_id}_{cached.video_id}"
+    title = escape_html(cached.title)
+    channel = escape_html(cached.channel_name or "")
+    teaser = escape_html(_first_sentences(cached.summary_overview, _SHARE_OVERVIEW_MAX_CHARS))
+    minutes = _estimate_reading_time_minutes(cached.to_summary())
+    lines = [f"🎬 <b>{title}</b>"]
+    if channel:
+        lines.append(channel)
+    lines.append("")
+    lines.append(teaser)
+    lines.append("")
+    lines.append(
+        f'🔮 <a href="{ref_link}">Полное саммари у бота</a> — {minutes} мин чтения'
+    )
+    return "\n".join(lines)
+
+
 def _estimate_reading_time_minutes(summary: Summary) -> int:
     parts: list[str] = [summary.overview]
     parts.extend(summary.key_points)
