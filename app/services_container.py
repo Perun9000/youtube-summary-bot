@@ -8,6 +8,7 @@ from aiogram import Bot
 from aiogram.types import Message
 
 from app.analytics_events import AnalyticsEvents
+from app.referrals_store import ReferralsStore
 from app.billing import BillingStore, QuotaService
 from app.config import Settings
 from app.channel_posts_store import ChannelPostsStore
@@ -133,6 +134,7 @@ class Services:
     quota: "QuotaService | None" = None
     analytics: "AnalyticsEvents | None" = None
     user_langs: "UserLangStore | None" = None
+    referrals: "ReferralsStore | None" = None
     # Двухшаговые админ-команды («введи /user_add — бот спросит — ты отвечаешь
     # данными в следующем сообщении»). Ключ — chat_id, значение —
     # PendingAdminInput. Не персистится: после рестарта диалог теряется,

@@ -54,6 +54,12 @@ CREATE TABLE IF NOT EXISTS monitoring_seen (
     added_at REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (channel_id, video_id)
 );
+CREATE TABLE IF NOT EXISTS referrals (
+    user_id INTEGER PRIMARY KEY,
+    referrer_id INTEGER NOT NULL,
+    video_id TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL

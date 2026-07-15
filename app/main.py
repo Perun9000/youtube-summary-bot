@@ -15,6 +15,7 @@ from aiogram.types import (
 )
 
 from app.analytics_events import AnalyticsEvents
+from app.referrals_store import ReferralsStore
 from app.billing import BillingStore, QuotaService
 from app.bot_handlers import (
     Services,
@@ -269,6 +270,7 @@ async def main() -> None:
         quota=quota_service,
         analytics=analytics_events,
         user_langs=UserLangStore(db),
+        referrals=ReferralsStore(db),
     )
 
     scheduler_task: asyncio.Task[None] | None = None
