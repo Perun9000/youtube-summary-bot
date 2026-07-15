@@ -54,7 +54,7 @@ class _FakeSummaryCache:
 class _FakeServices:
     def __init__(self, owner_user_id=OWNER_ID, user_langs=None, summary_cache=None):
         self.settings = _FakeSettings(owner_user_id)
-        self.summary_queue = asyncio.Queue()
+        self.summary_queue = asyncio.PriorityQueue()
         self.summary_queue_lock = asyncio.Lock()
         self.summary_worker_task = None
         self.summary_next_sequence = 0

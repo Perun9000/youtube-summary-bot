@@ -241,7 +241,7 @@ async def main() -> None:
             system_prompt_provider=system_prompt_store.current,
         ),
         telegraph=TelegraphService(settings),
-        summary_queue=asyncio.Queue(),
+        summary_queue=asyncio.PriorityQueue(),
         summary_queue_lock=asyncio.Lock(),
         summary_worker_task=None,
         summary_active_job=None,

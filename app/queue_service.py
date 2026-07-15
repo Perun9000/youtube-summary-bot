@@ -20,6 +20,7 @@ from app.status_messages import (
 from app.delivery import (
     _deliver_cached_summary_for_job,
     _lookup_cached_summary,
+    _message_user_id,
     _send_cached_summary_to_chat,
     _send_quota_denied,
 )
@@ -27,6 +28,27 @@ from app.pipeline import _process_transcription_job, _process_youtube_job
 
 
 logger = logging.getLogger(__name__)
+
+
+# Ранги приоритета summary_queue (см. SummaryJob.priority в services_container.py).
+PRIORITY_PRIVILEGED = 0  # owner, allowlist, платные подписчики
+PRIORITY_FREE = 1        # внешние free-пользователи
+PRIORITY_SCHEDULED = 2   # scheduled-мониторинг каналов
+
+
+def _job_priority(user_id: int | None, services: Services) -> int:
+    """Ранг приоритета живого (не scheduled) запроса по user_id.
+
+    owner/allowlist и активные подписчики — PRIORITY_PRIVILEGED (0), все
+    остальные внешние пользователи — PRIORITY_FREE (1). Scheduled-задачи
+    ранг не запрашивают тут — им всегда PRIORITY_SCHEDULED (2), назначается
+    прямо в месте постановки в очередь.
+    """
+    if services.users.is_allowed(user_id):
+        return PRIORITY_PRIVILEGED
+    if services.billing is not None and user_id is not None and services.billing.is_subscriber(user_id):
+        return PRIORITY_PRIVILEGED
+    return PRIORITY_FREE
 
 
 async def _enqueue_summary_job(message: Message, url: str, services: Services) -> None:
@@ -62,8 +84,11 @@ async def _enqueue_summary_job(message: Message, url: str, services: Services) -
             services.summary_next_sequence += 1
             sequence = services.summary_next_sequence
             active_job = services.summary_active_job
-            active_count = 1 if active_job is not None else 0
-            position = active_count + services.summary_queue.qsize() + 1
+            # Snapshot до put(): считаем, сколько ожидающих job'ов встанут
+            # перед новым по (priority, sequence) — вклинивание приоритета
+            # меняет "позицию в очереди", которую видит пользователь.
+            pending_snapshot = list(services.summary_queue._queue)
+            priority = _job_priority(_message_user_id(message), services)
             db_id = (
                 services.job_store.add(
                     url, message.chat.id, scheduled=False, disable_notification=False,
@@ -81,7 +106,14 @@ async def _enqueue_summary_job(message: Message, url: str, services: Services) -
                 db_id=db_id,
                 quota_user_id=quota_user_id,
                 lang=lang,
+                priority=priority,
             )
+            ahead = sum(
+                1
+                for pending in pending_snapshot
+                if (pending.priority, pending.sequence) < (job.priority, job.sequence)
+            )
+            position = (1 if active_job is not None else 0) + ahead + 1
             await services.summary_queue.put(job)
             enqueued = True
             if services.summary_worker_task is None or services.summary_worker_task.done():
@@ -182,6 +214,7 @@ async def enqueue_scheduled_candidate(
             show_matches=list(candidate.show_matches) or None,
             db_id=db_id,
             lang="ru",
+            priority=PRIORITY_SCHEDULED,
         )
         await services.summary_queue.put(job)
         if services.summary_worker_task is None or services.summary_worker_task.done():
@@ -210,6 +243,14 @@ async def restore_pending_jobs(services: Services) -> int:
     async with services.summary_queue_lock:
         for row in rows:
             services.summary_next_sequence += 1
+            scheduled = bool(row["scheduled"])
+            # chat_id восстановленной задачи — private chat, где chat_id ==
+            # user_id (owner/allowlist/подписчик проверяются как обычно).
+            # Scheduled-строки ранг по chat_id не проверяют — им всегда
+            # PRIORITY_SCHEDULED, приоритет не персистится в БД.
+            priority = (
+                PRIORITY_SCHEDULED if scheduled else _job_priority(row["chat_id"], services)
+            )
             job = SummaryJob(
                 sequence=services.summary_next_sequence,
                 message=None,
@@ -217,10 +258,11 @@ async def restore_pending_jobs(services: Services) -> int:
                 enqueued_at=time.monotonic(),
                 chat_id=row["chat_id"],
                 title_hint=row["title_hint"],
-                scheduled=bool(row["scheduled"]),
+                scheduled=scheduled,
                 disable_notification=bool(row["disable_notification"]),
                 db_id=row["id"],
                 lang=row["lang"],
+                priority=priority,
             )
             services.job_store.set_status(row["id"], "queued")
             await services.summary_queue.put(job)
@@ -285,6 +327,7 @@ async def enqueue_local_api_job(video_id: str, services: Services) -> str:
             chat_id=owner_id,
             db_id=db_id,
             lang=lang,
+            priority=PRIORITY_PRIVILEGED,
         )
         await services.summary_queue.put(job)
         if services.summary_worker_task is None or services.summary_worker_task.done():
@@ -335,6 +378,10 @@ async def _requeue_due_deferred(services: Services) -> None:
     async with services.summary_queue_lock:
         for row in rows:
             services.summary_next_sequence += 1
+            scheduled = bool(row["scheduled"])
+            priority = (
+                PRIORITY_SCHEDULED if scheduled else _job_priority(row["chat_id"], services)
+            )
             job = SummaryJob(
                 sequence=services.summary_next_sequence,
                 message=None,
@@ -342,10 +389,11 @@ async def _requeue_due_deferred(services: Services) -> None:
                 enqueued_at=time.monotonic(),
                 chat_id=row["chat_id"],
                 title_hint=row["title_hint"],
-                scheduled=bool(row["scheduled"]),
+                scheduled=scheduled,
                 disable_notification=bool(row["disable_notification"]),
                 db_id=row["id"],
                 lang=row["lang"],
+                priority=priority,
             )
             services.job_store.set_status(row["id"], "queued")
             await services.summary_queue.put(job)
@@ -582,7 +630,7 @@ async def _stop_summary_queue(message: Message, services: Services) -> None:
         await message.answer(f"Останавливаю текущую генерацию и очищаю очередь. Удалено из очереди: {pending_count}.")
     else:
         await message.answer(f"Очередь summary очищена. Удалено из очереди: {pending_count}.")
-def _drain_summary_queue(queue: asyncio.Queue[SummaryJob], services: Services) -> int:
+def _drain_summary_queue(queue: asyncio.PriorityQueue[SummaryJob], services: Services) -> int:
     count = 0
     while True:
         try:

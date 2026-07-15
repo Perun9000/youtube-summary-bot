@@ -79,6 +79,16 @@ class SummaryJob:
     # резолвят язык заново. Scheduled-задачи мониторинга — всегда "ru"
     # (owner-контекст).
     lang: str = "ru"
+    # Ранг приоритета в summary_queue (меньше — раньше): 0 — owner/allowlist/
+    # платные подписчики, 1 — внешние free-пользователи, 2 — scheduled-
+    # мониторинг. Не персистится в БД — восстанавливается по chat_id при
+    # рестарте (см. _job_priority в queue_service.py). Внутри ранга — FIFO
+    # по sequence. Уже начатую задачу приоритет не вытесняет: выбор только
+    # среди ожидающих в очереди.
+    priority: int = 0
+
+    def __lt__(self, other: "SummaryJob") -> bool:
+        return (self.priority, self.sequence) < (other.priority, other.sequence)
 @dataclass
 class Services:
     settings: Settings
@@ -87,7 +97,7 @@ class Services:
     youtube: YouTubeService
     summarizer: Summarizer
     telegraph: TelegraphService
-    summary_queue: asyncio.Queue[SummaryJob]
+    summary_queue: asyncio.PriorityQueue[SummaryJob]
     summary_queue_lock: asyncio.Lock
     summary_worker_task: asyncio.Task[None] | None
     summary_active_job: SummaryJob | None

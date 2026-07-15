@@ -184,7 +184,13 @@ async def _queue_block(services: Services, job: SummaryJob | None) -> str:
         return ""
     async with services.summary_queue_lock:
         active_job = services.summary_active_job
-        pending_jobs = list(services.summary_queue._queue)
+        # summary_queue — heapq-очередь (PriorityQueue): ._queue хранит
+        # heap-инвариант, а не полный порядок. Сортируем по тому же ключу,
+        # по которому воркер реально выбирает следующий job, иначе позиция
+        # и список "своих" роликов не совпадут с тем, что произойдёт дальше.
+        pending_jobs = sorted(
+            services.summary_queue._queue, key=lambda j: (j.priority, j.sequence)
+        )
 
     queue_all = ([active_job] if active_job is not None else []) + pending_jobs
     total = len(queue_all)
