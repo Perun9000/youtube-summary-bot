@@ -103,8 +103,13 @@ async def _set_service_status(
         )
     services.summary_status_messages[chat_id] = new_message
     return new_message
-async def _bump_service_status(services: Services, source_message: Message, job: SummaryJob) -> Message:
-    chat_id = source_message.chat.id
+async def _bump_service_status(
+    services: Services, source_message: Message | None, job: SummaryJob
+) -> Message | None:
+    # source_message=None — путь без aiogram Message (local API, scheduled,
+    # восстановленные job'ы): chat_id берём из job'а, отправку сделает
+    # _set_service_status через services.bot.send_message.
+    chat_id = source_message.chat.id if source_message is not None else job.chat_id
     text = services.summary_status_base_texts.get(chat_id) or "Генерирую summary..."
     parse_mode = services.summary_status_parse_modes.get(chat_id)
     disable_preview = services.summary_status_disable_previews.get(chat_id, False)

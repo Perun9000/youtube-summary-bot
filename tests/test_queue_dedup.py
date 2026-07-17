@@ -293,6 +293,69 @@ async def test_enqueue_local_api_job_sends_initial_status(monkeypatch):
     await _stop_worker(services)
 
 
+# ── (d2) активная генерация в чате owner'а: bump, а не «Позиция: N» ────────
+
+
+async def test_enqueue_local_api_job_bumps_active_status_instead_of_replacing_it(monkeypatch):
+    """Owner кликает второй ролик, пока первый генерируется. До фикса else-
+    ветка слала _set_service_status(text="Позиция: 2", bump=True, job=<новый>),
+    что УДАЛЯЛО живое прогресс-сообщение активной генерации и заменяло его на
+    «Позиция: 2». Правильно — как в _enqueue_summary_job: bump статуса
+    АКТИВНОГО job'а (новый ролик виден в queue-блоке под ним), свой статус
+    новый job не шлёт."""
+    set_calls = []
+    bump_calls = []
+
+    async def fake_set_service_status(services, source_message=None, text="", job=None, **kwargs):
+        set_calls.append({"source_message": source_message, "text": text, "job": job})
+        return object()
+
+    async def fake_bump_service_status(services, source_message, job):
+        bump_calls.append({"source_message": source_message, "job": job})
+        return object()
+
+    monkeypatch.setattr(queue_service, "_set_service_status", fake_set_service_status)
+    monkeypatch.setattr(queue_service, "_bump_service_status", fake_bump_service_status)
+
+    services = _FakeServices()
+    active = SummaryJob(
+        sequence=1, message=None,
+        url=f"https://www.youtube.com/watch?v={OTHER_VIDEO_ID}",
+        enqueued_at=0.0, chat_id=OWNER_ID, lang="ru",
+    )
+    services.summary_active_job = active
+
+    result = await enqueue_local_api_job(VIDEO_ID, services)
+
+    assert result == "queued"
+    assert set_calls == []  # «Позиция: N» для нового job'а НЕ шлётся
+    assert len(bump_calls) == 1
+    assert bump_calls[0]["job"] is active  # bump'ается статус АКТИВНОГО job'а
+    assert bump_calls[0]["source_message"] is None  # local API: bot-send путь
+
+    await _stop_worker(services)
+
+
+async def test_bump_service_status_works_without_source_message():
+    """_bump_service_status для message=None пути: chat_id берётся из job'а,
+    отправка идёт через services.bot.send_message (как у scheduled)."""
+    from app.status_messages import _bump_service_status
+
+    services = _FakeServices()
+    services.summary_status_base_texts[OWNER_ID] = "Генерирую summary через openrouter..."
+    job = SummaryJob(
+        sequence=1, message=None, url=URL,
+        enqueued_at=0.0, chat_id=OWNER_ID, lang="ru",
+    )
+
+    result = await _bump_service_status(services, None, job)
+
+    assert result is not None
+    assert len(services.bot.sent) == 1
+    assert services.bot.sent[0]["chat_id"] == OWNER_ID
+    assert "Генерирую summary через openrouter..." in services.bot.sent[0]["text"]
+
+
 # ── (e) _set_service_status с message=None и НЕ-scheduled job шлёт через bot ─
 
 

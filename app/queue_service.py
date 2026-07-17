@@ -432,6 +432,11 @@ async def enqueue_local_api_job(video_id: str, services: Services) -> str:
             job=job,
             bump=True,
         )
+    elif active_job is not None and active_job.chat_id == owner_id:
+        # В чате owner'а уже идёт генерация: не затираем её живой прогресс
+        # текстом «Позиция: N» — bump'аем статус АКТИВНОГО job'а (новый ролик
+        # виден в queue-блоке под ним), как в _enqueue_summary_job.
+        await _bump_service_status(services, None, active_job)
     else:
         await _set_service_status(
             services=services,
