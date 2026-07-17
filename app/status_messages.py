@@ -41,10 +41,13 @@ async def _set_service_status(
         chat_id = source_message.chat.id
     elif (
         job is not None
-        and job.scheduled
         and job.chat_id is not None
         and services.bot is not None
     ):
+        # Any job without a source Message (scheduled, restored-after-restart,
+        # local API / extension clicks) goes through bot.send_message. Used to
+        # be gated on job.scheduled only — widened so status updates show up
+        # for every no-Message job, not just scheduled monitoring hits.
         chat_id = job.chat_id
         use_bot_send = True
     else:
@@ -225,11 +228,9 @@ async def _refresh_active_service_status(services: Services) -> None:
         active_job = services.summary_active_job
     if active_job is None:
         return
-    # Both manual and scheduled jobs can refresh: scheduled ones go through
-    # services.bot.send_message via _set_service_status with source_message=None.
-    if not active_job.scheduled and active_job.message is None:
-        return
-
+    # Any job can refresh: jobs without a source Message (scheduled, restored,
+    # local API) go through services.bot.send_message via _set_service_status
+    # with source_message=None — no gate needed here anymore.
     chat_id = active_job.chat_id
     text = services.summary_status_base_texts.get(chat_id)
     if not text:

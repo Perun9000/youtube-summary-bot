@@ -33,6 +33,7 @@
   "start.allowlist": "Send me a YouTube video link. I'll reply here with a short summary and publish the full writeup to Telegra.ph.\n\nYou have unlimited access 🎉",
   "start.bad_deeplink": "I couldn't parse the link parameter. Open the YouTube video and tap the “Summary” button again — it should send an 11-character video_id.",
   "start.onboarding": "👋 Hi! I make summaries of YouTube videos.\n\nSend me a link to a video — I'll reply here with a short digest (what it's about, reading time, tags, top comment), and publish the full chapter-by-chapter writeup to Telegra.ph.\n\n<b>What I can do:</b>\n• videos without captions — I transcribe the audio myself\n• premieres — I'll remember and come back with a summary after release\n• already-processed videos are delivered instantly and for free\n\n<b>Plans:</b>\n🆓 <b>Free</b> — {starter} summaries right away, then {weekly} per week\n⭐ <b>Subscription {price} ⭐/mo</b> — {monthly} summaries a month and priority generation speed: /subscribe\n\nA long video without captions (over an hour) counts as 2 summaries.\n\n/limits — remaining quota · /help — all commands",
+  "status.already_queued": "This video is already in the queue — the summary will arrive once it's processed.",
   "status.audio_download": "Downloading audio for transcription via Groq...",
   "status.captions": "Trying to get YouTube's built-in captions...",
   "status.elapsed": "Elapsed: {elapsed}",

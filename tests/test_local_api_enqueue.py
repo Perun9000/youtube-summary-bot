@@ -51,6 +51,19 @@ class _FakeSummaryCache:
         return self._cached_obj
 
 
+class _FakeBot:
+    """Records send_message calls; enqueue_local_api_job now sends an initial
+    queue status via _set_service_status(source_message=None), which needs a
+    bot to send through (see app/status_messages.py)."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def send_message(self, **kwargs):
+        self.sent.append(kwargs)
+        return object()
+
+
 class _FakeServices:
     def __init__(self, owner_user_id=OWNER_ID, user_langs=None, summary_cache=None):
         self.settings = _FakeSettings(owner_user_id)
@@ -62,6 +75,11 @@ class _FakeServices:
         self.job_store = _FakeJobStore()
         self.user_langs = user_langs
         self.summary_cache = summary_cache
+        self.bot = _FakeBot()
+        self.summary_status_messages = {}
+        self.summary_status_base_texts = {}
+        self.summary_status_parse_modes = {}
+        self.summary_status_disable_previews = {}
 
 
 async def _stop_worker(services: _FakeServices) -> None:

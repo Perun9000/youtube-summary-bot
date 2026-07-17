@@ -33,6 +33,7 @@
   "start.allowlist": "Kirim link video YouTube. Saya akan membalas di sini dengan ringkasan singkat dan menerbitkan uraian lengkap di Telegra.ph.\n\nAnda memiliki akses tak terbatas 🎉",
   "start.bad_deeplink": "Saya tidak bisa membaca parameter link ini. Buka video YouTube dan tekan tombol “Summary” lagi — seharusnya mengirim video_id 11 karakter.",
   "start.onboarding": "👋 Hai! Saya membuat ringkasan video YouTube.\n\nKirim link videonya — saya akan membalas di sini dengan ringkasan singkat (tentang apa videonya, waktu baca, tag, komentar teratas), dan menerbitkan uraian lengkap per bab di Telegra.ph.\n\n<b>Yang bisa saya lakukan:</b>\n• video tanpa teks — saya transkripsikan audionya sendiri\n• video premiere — saya ingat dan akan kembali dengan ringkasan setelah rilis\n• video yang sudah pernah diproses langsung dikirim gratis\n\n<b>Paket:</b>\n🆓 <b>Gratis</b> — {starter} ringkasan di awal, lalu {weekly} per minggu\n⭐ <b>Berlangganan {price} ⭐/bulan</b> — {monthly} ringkasan per bulan dan kecepatan pembuatan yang diprioritaskan: /subscribe\n\nVideo panjang tanpa teks (lebih dari satu jam) dihitung sebagai 2 ringkasan.\n\n/limits — sisa kuota · /help — semua perintah",
+  "status.already_queued": "Video ini sudah ada dalam antrean — ringkasannya akan tiba begitu selesai diproses.",
   "status.audio_download": "Mengunduh audio untuk transkripsi via Groq...",
   "status.captions": "Mencoba mengambil teks bawaan YouTube...",
   "status.elapsed": "Waktu berlalu: {elapsed}",

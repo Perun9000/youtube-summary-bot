@@ -33,6 +33,7 @@
   "start.allowlist": "Envíame un enlace de vídeo de YouTube. Te responderé aquí con un resumen breve y publicaré el desarrollo completo en Telegra.ph.\n\nTienes acceso ilimitado 🎉",
   "start.bad_deeplink": "No pude interpretar el parámetro del enlace. Abre el vídeo de YouTube y pulsa el botón «Summary» otra vez — debe enviar un video_id de 11 caracteres.",
   "start.onboarding": "👋 ¡Hola! Hago resúmenes de vídeos de YouTube.\n\nEnvíame un enlace al vídeo — te responderé aquí con un resumen breve (de qué trata, tiempo de lectura, etiquetas, comentario destacado) y publicaré el desarrollo completo por capítulos en Telegra.ph.\n\n<b>Qué puedo hacer:</b>\n• vídeos sin subtítulos — transcribo el audio yo mismo\n• estrenos — lo recordaré y volveré con un resumen tras el lanzamiento\n• los vídeos ya procesados se entregan al instante y gratis\n\n<b>Planes:</b>\n🆓 <b>Gratis</b> — {starter} resúmenes de entrada, luego {weekly} por semana\n⭐ <b>Suscripción {price} ⭐/mes</b> — {monthly} resúmenes al mes y velocidad de generación prioritaria: /subscribe\n\nUn vídeo largo sin subtítulos (de más de una hora) cuenta como 2 resúmenes.\n\n/limits — cuota restante · /help — todos los comandos",
+  "status.already_queued": "Este vídeo ya está en la cola — el resumen llegará en cuanto se procese.",
   "status.audio_download": "Descargando el audio para la transcripción vía Groq...",
   "status.captions": "Intentando obtener los subtítulos integrados de YouTube...",
   "status.elapsed": "Transcurrido: {elapsed}",

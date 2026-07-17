@@ -17,6 +17,7 @@ from app.status_messages import (
     _prefetch_job_title,
     _set_service_status,
 )
+from app.utils import extract_video_id
 from app.delivery import (
     _deliver_cached_summary_for_job,
     _lookup_cached_summary,
@@ -51,6 +52,49 @@ def _job_priority(user_id: int | None, services: Services) -> int:
     return PRIORITY_FREE
 
 
+async def _find_duplicate_job(
+    video_id: str, chat_id: int, services: Services
+) -> SummaryJob | None:
+    """Ищем уже стоящий в очереди/обрабатываемый job на тот же (video_id, chat_id).
+
+    Дедупликация повторных кликов по одному ролику: без неё каждый клик
+    ставит новый job (и для внешних пользователей списывает квоту за каждый
+    клик). Проверяем summary_queue (активный + ожидающие) и, если он
+    инициализирован, transcription_queue (активный + ожидающие) — ролик может
+    застрять там в ожидании Groq. Каждая очередь читается под своим локом по
+    отдельности (как в _format_queue_status) — без вложенных локов, риска
+    дедлока нет.
+    """
+    candidates: list[SummaryJob] = []
+    async with services.summary_queue_lock:
+        if services.summary_active_job is not None:
+            candidates.append(services.summary_active_job)
+        candidates.extend(services.summary_queue._queue)
+
+    # getattr with default: some lightweight test fakes for Services don't
+    # define transcription_* attributes at all (they predate the
+    # transcription queue) — treat that the same as "not initialized".
+    transcription_queue = getattr(services, "transcription_queue", None)
+    transcription_queue_lock = getattr(services, "transcription_queue_lock", None)
+    if transcription_queue is not None and transcription_queue_lock is not None:
+        async with transcription_queue_lock:
+            transcription_active_job = getattr(services, "transcription_active_job", None)
+            if transcription_active_job is not None:
+                candidates.append(transcription_active_job)
+            candidates.extend(transcription_queue._queue)
+
+    for candidate in candidates:
+        if candidate.chat_id != chat_id:
+            continue
+        try:
+            candidate_video_id = extract_video_id(candidate.url)
+        except Exception:  # noqa: BLE001 — перестраховка, в очереди только видео-URL
+            continue
+        if candidate_video_id == video_id:
+            return candidate
+    return None
+
+
 async def _enqueue_summary_job(message: Message, url: str, services: Services) -> None:
     # Внешний пользователь (не allowlist) в PUBLIC_MODE проходит через квоты.
     from app.bot_handlers import _is_allowed, _msg_lang  # local: избегаем цикла
@@ -72,6 +116,27 @@ async def _enqueue_summary_job(message: Message, url: str, services: Services) -
             await _send_cached_summary_to_chat(message, cached, services)
             enqueued = True
             return
+
+        # Дубль-проверка ДО квота-гейта: повторный клик по тому же ролику в
+        # том же чате не должен жечь квоту внешнего пользователя, даже если
+        # исходный job ещё не обработан.
+        try:
+            incoming_video_id: str | None = extract_video_id(url)
+        except Exception:  # noqa: BLE001 — на этом пути всегда видео-URL, перестраховка
+            incoming_video_id = None
+        if incoming_video_id is not None:
+            duplicate = await _find_duplicate_job(incoming_video_id, message.chat.id, services)
+            if duplicate is not None:
+                logger.info(
+                    "queue.job.duplicate_skipped chat_id=%s video_id=%s",
+                    message.chat.id, incoming_video_id,
+                )
+                await message.answer(t("status.already_queued", lang))
+                # Чат чистый: исходную ссылку удаляем как при обычной
+                # постановке в очередь — статус-сообщение существующего job'а
+                # и так висит и покажет прогресс.
+                enqueued = True
+                return
 
         if quota_user_id is not None and services.quota is not None:
             verdict = services.quota.check(quota_user_id)
@@ -309,6 +374,15 @@ async def enqueue_local_api_job(video_id: str, services: Services) -> str:
         logger.info("local_api.cache.hit video_id=%s", video_id)
         return "cached"
 
+    # Дубль-проверка: тот же ролик уже стоит/обрабатывается для владельца —
+    # новый job не создаём (иначе кнопка расширения плодила бы по job'у на
+    # каждый клик). Кнопка всё равно мигнёт ✅ — ролик и так в очереди.
+    duplicate = await _find_duplicate_job(video_id, owner_id, services)
+    if duplicate is not None:
+        logger.info("local_api.job.duplicate_skipped video_id=%s", video_id)
+        return "queued"
+
+    active_job: SummaryJob | None
     async with services.summary_queue_lock:
         services.summary_next_sequence += 1
         db_id = (
@@ -319,6 +393,11 @@ async def enqueue_local_api_job(video_id: str, services: Services) -> str:
             if services.job_store
             else None
         )
+        active_job = services.summary_active_job
+        # Snapshot до put() — см. тот же паттерн в _enqueue_summary_job:
+        # считаем, сколько ожидающих job'ов встанут перед новым по
+        # (priority, sequence), чтобы статус показал верную позицию.
+        pending_snapshot = list(services.summary_queue._queue)
         job = SummaryJob(
             sequence=services.summary_next_sequence,
             message=None,
@@ -329,10 +408,38 @@ async def enqueue_local_api_job(video_id: str, services: Services) -> str:
             lang=lang,
             priority=PRIORITY_PRIVILEGED,
         )
+        ahead = sum(
+            1
+            for pending in pending_snapshot
+            if (pending.priority, pending.sequence) < (job.priority, job.sequence)
+        )
+        position = (1 if active_job is not None else 0) + ahead + 1
         await services.summary_queue.put(job)
         if services.summary_worker_task is None or services.summary_worker_task.done():
             services.summary_worker_task = asyncio.create_task(_summary_queue_worker(services))
-    logger.info("local_api.job.enqueued sequence=%s video_id=%s", job.sequence, video_id)
+    logger.info(
+        "local_api.job.enqueued sequence=%s video_id=%s position=%s", job.sequence, video_id, position
+    )
+
+    # Тот же паттерн начального статуса, что и в _enqueue_summary_job, но
+    # через bot.send_message (message=None) — до фикса Q2 расширение ставило
+    # job молча, без единого сообщения о процессе/очереди в чате.
+    if position == 1:
+        await _set_service_status(
+            services=services,
+            source_message=None,
+            text=t("status.queued_first", lang),
+            job=job,
+            bump=True,
+        )
+    else:
+        await _set_service_status(
+            services=services,
+            source_message=None,
+            text=t("status.queued_position", lang, position=position),
+            job=job,
+            bump=True,
+        )
     return "queued"
 
 
