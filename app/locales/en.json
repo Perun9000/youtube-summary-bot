@@ -69,7 +69,7 @@
   "summary.new_video_channel": "New video on channel {channel}",
   "summary.new_video_channel_link": "New video on channel <a href=\"{url}\">{channel}</a>",
   "summary.reading_time": "Reading time: {minutes} min",
-  "summary.top_comment": "💬 <i>Top comment ({likes}):\n“",
+  "summary.top_comment": "<blockquote expandable>💬 Top comment ({likes}): “",
   "telegraph.chapter_placeholder": "Key point",
   "telegraph.chapters": "Key points",
   "telegraph.chapters_failed": "Couldn't extract a detailed breakdown of the key points — the model returned an incomplete response. The executive summary above is still valid.",

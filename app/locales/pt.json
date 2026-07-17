@@ -69,7 +69,7 @@
   "summary.new_video_channel": "Novo vídeo no canal {channel}",
   "summary.new_video_channel_link": "Novo vídeo no canal <a href=\"{url}\">{channel}</a>",
   "summary.reading_time": "Tempo de leitura: {minutes} min",
-  "summary.top_comment": "💬 <i>Comentário em destaque ({likes}):\n“",
+  "summary.top_comment": "<blockquote expandable>💬 Comentário em destaque ({likes}): “",
   "telegraph.chapter_placeholder": "Ponto principal",
   "telegraph.chapters": "Pontos principais",
   "telegraph.chapters_failed": "Não foi possível extrair um detalhamento dos pontos principais — o modelo retornou uma resposta incompleta. O resumo executivo acima ainda é válido.",

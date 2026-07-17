@@ -1,5 +1,8 @@
 from app.models import Summary
 from app.summarizer import (
+    COMPACT_SUMMARY_PROMPT,
+    SUMMARY_JSON_PROMPT,
+    SYNTHESIS_PROMPT,
     Summarizer,
     SummaryParseError,
     SummaryUnusableError,
@@ -10,6 +13,23 @@ from app.summarizer import (
 )
 
 import pytest
+
+
+# --- Q3, Изменение 1: overview-схема требует 2–4 абзаца через \n\n ---
+
+@pytest.mark.parametrize(
+    "prompt", [SUMMARY_JSON_PROMPT, SYNTHESIS_PROMPT, COMPACT_SUMMARY_PROMPT],
+)
+def test_overview_schema_requires_paragraph_breaks(prompt):
+    # Схема поля "overview" должна требовать 2-4 абзаца, разделённых \n\n
+    # (буквально — экранированная последовательность внутри строки промпта),
+    # с главной мыслью в первом абзаце.
+    assert '"overview"' in prompt
+    overview_line = next(
+        line for line in prompt.splitlines() if '"overview"' in line
+    )
+    assert "\\n\\n" in overview_line
+    assert "абзац" in overview_line.lower()
 
 
 VALID = '{"overview": "Кратко о ролике.", "chapters": [{"start": "00:01", "title": "Глава", "notes": "Текст."}], "tags": {"topic": "финансы", "speakers": ["Иванов"], "hosts": [], "format": "интервью"}}'

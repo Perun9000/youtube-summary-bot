@@ -69,7 +69,7 @@
   "summary.new_video_channel": "ویدیوی جدید در کانال {channel}",
   "summary.new_video_channel_link": "ویدیوی جدید در کانال <a href=\"{url}\">{channel}</a>",
   "summary.reading_time": "زمان مطالعه: {minutes} دقیقه",
-  "summary.top_comment": "💬 <i>برترین کامنت ({likes}):\n«",
+  "summary.top_comment": "<blockquote expandable>💬 برترین کامنت ({likes}): «",
   "telegraph.chapter_placeholder": "نکته",
   "telegraph.chapters": "نکات کلیدی",
   "telegraph.chapters_failed": "استخراج جزئیات نکات کلیدی ممکن نشد — مدل پاسخ ناقصی برگرداند. خلاصه‌ی اجرایی بالا همچنان معتبر است.",

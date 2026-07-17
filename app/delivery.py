@@ -72,24 +72,31 @@ def _format_telegram_summary(
             segment_line = f"<i>Фрагмент ролика: {escape_html(spans_text)}</i>"
 
     overview_line = f"{t('summary.about', lang)}\n{escape_html(summary.overview)}"
-    reading_line = t("summary.reading_time", lang, minutes=_estimate_reading_time_minutes(summary))
 
+    # Компактная строка: «⏱ Время чтения: N мин · подробное саммари 🔮».
     # Ссылка на полный конспект живёт и в inline-кнопке (_build_summary_keyboard),
     # и в теле сообщения: кнопка при пересылке сообщения не сохраняется,
     # а гиперссылка в тексте — сохраняется. При деградации Telegraph
-    # (telegraph_url == "") строка просто не добавляется.
-    telegraph_line = ""
+    # (telegraph_url == "") остаётся только часть про время чтения.
+    # ⏱/🔮 держим в коде, а не в локализованных ключах, чтобы не трогать
+    # переводы во всех 7 локалях ради одного эмодзи.
+    reading_time_text = t("summary.reading_time", lang, minutes=_estimate_reading_time_minutes(summary))
+    reading_part = f"⏱ {reading_time_text}" if reading_time_text else ""
+
+    telegraph_part = ""
     if telegraph_url:
-        telegraph_line = (
-            f'🔮 <a href="{escape_html(telegraph_url)}">{t("summary.details_link", lang)}</a>'
+        telegraph_part = (
+            f'<a href="{escape_html(telegraph_url)}">{t("summary.details_link", lang)}</a> 🔮'
         )
+
+    compact_line = " · ".join(part for part in (reading_part, telegraph_part) if part)
 
     blocks = [channel_line, title_line]
     if segment_line:
         blocks.append(segment_line)
-    blocks.extend([overview_line, reading_line])
-    if telegraph_line:
-        blocks.append(telegraph_line)
+    blocks.append(overview_line)
+    if compact_line:
+        blocks.append(compact_line)
 
     tags_line = _format_tags_line(summary.tags)
     if tags_line:
@@ -221,7 +228,7 @@ def _format_top_comment_line(top_comment: VideoComment, available_chars: int, la
     prefix = t("summary.top_comment", lang, likes=likes_label)
     open_quote = prefix[-1] if prefix else "«"
     close_quote = _QUOTE_PAIRS.get(open_quote, "»")
-    suffix = f"{close_quote}</i>"
+    suffix = f"{close_quote}</blockquote>"
     max_body_chars = min(TOP_COMMENT_MAX_CHARS, max(0, available_chars - len(prefix) - len(suffix)))
     if max_body_chars <= 0:
         return ""
