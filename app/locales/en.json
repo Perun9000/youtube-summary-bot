@@ -46,6 +46,7 @@
   "status.queue_line": "queue: {position}/{total}",
   "status.queued_first": "Added the video to the summary queue. Starting processing.",
   "status.queued_position": "Added the video to the queue. Position: {position}.",
+  "status.retry_scheduled": "Network hiccup — I'll retry in {minutes} min.",
   "status.stopped": "Summary generation stopped.",
   "status.transcribe_done": "Transcription finished. Returning to the summary queue...",
   "status.transcribe_queue": "Captions unavailable. Sending to the transcription queue via Groq Whisper...",

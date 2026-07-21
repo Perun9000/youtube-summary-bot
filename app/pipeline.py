@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import socket
 import time
 import uuid
 from pathlib import Path
 
-from aiogram.exceptions import TelegramBadRequest
+import aiohttp
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.types import CallbackQuery, FSInputFile
 
 from app.groq_whisper_service import GroqWhisperUnavailable
@@ -57,6 +59,126 @@ from app.delivery import (
 
 
 logger = logging.getLogger(__name__)
+
+
+# Q4: авторетрай задач, упавших по транзиентным (сетевым) причинам — утренний
+# шторм сети не должен показывать пользователю финальную ошибку, если через
+# несколько минут всё бы сгенерировалось. Переиспользуем deferred-механику
+# премьер (jobs.run_after + status='deferred' + run_deferred_jobs_scheduler):
+# ретраи ложатся на те же рельсы, просто с других run_after и с своим
+# счётчиком попыток (jobs.attempts / SummaryJob.retry_count).
+MAX_TRANSIENT_RETRIES = 3
+# Бэкофф — 5 мин × номер попытки (5 / 10 / 15 мин).
+TRANSIENT_RETRY_BACKOFF_UNIT_SEC = 300
+
+# Exception-типы, которые почти всегда означают транзиентный сетевой сбой,
+# а не проблему с самим роликом/квотой/конфигурацией. Консервативный
+# allowlist — расширять только по реальным инцидентам, не "на всякий случай".
+_TRANSIENT_EXCEPTION_TYPES: tuple[type[BaseException], ...] = (
+    aiohttp.ClientError,       # aiogram гоняет Bot API поверх aiohttp
+    asyncio.TimeoutError,      # alias TimeoutError на 3.11+, но пишем явно
+    TelegramNetworkError,      # aiogram: сбой сети при обращении к Telegram
+    ConnectionError,           # ConnectionReset/Refused/Aborted, BrokenPipe
+    socket.gaierror,           # DNS resolution failed
+)
+
+# Подстроки в str(exc) — по ним ловим сетевые сбои, которые llm_client.py и
+# смежные модули заворачивают в обычный RuntimeError с человекочитаемым
+# текстом (см. httpx.ConnectError/ReadTimeout → _OpenRouterRetriable →
+# RuntimeError в app/llm_client.py). Сравнение case-insensitive.
+_TRANSIENT_TEXT_MARKERS: tuple[str, ...] = (
+    "cannot connect to host",
+    "connection reset",
+    "request timeout",
+    "temporary failure in name resolution",
+    "openrouter http 502",
+    "openrouter http 503",
+    "openrouter http 504",
+    "http_502",
+    "http_503",
+    "http_504",
+    "connect_error",
+)
+
+
+def _is_transient_failure(exc: BaseException) -> bool:
+    """True, если ``exc`` похоже на временный сетевой сбой (не баг, не квота,
+    не проблема с самим роликом) — кандидат на авторетрай вместо финального
+    failed.
+
+    НЕ транзиентны (осознанно, по брифу Q4): FREE_CHAIN_EXHAUSTED_MARKER и
+    OPENROUTER_BUDGET_EXCEEDED_MARKER — у них своя семантика (квоты/бюджет),
+    их проверяем и отсекаем в первую очередь, даже если текст ошибки заодно
+    упоминает HTTP 5xx (последняя ошибка цепочки часто именно такая).
+    Приватное видео / нет транскрипта / GROQ_API_KEY не настроен /
+    UserFacingError / прочие ошибки квоты — тоже не транзиентны, но им и не
+    нужно специальное исключение: они просто не совпадают ни с одним типом
+    или маркером ниже.
+    """
+    reason = str(exc)
+    if FREE_CHAIN_EXHAUSTED_MARKER in reason or OPENROUTER_BUDGET_EXCEEDED_MARKER in reason:
+        return False
+    if isinstance(exc, _TRANSIENT_EXCEPTION_TYPES):
+        return True
+    lowered = reason.lower()
+    return any(marker in lowered for marker in _TRANSIENT_TEXT_MARKERS)
+
+
+async def _maybe_retry_transient_failure(
+    job: SummaryJob, services: Services, exc: Exception, job_id: str
+) -> bool:
+    """Если ``exc`` транзиентна и попытки не исчерпаны — отложить job на повтор
+    вместо финализации в failed.
+
+    Переиспользует ровно тот же путь, что и премьер-деферрал
+    (``_defer_premiere_job``): статус строки в БД → 'deferred' + run_after,
+    ``job.deferred_until`` выставлен — воркер (``_summary_queue_worker``) не
+    финализирует статус, job поднимет ``run_deferred_jobs_scheduler`` через
+    ``_requeue_due_deferred``. Возвращает True, если job поставлен на повтор
+    (вызывающий код должен тихо вернуться, не слать error-сообщение и не
+    re-raise'ить); False — ретраить нельзя (не транзиентно, лимит исчерпан,
+    либо нет персистентной строки), вызывающий код идёт по обычному
+    failed-пути.
+
+    Счётчик попыток — ``job.retry_count`` / ``jobs.attempts`` — общий с
+    полем, которое использует scheduled-деферрал LLM-недоступности в
+    ``_summary_queue_worker`` (тот инкрементирует retry_count в памяти, но
+    никогда не персистит его через set_deferred/set_status — тот job либо
+    сразу переигрывается, либо остаётся 'queued' и восстанавливается через
+    restore_pending_jobs). Премьер-деферрал (``_defer_premiere_job``) этот
+    счётчик не трогает вовсе — attempts остаётся 0, лимит в 3 попытки на
+    премьеры не распространяется.
+    """
+    if not _is_transient_failure(exc):
+        return False
+    if job.retry_count >= MAX_TRANSIENT_RETRIES:
+        return False
+    if services.job_store is None or job.db_id is None:
+        # Отложить не через что (нет персистентной строки) — как и в
+        # _defer_premiere_job, ретраить нечем, пусть job идёт по обычному
+        # failed-пути.
+        return False
+
+    job.retry_count += 1
+    backoff_sec = TRANSIENT_RETRY_BACKOFF_UNIT_SEC * job.retry_count
+    run_after = time.time() + backoff_sec
+    job.deferred_until = run_after
+    services.job_store.set_deferred(job.db_id, run_after, attempts=job.retry_count)
+    logger.info(
+        "job.transient_retry.deferred job_id=%s db_id=%s attempts=%s backoff_sec=%s error=%s",
+        job_id, job.db_id, job.retry_count, backoff_sec, exc,
+    )
+
+    minutes = backoff_sec // 60
+    try:
+        await _set_service_status(
+            services, job.message,
+            t("status.retry_scheduled", job.lang, minutes=minutes),
+            job=job,
+        )
+    except Exception:  # noqa: BLE001 — статус best-effort, ретрай уже поставлен
+        logger.warning("job.transient_retry.status_failed job_id=%s db_id=%s", job_id, job.db_id)
+    return True
 
 
 def _user_facing_error_reason(exc: Exception, job: SummaryJob, services) -> str:
@@ -621,6 +743,12 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
         raise
     except Exception as exc:
         logger.exception("job.failed job_id=%s video_id=%s duration_sec=%.1f", job_id, video_id, time.monotonic() - started)
+        # Q4: сетевой сбой (шторм, обрыв до OpenRouter/Telegram) — вместо
+        # финального failed откладываем job на повтор через ту же
+        # deferred-механику, что и премьеры. Пользователь не видит ошибку,
+        # если ретрай ещё не исчерпан.
+        if await _maybe_retry_transient_failure(job, services, exc, job_id):
+            return
         await _set_service_status(services, message, t("status.interrupted", job.lang), job=job)
         await _send_summary_delivery(
             services=services,

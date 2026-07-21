@@ -46,6 +46,7 @@
   "status.queue_line": "صف: {position}/{total}",
   "status.queued_first": "ویدیو را به صف خلاصه‌سازی افزودم. شروع پردازش.",
   "status.queued_position": "ویدیو را به صف افزودم. موقعیت: {position}.",
+  "status.retry_scheduled": "اختلال موقت شبکه — تا {minutes} دقیقه دیگر دوباره تلاش می‌کنم.",
   "status.stopped": "تولید خلاصه متوقف شد.",
   "status.transcribe_done": "تبدیل به متن تمام شد. بازگرداندن به صف خلاصه‌سازی...",
   "status.transcribe_queue": "زیرنویس در دسترس نیست. ارسال به صف تشخیص گفتار با Groq Whisper...",

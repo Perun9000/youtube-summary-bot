@@ -328,6 +328,12 @@ async def restore_pending_jobs(services: Services) -> int:
                 db_id=row["id"],
                 lang=row["lang"],
                 priority=priority,
+                # Q4: перенос счётчика транзиентных ретраев — если контейнер
+                # рестартовал во время "active" job'а, который уже пережил
+                # 1-2 сетевых сбоя, восстановленный job не должен начинать
+                # отсчёт заново (иначе лимит в 3 попытки эффективно не работает
+                # через рестарты).
+                retry_count=row["attempts"] if "attempts" in row.keys() else 0,
             )
             services.job_store.set_status(row["id"], "queued")
             await services.summary_queue.put(job)
@@ -506,6 +512,11 @@ async def _requeue_due_deferred(services: Services) -> None:
                 db_id=row["id"],
                 lang=row["lang"],
                 priority=priority,
+                # Q4: перенос attempts — премьеры проходят тут с attempts=0
+                # (не тронуты транзиентным ретраем) и остаются на 0; job'ы,
+                # отложенные из-за сетевого сбоя, продолжают отсчёт лимита в
+                # 3 попытки через requeue, а не сбрасывают его.
+                retry_count=row["attempts"] if "attempts" in row.keys() else 0,
             )
             services.job_store.set_status(row["id"], "queued")
             await services.summary_queue.put(job)

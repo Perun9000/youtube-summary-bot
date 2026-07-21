@@ -46,6 +46,7 @@
   "status.queue_line": "cola: {position}/{total}",
   "status.queued_first": "Añadí el vídeo a la cola de resúmenes. Empiezo a procesarlo.",
   "status.queued_position": "Añadí el vídeo a la cola. Posición: {position}.",
+  "status.retry_scheduled": "Fallo de red temporal — reintentaré en {minutes} min.",
   "status.stopped": "Generación del resumen detenida.",
   "status.transcribe_done": "Transcripción terminada. Devolviendo a la cola de resúmenes...",
   "status.transcribe_queue": "Subtítulos no disponibles. Enviando a la cola de transcripción vía Groq Whisper...",

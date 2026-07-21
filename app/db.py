@@ -75,7 +75,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     run_after REAL,
-    lang TEXT NOT NULL DEFAULT 'ru'
+    lang TEXT NOT NULL DEFAULT 'ru',
+    attempts INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS morning_digest_items (
     video_id TEXT PRIMARY KEY,
@@ -144,6 +145,14 @@ class Database:
             try:
                 self._conn.execute("ALTER TABLE jobs ADD COLUMN lang TEXT NOT NULL DEFAULT 'ru'")
                 logger.info("db.migrate jobs.lang added")
+            except sqlite3.OperationalError:
+                pass  # колонка уже есть
+            # Миграция для баз, созданных до появления транзиентных ретраев
+            # (Q4): счётчик попыток авторетрая по сетевым сбоям. См.
+            # app/pipeline.py::_is_transient_failure и JobStore.set_deferred.
+            try:
+                self._conn.execute("ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+                logger.info("db.migrate jobs.attempts added")
             except sqlite3.OperationalError:
                 pass  # колонка уже есть
             self._conn.commit()

@@ -46,6 +46,7 @@
   "status.queue_line": "очередь: {position}/{total}",
   "status.queued_first": "Добавил ролик в очередь summary. Начинаю обработку.",
   "status.queued_position": "Добавил ролик в очередь summary. Позиция: {position}.",
+  "status.retry_scheduled": "Сетевая заминка — повторю через {minutes} мин.",
   "status.stopped": "Генерация summary остановлена.",
   "status.transcribe_done": "Распознавание завершено. Возвращаю в очередь summary...",
   "status.transcribe_queue": "Субтитры недоступны. Отправляю в очередь распознавания через Groq Whisper...",

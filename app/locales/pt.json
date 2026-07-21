@@ -46,6 +46,7 @@
   "status.queue_line": "fila: {position}/{total}",
   "status.queued_first": "Adicionei o vídeo à fila de resumos. Começando o processamento.",
   "status.queued_position": "Adicionei o vídeo à fila. Posição: {position}.",
+  "status.retry_scheduled": "Falha temporária de rede — vou tentar novamente em {minutes} min.",
   "status.stopped": "Geração do resumo parada.",
   "status.transcribe_done": "Transcrição concluída. Devolvendo à fila de resumos...",
   "status.transcribe_queue": "Legendas indisponíveis. Enviando para a fila de transcrição via Groq Whisper...",
