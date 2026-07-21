@@ -332,8 +332,9 @@ async def restore_pending_jobs(services: Services) -> int:
                 # рестартовал во время "active" job'а, который уже пережил
                 # 1-2 сетевых сбоя, восстановленный job не должен начинать
                 # отсчёт заново (иначе лимит в 3 попытки эффективно не работает
-                # через рестарты).
-                retry_count=row["attempts"] if "attempts" in row.keys() else 0,
+                # через рестарты). transient_retries, НЕ retry_count — то поле
+                # принадлежит только LLM-availability wait loop'у ниже.
+                transient_retries=row["attempts"] if "attempts" in row.keys() else 0,
             )
             services.job_store.set_status(row["id"], "queued")
             await services.summary_queue.put(job)
@@ -515,8 +516,10 @@ async def _requeue_due_deferred(services: Services) -> None:
                 # Q4: перенос attempts — премьеры проходят тут с attempts=0
                 # (не тронуты транзиентным ретраем) и остаются на 0; job'ы,
                 # отложенные из-за сетевого сбоя, продолжают отсчёт лимита в
-                # 3 попытки через requeue, а не сбрасывают его.
-                retry_count=row["attempts"] if "attempts" in row.keys() else 0,
+                # 3 попытки через requeue, а не сбрасывают его. transient_retries,
+                # НЕ retry_count — то поле принадлежит только LLM-availability
+                # wait loop'у ниже, Q4 его не читает и не пишет.
+                transient_retries=row["attempts"] if "attempts" in row.keys() else 0,
             )
             services.job_store.set_status(row["id"], "queued")
             await services.summary_queue.put(job)
@@ -556,6 +559,12 @@ async def _summary_queue_worker(services: Services) -> None:
                 # долгого даунтайма LLM, restore_pending_jobs корректно поднимет
                 # его из БД именно как queued-работу.
                 retry_interval = services.settings.monitoring_llm_retry_interval_sec
+                # retry_count здесь — счётчик ТОЛЬКО этого wait loop'а (может
+                # расти сколь угодно долго, пока LLM недоступен, и никогда не
+                # персистится). Q4-механика транзиентных ретраев (см.
+                # app/pipeline.py::_maybe_retry_transient_failure) использует
+                # отдельное поле job.transient_retries — умышленно, чтобы
+                # долгий LLM-даунтайм не сжигал её лимит заранее.
                 job.retry_count += 1
                 logger.info(
                     "queue.job.defer_scheduled sequence=%s chat_id=%s retry=%s sleep_sec=%s",

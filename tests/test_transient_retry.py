@@ -68,6 +68,52 @@ def test_openrouter_http_502_text_variant_is_transient():
     assert _is_transient_failure(RuntimeError("OpenRouter HTTP 502: upstream error"))
 
 
+# ── Critical 1 (review fix): paid single-model wrapper text ────────────────
+# "OpenRouter ({model}) не ответил после {N} попыток: {short_reason}" —
+# _generate_with_retries (paid path, no fallback chain). This is the actual
+# text real timeouts/5xx/connect failures surface as; the pre-fix marker set
+# never matched it (see app/pipeline.py comment above _TRANSIENT_TEXT_MARKERS
+# for the full short_reason inventory).
+
+
+def test_paid_wrapper_timeout_is_transient():
+    assert _is_transient_failure(
+        RuntimeError("OpenRouter (some/model) не ответил после 3 попыток: timeout")
+    )
+
+
+def test_paid_wrapper_http_500_is_transient():
+    assert _is_transient_failure(
+        RuntimeError("OpenRouter (some/model) не ответил после 3 попыток: http_500")
+    )
+
+
+def test_paid_wrapper_http_error_subclass_is_transient():
+    assert _is_transient_failure(
+        RuntimeError(
+            "OpenRouter (some/model) не ответил после 3 попыток: "
+            "http_error:RemoteProtocolError"
+        )
+    )
+
+
+def test_paid_wrapper_connect_error_is_transient():
+    assert _is_transient_failure(
+        RuntimeError("OpenRouter (some/model) не ответил после 3 попыток: connect_error")
+    )
+
+
+def test_paid_wrapper_http_404_is_not_transient():
+    """4xx-путь _OpenRouterRetriable (429/402/404) also produces the "не
+    ответил после ... попыток" wrapper, but 404 means the model was pulled
+    from OpenRouter's catalog — a config problem, not a network blip.
+    Retrying it on the Q4 backoff would not help and must not be classified
+    as transient."""
+    assert not _is_transient_failure(
+        RuntimeError("OpenRouter (some/model) не ответил после 3 попыток: http_404")
+    )
+
+
 def test_free_chain_exhausted_marker_is_never_transient_even_with_5xx_inside():
     from app.llm_client import FREE_CHAIN_EXHAUSTED_MARKER
 
@@ -151,6 +197,15 @@ class _FakeBot:
         return _FakeSentMessage()
 
 
+class _FakeLLM:
+    """Succeeds immediately — used so job.scheduled=True jobs sail through
+    the _is_llm_available() gate in _summary_queue_worker without needing a
+    real Services.llm."""
+
+    async def list_models(self):
+        return []
+
+
 class _FakeServices:
     def __init__(self, exc: Exception, job_store: JobStore):
         self.settings = _FakeSettings()
@@ -161,6 +216,7 @@ class _FakeServices:
         self.summary_cache = None
         self.job_store = job_store
         self.bot = _FakeBot()
+        self.llm = _FakeLLM()
         self.bot_username = None
         self.morning_digest = None
 
@@ -179,7 +235,9 @@ def _make_job_store(tmp_path) -> JobStore:
     return JobStore(Database(tmp_path / "bot.db"))
 
 
-def _make_job(job_store: JobStore, *, retry_count: int = 0, chat_id: int = CHAT_ID) -> SummaryJob:
+def _make_job(
+    job_store: JobStore, *, transient_retries: int = 0, chat_id: int = CHAT_ID
+) -> SummaryJob:
     db_id = job_store.add(
         URL, chat_id, scheduled=False, disable_notification=False, title_hint=None, lang="ru",
     )
@@ -191,7 +249,7 @@ def _make_job(job_store: JobStore, *, retry_count: int = 0, chat_id: int = CHAT_
         chat_id=chat_id,
         db_id=db_id,
         lang="ru",
-        retry_count=retry_count,
+        transient_retries=transient_retries,
     )
 
 
@@ -210,7 +268,7 @@ async def test_transient_failure_defers_job_instead_of_failing(tmp_path):
     job_store = _make_job_store(tmp_path)
     exc = aiohttp.ClientConnectionError("network storm")
     services = _FakeServices(exc, job_store)
-    job = _make_job(job_store, retry_count=0)
+    job = _make_job(job_store, transient_retries=0)
     before = time.time()
 
     await _run_worker_once(services, job)
@@ -242,10 +300,11 @@ async def test_third_transient_failure_falls_back_to_failed_with_error_message(t
     job_store = _make_job_store(tmp_path)
     exc = aiohttp.ClientConnectionError("network storm")
     services = _FakeServices(exc, job_store)
-    # retry_count == MAX_TRANSIENT_RETRIES: две попытки уже были (пришли бы
-    # через _requeue_due_deferred, см. тест (d)), это — третий провал подряд.
+    # transient_retries == MAX_TRANSIENT_RETRIES: две попытки уже были
+    # (пришли бы через _requeue_due_deferred, см. тест (d)), это — третий
+    # провал подряд.
     assert MAX_TRANSIENT_RETRIES == 3
-    job = _make_job(job_store, retry_count=MAX_TRANSIENT_RETRIES)
+    job = _make_job(job_store, transient_retries=MAX_TRANSIENT_RETRIES)
 
     await _run_worker_once(services, job)
 
@@ -266,7 +325,7 @@ async def test_non_transient_failure_fails_immediately_even_on_first_attempt(tmp
     job_store = _make_job_store(tmp_path)
     exc = RuntimeError("нет субтитров")
     services = _FakeServices(exc, job_store)
-    job = _make_job(job_store, retry_count=0)
+    job = _make_job(job_store, transient_retries=0)
 
     await _run_worker_once(services, job)
 
@@ -275,7 +334,7 @@ async def test_non_transient_failure_fails_immediately_even_on_first_attempt(tmp
     assert row["attempts"] == 0  # ретрай не трогал счётчик — ошибка нетранзиентна
 
 
-# ── (г) _requeue_due_deferred переносит attempts в retry_count ────────────
+# ── (г) _requeue_due_deferred переносит attempts в transient_retries ──────
 
 
 class _FakeServicesForRequeue:
@@ -289,7 +348,7 @@ class _FakeServicesForRequeue:
         self.summary_next_sequence = 0
 
 
-async def test_requeue_due_deferred_carries_attempts_into_retry_count(tmp_path):
+async def test_requeue_due_deferred_carries_attempts_into_transient_retries(tmp_path):
     job_store = _make_job_store(tmp_path)
     db_id = job_store.add(
         URL, CHAT_ID, scheduled=False, disable_notification=False, title_hint=None, lang="ru",
@@ -301,7 +360,9 @@ async def test_requeue_due_deferred_carries_attempts_into_retry_count(tmp_path):
     await _requeue_due_deferred_at(services, now=1000.0)
 
     requeued = services.summary_queue.get_nowait()
-    assert requeued.retry_count == 2
+    assert requeued.transient_retries == 2
+    # LLM-wait-loop поле remains untouched by the requeue path.
+    assert requeued.retry_count == 0
     assert requeued.db_id == db_id
 
     row = job_store._db.query_one("SELECT * FROM jobs WHERE id = ?", (db_id,))
@@ -333,3 +394,34 @@ def test_premiere_deferral_does_not_touch_attempts(tmp_path):
     row = job_store._db.query_one("SELECT * FROM jobs WHERE id = ?", (db_id,))
     assert row["status"] == "deferred"
     assert row["attempts"] == 0
+
+
+# ── Critical 2 (review fix): LLM-wait retry_count must not pollute Q4 ──────
+
+
+async def test_llm_wait_retry_count_does_not_block_transient_retry(tmp_path):
+    """Regression for Critical 2: while a scheduled job's LLM backend is
+    unreachable, _summary_queue_worker bumps job.retry_count on the SAME
+    in-memory job object every retry_interval, for as long as the outage
+    lasts (see the job.scheduled branch above _is_llm_available). A downtime
+    longer than MAX_TRANSIENT_RETRIES * retry_interval (well under 15 min)
+    pushes retry_count past MAX_TRANSIENT_RETRIES before real processing even
+    starts.
+
+    Simulate that: retry_count=5 (as if the wait loop already churned through
+    5 cycles), LLM back up now, and a genuine transient network failure hits
+    during processing. The job must still defer via Q4's transient_retries
+    (untouched, starts at 0) instead of going straight to failed — retry_count
+    and transient_retries must be fully independent counters."""
+    job_store = _make_job_store(tmp_path)
+    exc = aiohttp.ClientConnectionError("network storm")
+    services = _FakeServices(exc, job_store)
+    job = _make_job(job_store, transient_retries=0)
+    job.scheduled = True
+    job.retry_count = 5  # polluted by the LLM-wait loop, unrelated to Q4
+
+    await _run_worker_once(services, job)
+
+    row = job_store._db.query_one("SELECT * FROM jobs WHERE id = ?", (job.db_id,))
+    assert row["status"] == "deferred"
+    assert row["attempts"] == 1

@@ -66,7 +66,8 @@ logger = logging.getLogger(__name__)
 # несколько минут всё бы сгенерировалось. Переиспользуем deferred-механику
 # премьер (jobs.run_after + status='deferred' + run_deferred_jobs_scheduler):
 # ретраи ложатся на те же рельсы, просто с других run_after и с своим
-# счётчиком попыток (jobs.attempts / SummaryJob.retry_count).
+# счётчиком попыток (jobs.attempts / SummaryJob.transient_retries — отдельное
+# поле от SummaryJob.retry_count, см. его комментарий в services_container.py).
 MAX_TRANSIENT_RETRIES = 3
 # Бэкофф — 5 мин × номер попытки (5 / 10 / 15 мин).
 TRANSIENT_RETRY_BACKOFF_UNIT_SEC = 300
@@ -86,6 +87,21 @@ _TRANSIENT_EXCEPTION_TYPES: tuple[type[BaseException], ...] = (
 # смежные модули заворачивают в обычный RuntimeError с человекочитаемым
 # текстом (см. httpx.ConnectError/ReadTimeout → _OpenRouterRetriable →
 # RuntimeError в app/llm_client.py). Сравнение case-insensitive.
+#
+# Paid-путь (_generate_with_retries, единственная модель без fallback-цепочки)
+# после исчерпания внутренних ретраев кидает
+# f"OpenRouter ({model}) не ответил после {attempt} попыток: {short_reason}".
+# По построению эта обёртка появляется ТОЛЬКО когда исходной причиной был
+# _OpenRouterRetriable (см. _generate_one_attempt) — а туда попадают ровно:
+# "connect_error", "timeout", f"http_error:{TypeName}" и "http_{429,402,404,
+# 5xx}". Т.е. сама фраза "не ответил после ... попыток" НЕ означает "сетевой
+# сбой" — 402 (провайдер исчерпал suточный USD-cap на free-тарифе) и 404
+# (модель временно снята из каталога OpenRouter) тоже проходят через
+# _OpenRouterRetriable, но это квота/конфигурация, а не сеть, и ретраить их
+# через 5/10/15 мин бессмысленно (тот же исход, просто позже). Поэтому матчим
+# НЕ обёртку целиком, а конкретные short_reason-суффиксы сетевого класса —
+# ": timeout", ": http_5" (500-599), ": connect", ": http_error:" —
+# оставляя http_429/402/404 нетранзиентными.
 _TRANSIENT_TEXT_MARKERS: tuple[str, ...] = (
     "cannot connect to host",
     "connection reset",
@@ -98,7 +114,22 @@ _TRANSIENT_TEXT_MARKERS: tuple[str, ...] = (
     "http_503",
     "http_504",
     "connect_error",
+    # short_reason-суффиксы обёртки "не ответил после N попыток: {reason}"
+    # (см. комментарий выше) — намеренно не включают ": http_429"/": http_402"/
+    # ": http_404".
+    ": timeout",
+    ": http_5",
+    ": connect",
+    ": http_error:",
 )
+
+# Minor: yt-dlp DownloadError (сбой скачивания видео/аудио) сюда сознательно
+# не добавлен. fetch_metadata (единственный путь, реально участвующий в Q4
+# retry-обвязке через _process_youtube_job) глотает исключения yt-dlp и
+# переупаковывает их в свои собственные UserFacingError/RuntimeError с уже
+# понятным текстом — DownloadError наружу не долетает. download_audio (Groq-
+# транскрипция) — отдельный путь вне Q4-скоупа транскрипционного конвейера
+# (см. бриф ревью). Если это когда-нибудь изменится — заводить маркер тут.
 
 
 def _is_transient_failure(exc: BaseException) -> bool:
@@ -140,18 +171,23 @@ async def _maybe_retry_transient_failure(
     либо нет персистентной строки), вызывающий код идёт по обычному
     failed-пути.
 
-    Счётчик попыток — ``job.retry_count`` / ``jobs.attempts`` — общий с
-    полем, которое использует scheduled-деферрал LLM-недоступности в
-    ``_summary_queue_worker`` (тот инкрементирует retry_count в памяти, но
-    никогда не персистит его через set_deferred/set_status — тот job либо
-    сразу переигрывается, либо остаётся 'queued' и восстанавливается через
-    restore_pending_jobs). Премьер-деферрал (``_defer_premiere_job``) этот
-    счётчик не трогает вовсе — attempts остаётся 0, лимит в 3 попытки на
-    премьеры не распространяется.
+    Счётчик попыток — ``job.transient_retries`` / ``jobs.attempts`` —
+    отдельное поле от ``job.retry_count``, которое использует scheduled-
+    деферрал LLM-недоступности в ``_summary_queue_worker`` (тот инкрементирует
+    retry_count в памяти на каждом проходе цикла ожидания, пока LLM недоступен
+    — потенциально много раз на одном и том же job-объекте — и никогда не
+    персистит его через set_deferred/set_status; тот job либо сразу
+    переигрывается, либо остаётся 'queued' и восстанавливается через
+    restore_pending_jobs). Если бы Q4 читал retry_count, долгий LLM-даунтайм
+    (> MAX_TRANSIENT_RETRIES * retry_interval) исчерпывал бы лимит транзиентных
+    ретраев ещё до начала реальной обработки — см. Critical 2 в ревью.
+    Премьер-деферрал (``_defer_premiere_job``) transient_retries не трогает
+    вовсе — attempts остаётся 0, лимит в 3 попытки на премьеры не
+    распространяется.
     """
     if not _is_transient_failure(exc):
         return False
-    if job.retry_count >= MAX_TRANSIENT_RETRIES:
+    if job.transient_retries >= MAX_TRANSIENT_RETRIES:
         return False
     if services.job_store is None or job.db_id is None:
         # Отложить не через что (нет персистентной строки) — как и в
@@ -159,14 +195,14 @@ async def _maybe_retry_transient_failure(
         # failed-пути.
         return False
 
-    job.retry_count += 1
-    backoff_sec = TRANSIENT_RETRY_BACKOFF_UNIT_SEC * job.retry_count
+    job.transient_retries += 1
+    backoff_sec = TRANSIENT_RETRY_BACKOFF_UNIT_SEC * job.transient_retries
     run_after = time.time() + backoff_sec
     job.deferred_until = run_after
-    services.job_store.set_deferred(job.db_id, run_after, attempts=job.retry_count)
+    services.job_store.set_deferred(job.db_id, run_after, attempts=job.transient_retries)
     logger.info(
         "job.transient_retry.deferred job_id=%s db_id=%s attempts=%s backoff_sec=%s error=%s",
-        job_id, job.db_id, job.retry_count, backoff_sec, exc,
+        job_id, job.db_id, job.transient_retries, backoff_sec, exc,
     )
 
     minutes = backoff_sec // 60

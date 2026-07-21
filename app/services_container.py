@@ -56,6 +56,13 @@ class SummaryJob:
     segment_spans: list[tuple[float, float]] | None = None
     expert_matches: list[str] | None = None
     show_matches: list[str] | None = None
+    # LLM-availability wait loop only (_summary_queue_worker, scheduled jobs):
+    # bumped every retry_interval while the LLM backend is unreachable, on the
+    # SAME in-memory job object, for as long as the outage lasts. Never
+    # persisted. Q4's transient-retry mechanic must NOT read or write this
+    # field — an outage longer than MAX_TRANSIENT_RETRIES * retry_interval
+    # would otherwise pre-exhaust the transient-retry budget before real
+    # processing even starts (see transient_retries below).
     retry_count: int = 0
     db_id: int | None = None
     # Transient, не персистится: main worker выставляет "done"/"failed" по
@@ -68,6 +75,14 @@ class SummaryJob:
     # вышла) и уже проставил в БД статус "deferred" + run_after. Воркеру
     # финальный статус трогать не нужно — job поднимет deferred-scheduler.
     deferred_until: float | None = None
+    # Q4: счётчик попыток авторетрая транзиентных (сетевых) сбоев —
+    # см. app/pipeline.py::_maybe_retry_transient_failure. Персистится в
+    # jobs.attempts (JobStore.set_deferred(attempts=...)) и переносится через
+    # рестарты/деферралы в restore_pending_jobs / _requeue_due_deferred.
+    # Отдельное поле от retry_count (см. его комментарий выше) — умышленно,
+    # чтобы длинный простой LLM не сжигал лимит транзиентных ретраев ещё до
+    # начала реальной обработки job'а.
+    transient_retries: int = 0
     # Квоты внешних пользователей (PUBLIC_MODE). None — безлимит (allowlist,
     # owner, scheduled-мониторинг): ни проверок, ни списаний.
     quota_user_id: int | None = None
