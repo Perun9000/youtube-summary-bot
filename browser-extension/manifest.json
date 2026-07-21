@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "YouTube Summary (Telegram bot)",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "Кнопка «Summary» в UI YouTube. По клику открывает Telegram-бота с ID текущего ролика — бот возвращает краткое саммари и полный конспект в Telegra.ph.",
   "icons": {
     "16": "icons/icon-16.png",
