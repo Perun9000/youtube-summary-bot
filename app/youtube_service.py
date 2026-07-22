@@ -233,6 +233,49 @@ class YtdlpUsage:
             return {}
 
 
+def _base_audio_options(tmp_dir: Path) -> dict:
+    """Опции yt-dlp для скачивания аудио (без cookie — их добавляет вызывающий).
+
+    hls_prefer_native — критично для работы за HTTP-прокси: свежие ролики
+    YouTube отдаёт только HLS-потоками, а ffmpeg-загрузчик игнорирует
+    HTTP(S)_PROXY и виснет там, где прямой доступ к googlevideo зарезан
+    (VPS в РФ). Нативный загрузчик yt-dlp ходит через прокси как все
+    python-запросы. socket_timeout страхует от вечного «Скачиваю аудио...».
+    """
+    return {
+        "format": "bestaudio/best",
+        "outtmpl": str(tmp_dir / "%(id)s.%(ext)s"),
+        "hls_prefer_native": True,
+        "socket_timeout": 30,
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                # 64 kbps mono — баланс размера и качества для прослушивания
+                # человеком (не для ASR — Whisper всё равно ресамплит к 16 kHz):
+                #  - заметно чище, чем 32 kbps: динамика голоса, интонации,
+                #    смех и телефонные вставки звучат внятно;
+                #  - ~28 МБ/час: часовой ролик умещается в 50 МБ Telegram
+                #    без перекомпрессии, 90-минутный тоже (~42 МБ),
+                #    двухчасовой пойдёт через _ensure_audio_fits_telegram.
+                "preferredquality": "64",
+            }
+        ],
+        # Принудительный mono на этапе перекодирования. YouTube часто
+        # отдаёт стерео-дорожку, где обе колонки идентичны (записанная
+        # речь), либо стереофонию, ничего не дающую разговорному ролику.
+        # Mono = тот же битрейт расходуется на одну дорожку → лучше
+        # звучит per канал, размер не растёт.
+        "postprocessor_args": {
+            "ffmpegextractaudio": ["-ac", "1"],
+        },
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "noplaylist": True,
+    }
+
+
 class YouTubeService:
     def __init__(self, settings: Settings, db=None) -> None:
         self._settings = settings
@@ -424,6 +467,7 @@ class YouTubeService:
         ]
 
     def download_audio(self, url: str) -> Path:
+        """Скачать аудиодорожку ролика в mp3 (для Groq Whisper и кнопки owner'а)."""
         audio_dir = self._settings.bot_data_dir / "audio"
         audio_dir.mkdir(parents=True, exist_ok=True)
         video_id = extract_video_id(url)
@@ -441,36 +485,7 @@ class YouTubeService:
         tmp_dir = Path(tempfile.mkdtemp(prefix="yt-", dir=audio_dir))
 
         def build_options(cookie_path: Path | None) -> dict:
-            options = {
-                "format": "bestaudio/best",
-                "outtmpl": str(tmp_dir / "%(id)s.%(ext)s"),
-                "postprocessors": [
-                    {
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        # 64 kbps mono — баланс размера и качества для прослушивания
-                        # человеком (не для ASR — Whisper всё равно ресамплит к 16 kHz):
-                        #  - заметно чище, чем 32 kbps: динамика голоса, интонации,
-                        #    смех и телефонные вставки звучат внятно;
-                        #  - ~28 МБ/час: часовой ролик умещается в 50 МБ Telegram
-                        #    без перекомпрессии, 90-минутный тоже (~42 МБ),
-                        #    двухчасовой пойдёт через _ensure_audio_fits_telegram.
-                        "preferredquality": "64",
-                    }
-                ],
-                # Принудительный mono на этапе перекодирования. YouTube часто
-                # отдаёт стерео-дорожку, где обе колонки идентичны (записанная
-                # речь), либо стереофонию, ничего не дающую разговорному ролику.
-                # Mono = тот же битрейт расходуется на одну дорожку → лучше
-                # звучит per канал, размер не растёт.
-                "postprocessor_args": {
-                    "ffmpegextractaudio": ["-ac", "1"],
-                },
-                "quiet": True,
-                "no_warnings": True,
-                "noprogress": True,
-                "noplaylist": True,
-            }
+            options = _base_audio_options(tmp_dir)
             self._add_cookie_option(options, cookie_path)
             return options
 
