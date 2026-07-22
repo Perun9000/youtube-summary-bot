@@ -258,11 +258,11 @@ def load_settings() -> Settings:
         )
     else:
         openrouter_model_free_chain = (
-            "qwen/qwen3-next-80b-a3b-instruct:free",
             "nvidia/nemotron-3-ultra-550b-a55b:free",
             "nvidia/nemotron-3-super-120b-a12b:free",
-            "tencent/hy3:free",
-            "meta-llama/llama-3.3-70b-instruct:free",
+            "google/gemma-4-31b-it:free",
+            "poolside/laguna-m.1:free",
+            "nvidia/nemotron-3-nano-30b-a3b:free",
         )
     if not openrouter_model_free_chain:
         raise RuntimeError("OPENROUTER_MODEL_FREE_CHAIN cannot be empty")
