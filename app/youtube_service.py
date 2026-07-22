@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import tempfile
 import threading
 import time
@@ -241,8 +242,13 @@ def _base_audio_options(tmp_dir: Path) -> dict:
     HTTP(S)_PROXY и виснет там, где прямой доступ к googlevideo зарезан
     (VPS в РФ). Нативный загрузчик yt-dlp ходит через прокси как все
     python-запросы. socket_timeout страхует от вечного «Скачиваю аудио...».
+
+    Для post-live HLS (свежезавершённые эфиры) yt-dlp игнорирует
+    hls_prefer_native и принудительно берёт ffmpeg — поэтому env-прокси
+    дополнительно передаётся явным параметром `proxy`: только его FFmpegFD
+    пробрасывает в ffmpeg флагом -http_proxy.
     """
-    return {
+    options: dict = {
         "format": "bestaudio/best",
         "outtmpl": str(tmp_dir / "%(id)s.%(ext)s"),
         "hls_prefer_native": True,
@@ -274,6 +280,10 @@ def _base_audio_options(tmp_dir: Path) -> dict:
         "noprogress": True,
         "noplaylist": True,
     }
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+    if proxy:
+        options["proxy"] = proxy
+    return options
 
 
 class YouTubeService:
