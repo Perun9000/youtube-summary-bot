@@ -407,8 +407,13 @@ def _is_job_cacheable(job: SummaryJob) -> bool:
     produced span-filtered transcripts) gets a summary specific to one
     expert window — it would be wrong to serve that as the canonical answer
     when a later user requests the *whole* video.
+
+    Custom-prompt job'ы (/myprompt) тоже не кэшируются: саммари с чужим
+    стилем нельзя отдавать как каноничный ответ другим пользователям, и
+    кэш-хит не дал бы промпту примениться (гейт работает в обе стороны —
+    и на чтение, и на запись).
     """
-    return not (job.segment_spans and len(job.segment_spans) > 0)
+    return not (job.segment_spans and len(job.segment_spans) > 0) and not job.custom_prompt
 def _lookup_cached_summary(url: str, services: Services, lang: str = "ru") -> CachedSummary | None:
     """Resolve URL → video_id → cached entry for ``lang``, swallowing parse errors."""
     if services.summary_cache is None:

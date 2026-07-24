@@ -51,3 +51,37 @@ def test_pending_expiry_by_stage():
 
 def test_max_chars_constant():
     assert CUSTOM_PROMPT_MAX_CHARS == 500
+
+
+# --- Прокидка через job: context_hint и кэш-байпас ---
+
+from app.delivery import _is_job_cacheable  # noqa: E402
+from app.pipeline import _build_context_hint  # noqa: E402
+from app.services_container import SummaryJob  # noqa: E402
+
+
+def _job(**kw):
+    return SummaryJob(
+        sequence=1, message=None, url=URL, enqueued_at=0.0, chat_id=1, **kw
+    )
+
+
+def test_context_hint_from_custom_prompt():
+    hint = _build_context_hint(_job(custom_prompt="Только цифры"))
+    assert "Только цифры" in hint
+    assert "не отменяют" in hint.lower()
+
+
+def test_context_hint_none_without_prompt_and_spans():
+    assert _build_context_hint(_job()) is None
+
+
+def test_context_hint_combines_segment_and_custom():
+    job = _job(custom_prompt="Кратко", segment_spans=[(0.0, 60.0)])
+    hint = _build_context_hint(job)
+    assert "фрагмент" in hint.lower() and "Кратко" in hint
+
+
+def test_custom_prompt_job_not_cacheable():
+    assert _is_job_cacheable(_job(custom_prompt="x")) is False
+    assert _is_job_cacheable(_job()) is True

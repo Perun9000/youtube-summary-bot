@@ -12,6 +12,7 @@ import aiohttp
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.types import CallbackQuery, FSInputFile
 
+from app.custom_prompt import wrap_custom_prompt
 from app.groq_whisper_service import GroqWhisperUnavailable
 from app.i18n import UserFacingError, t
 from app.llm_client import (
@@ -925,22 +926,26 @@ async def _process_transcription_job(job: SummaryJob, services: Services) -> Non
 
 
 def _build_context_hint(job: SummaryJob) -> str | None:
-    """Build a summarizer context hint for segment-mode (scheduled) jobs."""
-    if not job.segment_spans:
-        return None
-    spans_text = format_spans_for_humans(job.segment_spans)
-    experts = ", ".join(job.expert_matches) if job.expert_matches else ""
-    if experts:
-        return (
-            f"Это фрагмент длинного шоу с участием: {experts}. "
-            f"Таймкоды фрагмента: {spans_text}. "
-            "Саммаризируй только этот фрагмент: весь transcript, который ты получаешь, — "
-            "это уже вырезанный кусок. Не упоминай остальную часть ролика."
-        )
-    return (
-        f"Это фрагмент длинного ролика (таймкоды: {spans_text}). "
-        "Саммаризируй только этот фрагмент, не упоминай остальную часть ролика."
-    )
+    """Segment-hint (scheduled) + пожелания пользователя (/myprompt)."""
+    parts: list[str] = []
+    if job.segment_spans:
+        spans_text = format_spans_for_humans(job.segment_spans)
+        experts = ", ".join(job.expert_matches) if job.expert_matches else ""
+        if experts:
+            parts.append(
+                f"Это фрагмент длинного шоу с участием: {experts}. "
+                f"Таймкоды фрагмента: {spans_text}. "
+                "Саммаризируй только этот фрагмент: весь transcript, который ты получаешь, — "
+                "это уже вырезанный кусок. Не упоминай остальную часть ролика."
+            )
+        else:
+            parts.append(
+                f"Это фрагмент длинного ролика (таймкоды: {spans_text}). "
+                "Саммаризируй только этот фрагмент, не упоминай остальную часть ролика."
+            )
+    if job.custom_prompt:
+        parts.append(wrap_custom_prompt(job.custom_prompt))
+    return "\n\n".join(parts) if parts else None
 
 
 def _cleanup_audio_file(audio_path) -> None:
