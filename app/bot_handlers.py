@@ -43,6 +43,11 @@ from app.services_container import (  # noqa: F401
     SummaryJob,
     YOUTUBE_VIDEO_ID_RE as _YOUTUBE_VIDEO_ID_RE,
 )
+from app.custom_prompt import (
+    CUSTOM_PROMPT_MAX_CHARS,
+    PendingCustomPrompt,
+    parse_prompt_message,
+)
 from app.queue_service import (  # noqa: F401
     enqueue_scheduled_candidate,
     restore_pending_jobs,
@@ -68,6 +73,17 @@ SUBSCRIPTION_PAYLOAD = "monthly_summary_subscription"
 # Реф-ссылка ступени 0: /start r<uid>_<video_id>
 # (см. docs/superpowers/specs/2026-07-15-referral-share-step0-design.md).
 _REF_PAYLOAD_RE = re.compile(r"^r(\d{1,12})_([A-Za-z0-9_-]{11})$")
+
+
+def _may_use_custom_prompt(user_id: int | None, services) -> bool:
+    """Доступ к /myprompt: owner, allowlist или активная подписка."""
+    if user_id is None:
+        return False
+    if services.users.is_owner(user_id) or services.users.is_allowed(user_id):
+        return True
+    return bool(
+        services.billing is not None and services.billing.is_subscriber(user_id)
+    )
 
 
 def _parse_ref_payload(payload: str) -> tuple[int, str] | None:
@@ -326,6 +342,30 @@ def build_router(services: Services) -> Router:
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
+
+    @router.message(Command("myprompt"))
+    async def myprompt_command(message: Message) -> None:
+        """Одноразовый кастомный промпт для следующего саммари (premium).
+
+        Спека: docs/superpowers/specs/2026-07-23-custom-user-prompt-design.md
+        """
+        lang = _msg_lang(message, services)
+        if not _has_access(message, services):
+            await message.answer(t("access.closed", lang))
+            return
+        user_id = _message_user_id(message)
+        if not _may_use_custom_prompt(user_id, services):
+            await message.answer(t("myprompt.denied", lang))
+            return
+        args = (message.text or "").split(maxsplit=1)
+        if len(args) == 2 and args[1].strip():
+            # Короткий путь: /myprompt <промпт и/или ссылка> одним сообщением.
+            await _handle_custom_prompt_input(message, args[1], services)
+            return
+        services.pending_custom_prompts[message.chat.id] = PendingCustomPrompt(
+            stage="awaiting_input", started_at=time.time()
+        )
+        await message.answer(t("myprompt.ask", lang, limit=CUSTOM_PROMPT_MAX_CHARS))
 
     @router.message(Command("limits"))
     async def limits(message: Message) -> None:
@@ -949,6 +989,32 @@ def build_router(services: Services) -> Router:
                 await _apply_cache_drop(message, raw, services)
             return
 
+        # Активный диалог /myprompt перехватывает сообщение раньше общего
+        # разбора ссылок (ленивое протухание, как у admin-inputs выше).
+        pending_prompt = services.pending_custom_prompts.get(message.chat.id)
+        if pending_prompt is not None:
+            if pending_prompt.expired(time.time()):
+                services.pending_custom_prompts.pop(message.chat.id, None)
+            elif pending_prompt.stage == "awaiting_input":
+                await _handle_custom_prompt_input(message, message.text or "", services)
+                return
+            else:  # armed: ждём ссылку
+                armed_url = extract_youtube_url(message.text or "")
+                if armed_url:
+                    services.pending_custom_prompts.pop(message.chat.id, None)
+                    prompt_user_id = _message_user_id(message)
+                    _record_custom_prompt(
+                        services, prompt_user_id, pending_prompt.prompt, armed_url
+                    )
+                    await _enqueue_summary_job(
+                        message, armed_url, services,
+                        custom_prompt=pending_prompt.prompt,
+                    )
+                    return
+                # Не ссылка — пользователь передумал: принимаем как новый промпт.
+                await _handle_custom_prompt_input(message, message.text or "", services)
+                return
+
         text = message.text or ""
         if text.strip().lower() in {"stop", "стоп"}:
             if not _is_owner(message, services):
@@ -1282,6 +1348,55 @@ async def _answer_owner_only(message: Message, services: Services) -> None:
         await message.answer(t("access.closed", _msg_lang(message, services)))
         return
     await message.answer("Эта команда доступна только владельцу бота.")
+async def _handle_custom_prompt_input(message: Message, text: str, services: Services) -> None:
+    """Ввод после /myprompt: промпт+ссылка (основной путь) / только промпт /
+    только ссылка (фолбек на стандартное саммари)."""
+    lang = _msg_lang(message, services)
+    user_id = _message_user_id(message)
+    url, prompt = parse_prompt_message(text)
+    if len(prompt) > CUSTOM_PROMPT_MAX_CHARS:
+        await message.answer(
+            t("myprompt.too_long", lang, limit=CUSTOM_PROMPT_MAX_CHARS, actual=len(prompt))
+        )
+        services.pending_custom_prompts[message.chat.id] = PendingCustomPrompt(
+            stage="awaiting_input", started_at=time.time()
+        )
+        return
+    if url and prompt:
+        services.pending_custom_prompts.pop(message.chat.id, None)
+        _record_custom_prompt(services, user_id, prompt, url)
+        await _enqueue_summary_job(message, url, services, custom_prompt=prompt)
+        return
+    if url:
+        # Только ссылка — фолбек на стандартное саммари (требование владельца).
+        services.pending_custom_prompts.pop(message.chat.id, None)
+        await _enqueue_summary_job(message, url, services)
+        return
+    # Только текст — «взводим» промпт и просим ссылку.
+    if services.analytics is not None and user_id is not None:
+        services.analytics.record(user_id, "custom_prompt_set", prompt)
+    services.pending_custom_prompts[message.chat.id] = PendingCustomPrompt(
+        stage="armed", prompt=prompt, started_at=time.time()
+    )
+    await message.answer(t("myprompt.armed", lang))
+
+
+def _record_custom_prompt(services: Services, user_id: int | None, prompt: str, url: str) -> None:
+    """Аналитика /myprompt: полный текст промпта — для последующего анализа."""
+    if services.analytics is None or user_id is None:
+        return
+    services.analytics.record(user_id, "custom_prompt_set", prompt)
+    try:
+        video_id = extract_video_id(url) or url
+    except Exception:  # noqa: BLE001
+        video_id = url
+    services.analytics.record(user_id, "custom_prompt_used", video_id)
+    logger.info(
+        "myprompt.used user_id=%s video_id=%s prompt_chars=%s",
+        user_id, video_id, len(prompt),
+    )
+
+
 async def _apply_user_add(message: Message, raw_args: str, services: Services) -> None:
     """Parse a "<user_id> [name...]" string and add user. Used both inline
     (``/user_add 123 Иван``) and via two-step pending dialog."""

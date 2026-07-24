@@ -55,6 +55,7 @@ PUBLIC_BOT_COMMANDS: list[BotCommand] = [
     BotCommand(command="help", description="Что умеет бот"),
     BotCommand(command="last", description="Последние 20 саммари"),
     BotCommand(command="limits", description="Остаток лимитов"),
+    BotCommand(command="myprompt", description="Саммари со своим промптом"),
     BotCommand(command="subscribe", description="Подписка"),
     BotCommand(command="paysupport", description="Вопросы по оплате"),
     BotCommand(command="language", description="Язык / Language"),

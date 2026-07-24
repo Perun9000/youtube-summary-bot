@@ -95,7 +95,12 @@ async def _find_duplicate_job(
     return None
 
 
-async def _enqueue_summary_job(message: Message, url: str, services: Services) -> None:
+async def _enqueue_summary_job(
+    message: Message,
+    url: str,
+    services: Services,
+    custom_prompt: str | None = None,
+) -> None:
     # Внешний пользователь (не allowlist) в PUBLIC_MODE проходит через квоты.
     from app.bot_handlers import _is_allowed, _msg_lang  # local: избегаем цикла
     lang = _msg_lang(message, services)
@@ -106,8 +111,13 @@ async def _enqueue_summary_job(message: Message, url: str, services: Services) -
     enqueued = False
     try:
         # Cache hit fast-path: если по этому ролику уже было саммари, отдаём его
-        # сразу, не занимая очередь и не дёргая LLM/Whisper.
-        cached = _lookup_cached_summary(url, services, lang=lang)
+        # сразу, не занимая очередь и не дёргая LLM/Whisper. С кастомным
+        # промптом кэш-хит бессмыслен — промпт не применился бы (/myprompt).
+        cached = (
+            _lookup_cached_summary(url, services, lang=lang)
+            if custom_prompt is None
+            else None
+        )
         if cached is not None:
             logger.info(
                 "queue.cache.hit chat_id=%s video_id=%s telegraph_url=%s",
@@ -172,6 +182,7 @@ async def _enqueue_summary_job(message: Message, url: str, services: Services) -
                 quota_user_id=quota_user_id,
                 lang=lang,
                 priority=priority,
+                custom_prompt=custom_prompt,
             )
             ahead = sum(
                 1

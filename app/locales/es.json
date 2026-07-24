@@ -96,5 +96,9 @@
   "ytdlp.sign_in_required": "YouTube exige iniciar sesión para verlo (anti-bot o verificación de edad). El bot no puede pasar.",
   "ytdlp.stream_recording_unavailable": "La grabación de la transmisión en vivo no está disponible.",
   "ytdlp.unavailable": "El vídeo no está disponible (eliminado por el autor, bloqueado por el titular de los derechos u oculto en esta región).",
-  "ref.pitch": "Envíame cualquier enlace de YouTube y haré el mismo tipo de resumen. Gratis: {weekly} por semana."
+  "ref.pitch": "Envíame cualquier enlace de YouTube y haré el mismo tipo de resumen. Gratis: {weekly} por semana.",
+  "myprompt.ask": "Envía tu prompt y el enlace del vídeo (puede ser un solo mensaje). Hasta {limit} caracteres, se aplica a un vídeo.",
+  "myprompt.armed": "¡Recibido! Ahora envía el enlace del vídeo — haré el resumen con tu prompt (espero 15 minutos).",
+  "myprompt.too_long": "Prompt demasiado largo: {actual} caracteres, el límite es {limit}. Acórtalo y envíalo de nuevo.",
+  "myprompt.denied": "El prompt personalizado es una función de la suscripción. Suscríbete: /subscribe"
 }

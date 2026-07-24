@@ -8,6 +8,7 @@ from aiogram import Bot
 from aiogram.types import Message
 
 from app.analytics_events import AnalyticsEvents
+from app.custom_prompt import PendingCustomPrompt
 from app.referrals_store import ReferralsStore
 from app.billing import BillingStore, QuotaService
 from app.config import Settings
@@ -159,6 +160,9 @@ class Services:
     # PendingAdminInput. Не персистится: после рестарта диалог теряется,
     # пользователь просто начнёт заново.
     pending_admin_inputs: dict[int, "PendingAdminInput"] = field(default_factory=dict)
+    # Состояния /myprompt: chat_id → PendingCustomPrompt (ленивое протухание,
+    # см. app/custom_prompt.py).
+    pending_custom_prompts: dict[int, PendingCustomPrompt] = field(default_factory=dict)
 @dataclass
 class PendingAdminInput:
     """Что бот ждёт от owner-а в следующем текстовом сообщении."""

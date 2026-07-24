@@ -85,3 +85,40 @@ def test_context_hint_combines_segment_and_custom():
 def test_custom_prompt_job_not_cacheable():
     assert _is_job_cacheable(_job(custom_prompt="x")) is False
     assert _is_job_cacheable(_job()) is True
+
+
+# --- Доступ к фиче ---
+
+from app.bot_handlers import _may_use_custom_prompt  # noqa: E402
+
+
+class _U:
+    def __init__(self, allowed=False, owner=False):
+        self._a, self._o = allowed, owner
+
+    def is_owner(self, uid):
+        return self._o
+
+    def is_allowed(self, uid):
+        return self._a or self._o
+
+
+class _B:
+    def __init__(self, subs=()):
+        self._s = set(subs)
+
+    def is_subscriber(self, uid, now=None):
+        return uid in self._s
+
+
+class _S:
+    def __init__(self, users, billing):
+        self.users, self.billing = users, billing
+
+
+def test_access_owner_allowlist_subscriber():
+    assert _may_use_custom_prompt(1, _S(_U(owner=True), _B())) is True
+    assert _may_use_custom_prompt(2, _S(_U(allowed=True), _B())) is True
+    assert _may_use_custom_prompt(3, _S(_U(), _B(subs={3}))) is True
+    assert _may_use_custom_prompt(4, _S(_U(), _B())) is False
+    assert _may_use_custom_prompt(None, _S(_U(owner=True), _B())) is False

@@ -96,5 +96,9 @@
   "ytdlp.sign_in_required": "YouTube meminta login untuk menonton (anti-bot atau pemeriksaan usia). Bot tidak bisa melewatinya.",
   "ytdlp.stream_recording_unavailable": "Rekaman siaran langsung tidak tersedia.",
   "ytdlp.unavailable": "Video tidak tersedia (dihapus pembuatnya, diblokir pemegang hak cipta, atau disembunyikan di wilayah ini).",
-  "ref.pitch": "Kirimkan tautan video YouTube apa pun dan aku akan membuat ringkasan seperti ini. Gratis: {weekly} per minggu."
+  "ref.pitch": "Kirimkan tautan video YouTube apa pun dan aku akan membuat ringkasan seperti ini. Gratis: {weekly} per minggu.",
+  "myprompt.ask": "Kirim prompt-mu dan tautan video (boleh satu pesan). Maksimal {limit} karakter, berlaku untuk satu video.",
+  "myprompt.armed": "Diterima! Sekarang kirim tautan video — ringkasan akan dibuat dengan prompt-mu (menunggu 15 menit).",
+  "myprompt.too_long": "Prompt terlalu panjang: {actual} karakter, batasnya {limit}. Persingkat dan kirim lagi.",
+  "myprompt.denied": "Prompt kustom adalah fitur langganan. Berlangganan: /subscribe"
 }

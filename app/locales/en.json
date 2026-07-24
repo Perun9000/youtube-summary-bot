@@ -96,5 +96,9 @@
   "ytdlp.sign_in_required": "YouTube requires a login to watch (anti-bot or age check). The bot can't get past it.",
   "ytdlp.stream_recording_unavailable": "The live stream recording is unavailable.",
   "ytdlp.unavailable": "The video is unavailable (deleted by the author, blocked by the copyright holder, or hidden in this region).",
-  "ref.pitch": "Send me any YouTube link and I'll make the same kind of summary. Free: {weekly} per week."
+  "ref.pitch": "Send me any YouTube link and I'll make the same kind of summary. Free: {weekly} per week.",
+  "myprompt.ask": "Send your prompt and a video link (one message is fine). Up to {limit} characters, applies to one video.",
+  "myprompt.armed": "Got it! Now send a video link — I'll build the summary with your prompt (waiting 15 minutes).",
+  "myprompt.too_long": "Prompt too long: {actual} characters, limit is {limit}. Shorten it and send again.",
+  "myprompt.denied": "Custom summary prompts are a subscription feature. Subscribe: /subscribe"
 }
