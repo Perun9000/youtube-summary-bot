@@ -100,5 +100,6 @@
   "myprompt.ask": "Send your prompt and a video link (one message is fine). Up to {limit} characters, applies to one video.",
   "myprompt.armed": "Got it! Now send a video link — I'll build the summary with your prompt (waiting 15 minutes).",
   "myprompt.too_long": "Prompt too long: {actual} characters, limit is {limit}. Shorten it and send again.",
-  "myprompt.denied": "Custom summary prompts are a subscription feature. Subscribe: /subscribe"
+  "myprompt.denied": "Custom summary prompts are a subscription feature. Subscribe: /subscribe",
+  "myprompt.rearmed": "Your prompt is saved — just send the link again (within 15 minutes) and I'll apply it."
 }

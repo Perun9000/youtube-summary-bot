@@ -12,7 +12,7 @@ import aiohttp
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.types import CallbackQuery, FSInputFile
 
-from app.custom_prompt import wrap_custom_prompt
+from app.custom_prompt import PendingCustomPrompt, wrap_custom_prompt
 from app.groq_whisper_service import GroqWhisperUnavailable
 from app.i18n import UserFacingError, t
 from app.llm_client import (
@@ -783,8 +783,13 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
         # Q4: сетевой сбой (шторм, обрыв до OpenRouter/Telegram) — вместо
         # финального failed откладываем job на повтор через ту же
         # deferred-механику, что и премьеры. Пользователь не видит ошибку,
-        # если ретрай ещё не исчерпан.
-        if await _maybe_retry_transient_failure(job, services, exc, job_id):
+        # если ретрай ещё не исчерпан. ИСКЛЮЧЕНИЕ — job с custom_prompt:
+        # deferred-requeue идёт через БД, где промпт не живёт, и тихий ретрай
+        # вернул бы обычное саммари вместо промптового. Честнее сразу отдать
+        # ошибку и «перевзвести» промпт (см. _rearm_custom_prompt ниже).
+        if job.custom_prompt is None and await _maybe_retry_transient_failure(
+            job, services, exc, job_id
+        ):
             return
         await _set_service_status(services, message, t("status.interrupted", job.lang), job=job)
         await _send_summary_delivery(
@@ -797,6 +802,10 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                 lang=job.lang,
             ),
         )
+        if _rearm_custom_prompt(services, job):
+            await _send_summary_delivery(
+                services=services, job=job, text=t("myprompt.rearmed", job.lang)
+            )
         _forget_service_status(services, chat_id)
         raise
 
@@ -925,6 +934,27 @@ async def _process_transcription_job(job: SummaryJob, services: Services) -> Non
             services.summary_worker_task = asyncio.create_task(_summary_queue_worker(services))
 
 
+def _rearm_custom_prompt(services, job: SummaryJob) -> bool:
+    """Не сжигать /myprompt-промпт при упавшей генерации.
+
+    Возвращает промпт во «взведённое» состояние (свежие 15 минут) — повторная
+    ссылка в том же чате применит его снова. Состояние НЕ перезаписывается,
+    если пользователь уже начал новый диалог /myprompt
+    (см. спеку 2026-07-23, дополнение 2026-07-26).
+    """
+    if not job.custom_prompt:
+        return False
+    if job.chat_id in services.pending_custom_prompts:
+        return False
+    services.pending_custom_prompts[job.chat_id] = PendingCustomPrompt(
+        stage="armed", prompt=job.custom_prompt, started_at=time.time()
+    )
+    logger.info(
+        "myprompt.rearmed chat_id=%s prompt_chars=%s", job.chat_id, len(job.custom_prompt)
+    )
+    return True
+
+
 def _build_context_hint(job: SummaryJob) -> str | None:
     """Segment-hint (scheduled) + пожелания пользователя (/myprompt)."""
     parts: list[str] = []
@@ -965,6 +995,8 @@ async def _send_transcription_failure(services: Services, job: SummaryJob, reaso
     известен, сообщение уходит без parse_mode).
     """
     text = t("error.transcript_failed", job.lang, reason=reason, link=job.url)
+    if _rearm_custom_prompt(services, job):
+        text = f'{text}\n\n{t("myprompt.rearmed", job.lang)}'
     try:
         if job.message is not None and not job.scheduled:
             await job.message.answer(text)

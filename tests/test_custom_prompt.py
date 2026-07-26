@@ -116,6 +116,37 @@ class _S:
         self.users, self.billing = users, billing
 
 
+def test_rearm_on_failure_keeps_prompt():
+    from app.pipeline import _rearm_custom_prompt
+
+    class _Svc:
+        pending_custom_prompts: dict = {}
+
+    svc = _Svc()
+    svc.pending_custom_prompts = {}
+    job = _job(custom_prompt="Саркастично")
+    assert _rearm_custom_prompt(svc, job) is True
+    state = svc.pending_custom_prompts[job.chat_id]
+    assert state.stage == "armed" and state.prompt == "Саркастично"
+
+
+def test_rearm_noop_without_prompt_or_when_dialog_active():
+    from app.pipeline import _rearm_custom_prompt
+
+    class _Svc:
+        pending_custom_prompts: dict = {}
+
+    svc = _Svc()
+    svc.pending_custom_prompts = {}
+    assert _rearm_custom_prompt(svc, _job()) is False
+
+    # Пользователь уже начал новый диалог — не затираем его состояние.
+    newer = PendingCustomPrompt(stage="awaiting_input", started_at=999.0)
+    svc.pending_custom_prompts = {1: newer}
+    assert _rearm_custom_prompt(svc, _job(custom_prompt="старый")) is False
+    assert svc.pending_custom_prompts[1] is newer
+
+
 def test_access_owner_allowlist_subscriber():
     assert _may_use_custom_prompt(1, _S(_U(owner=True), _B())) is True
     assert _may_use_custom_prompt(2, _S(_U(allowed=True), _B())) is True

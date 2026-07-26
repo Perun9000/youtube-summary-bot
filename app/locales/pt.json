@@ -100,5 +100,6 @@
   "myprompt.ask": "Envie seu prompt e o link do vídeo (pode ser uma única mensagem). Até {limit} caracteres, vale para um vídeo.",
   "myprompt.armed": "Recebido! Agora envie o link do vídeo — farei o resumo com seu prompt (aguardo 15 minutos).",
   "myprompt.too_long": "Prompt muito longo: {actual} caracteres, o limite é {limit}. Encurte e envie novamente.",
-  "myprompt.denied": "Prompt personalizado é um recurso da assinatura. Assine: /subscribe"
+  "myprompt.denied": "Prompt personalizado é um recurso da assinatura. Assine: /subscribe",
+  "myprompt.rearmed": "Seu prompt está salvo — envie o link novamente (em até 15 minutos) e eu o aplicarei."
 }

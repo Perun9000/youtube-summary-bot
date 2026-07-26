@@ -100,5 +100,6 @@
   "myprompt.ask": "Kirim prompt-mu dan tautan video (boleh satu pesan). Maksimal {limit} karakter, berlaku untuk satu video.",
   "myprompt.armed": "Diterima! Sekarang kirim tautan video — ringkasan akan dibuat dengan prompt-mu (menunggu 15 menit).",
   "myprompt.too_long": "Prompt terlalu panjang: {actual} karakter, batasnya {limit}. Persingkat dan kirim lagi.",
-  "myprompt.denied": "Prompt kustom adalah fitur langganan. Berlangganan: /subscribe"
+  "myprompt.denied": "Prompt kustom adalah fitur langganan. Berlangganan: /subscribe",
+  "myprompt.rearmed": "Prompt-mu tersimpan — kirim ulang tautannya (dalam 15 menit) dan akan kuterapkan."
 }
