@@ -36,8 +36,10 @@ def test_parse_url_only_gives_empty_prompt():
 def test_wrap_contains_guardrail_and_prompt():
     wrapped = wrap_custom_prompt("Только факты")
     assert "Только факты" in wrapped
-    assert "не отменяют" in wrapped.lower()
+    # Пожелания приоритетнее стилевых правил, но JSON-контракт незыблем.
+    assert "главнее" in wrapped.lower()
     assert "json" in wrapped.lower()
+    assert "язык вывода" in wrapped.lower()
 
 
 def test_pending_expiry_by_stage():
