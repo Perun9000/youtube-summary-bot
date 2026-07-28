@@ -71,7 +71,7 @@ def _job(**kw):
 def test_context_hint_from_custom_prompt():
     hint = _build_context_hint(_job(custom_prompt="Только цифры"))
     assert "Только цифры" in hint
-    assert "не отменяют" in hint.lower()
+    assert "главнее" in hint.lower()
 
 
 def test_context_hint_none_without_prompt_and_spans():
