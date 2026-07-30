@@ -199,7 +199,6 @@ async def main() -> None:
     digest_store = DigestStore(
         db,
         legacy_digests_path=settings.digests_path,
-        legacy_pins_path=settings.digest_pins_path,
     )
     logger.info(
         "digests.boot digests_path=%s pins_path=%s",

@@ -12,7 +12,7 @@ from aiogram.types import (
     Message,
 )
 
-from app.digest_service import DigestEntry, update_pin_for_user
+from app.digest_service import DigestEntry
 from app.i18n import t
 from app.morning_digest import MorningDigestItem
 from app.summary_cache import CachedSummary
@@ -810,19 +810,18 @@ async def _update_user_digest_safely(
     channel_name: str,
     created_at_unix: float,
 ) -> None:
-    """Fire-and-forget обёртка над update_pin_for_user.
+    """Записать саммари в digest-список пользователя (данные для /last).
 
-    Никогда не падает — ошибки логирует и проглатывает. Вызывается из путей
-    доставки саммари, и обновление дайджеста не должно блокировать или ронять
-    доставку. Если digest_store не подключен (`services.digests is None`) или
-    бот ещё не инициализирован — тоже тихо выходим.
+    Никогда не падает — ошибки логирует и проглатывает: обновление дайджеста
+    не должно блокировать или ронять доставку. Закреплённое сообщение-дайджест
+    удалено 2026-07-28 — остаётся только запись в БД; chat_id сохранён в
+    сигнатуре для совместимости вызовов, но больше не используется.
     """
     digests = services.digests
-    bot = services.bot
-    if digests is None or bot is None:
+    if digests is None:
         return
     if not telegraph_url:
-        # Без Telegra.ph-ссылки тапать в дайджесте будет некуда —
+        # Без Telegra.ph-ссылки тапать в списке будет некуда —
         # такая запись бесполезна. Пропускаем.
         return
     entry = DigestEntry(
@@ -833,13 +832,7 @@ async def _update_user_digest_safely(
         created_at_unix=created_at_unix or time.time(),
     )
     try:
-        await update_pin_for_user(
-            store=digests,
-            bot=bot,
-            user_id=user_id,
-            chat_id=chat_id,
-            entry=entry,
-        )
+        digests.add(user_id, entry)
     except Exception:
         logger.exception(
             "digests.update_failed user_id=%s chat_id=%s video_id=%s",

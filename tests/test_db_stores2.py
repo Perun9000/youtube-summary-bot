@@ -18,13 +18,12 @@ def test_digest_add_dedup_and_limit(tmp_path):
     assert len(entries) == 3
 
 
-def test_digest_pins(tmp_path):
+def test_digest_store_has_no_pin_api(tmp_path):
+    # Закреплённый дайджест удалён (2026-07-28): остались только данные
+    # для /last. Пин-методы не должны вернуться незамеченными.
     store = DigestStore(Database(tmp_path / "bot.db"))
-    assert store.get_pin(1) is None
-    store.set_pin(1, chat_id=10, message_id=20)
-    assert store.get_pin(1) == (10, 20)
-    store.clear_pin(1)
-    assert store.get_pin(1) is None
+    assert not hasattr(store, "set_pin")
+    assert not hasattr(store, "get_pin")
 
 
 def test_monitoring_state(tmp_path):
