@@ -22,6 +22,11 @@ LLM_GENERATE_MAX_ATTEMPTS = 2
 LLM_GENERATE_RETRY_DELAY_SEC = 15
 OPENROUTER_BUDGET_EXCEEDED_MARKER = "OPENROUTER_BUDGET_EXCEEDED"
 FREE_CHAIN_EXHAUSTED_MARKER = "OPENROUTER_FREE_CHAIN_EXHAUSTED"
+# Инцидент 2026-08-04: absolute upper bound for the same-model bigger-cap
+# retry (see ``OpenRouterClient._generate_with_adaptive_cap``), independent
+# of how high LLM_MAX_TOKENS_FINAL is configured — keeps a single retry from
+# ever requesting an unbounded completion.
+ADAPTIVE_MAX_TOKENS_CAP_CEILING = 8000
 
 
 class CircuitBreaker:
@@ -430,7 +435,7 @@ class OpenRouterClient:
         for pass_idx in range(passes):
             for model in chain:
                 try:
-                    result = await self._generate_one_attempt(
+                    result = await self._generate_with_adaptive_cap(
                         model, prompt, system, usage, max_tokens
                     )
                     self._breaker.record_success()
@@ -469,7 +474,7 @@ class OpenRouterClient:
             for model in tail:
                 logger.warning("llm.generate.dynamic_tail.try model=%s", model)
                 try:
-                    result = await self._generate_one_attempt(
+                    result = await self._generate_with_adaptive_cap(
                         model, prompt, system, usage, max_tokens
                     )
                     logger.info("llm.generate.dynamic_tail.success model=%s", model)
@@ -602,7 +607,7 @@ class OpenRouterClient:
         last_exc: Exception | None = None
         for attempt in range(1, LLM_GENERATE_MAX_ATTEMPTS + 1):
             try:
-                return await self._generate_one_attempt(
+                return await self._generate_with_adaptive_cap(
                     model, prompt, system, usage, max_tokens
                 )
             except _OpenRouterTruncated as exc:
@@ -633,6 +638,61 @@ class OpenRouterClient:
             raise RuntimeError(f"OpenRouter ({model}) не ответил.") from last_exc
         self._breaker.record_failure()
         raise RuntimeError(f"OpenRouter ({model}) не ответил.")
+
+    async def _generate_with_adaptive_cap(
+        self,
+        model: str,
+        prompt: str,
+        system: str | None,
+        usage: GenerationUsage | None,
+        max_tokens: int | None,
+    ) -> str:
+        """One model call with a single same-model retry at a bigger cap
+        when the first attempt gets cut off by our own ``max_tokens``.
+
+        Инцидент 2026-08-04: плотный длинный ролик требовал >2000
+        output-токенов на partial-стадии — КАЖДАЯ free-модель в цепочке
+        упиралась в наш собственный потолок (finish_reason=length),
+        truncation-guard браковал ответ и переключал модель: 3 прохода по
+        цепочке, 20+ минут, впустую сожжённый дневной лимит запросов. Прыжки
+        по моделям не лечат наш собственный лимит — прежде чем сдаваться на
+        этой модели, пробуем её же с бо́льшим потолком.
+
+        Cap for the retry: ``max(original, min(llm_max_tokens_final,
+        ADAPTIVE_MAX_TOKENS_CAP_CEILING))``. If the original request was
+        already at or above that cap, there is no headroom — behave exactly
+        as before (no retry, propagate the truncation immediately so the
+        caller's trying_next / last-resort handling kicks in). Otherwise the
+        retry doubles the original request, capped — one extra HTTP call per
+        model, at most.
+
+        Raises ``_OpenRouterTruncated`` if still cut off at the cap (with
+        the *retry's* longer text, the better last-resort candidate), or any
+        other ``_OpenRouterRetriable`` from either attempt — callers keep
+        their existing trying_next / last-resort handling unchanged.
+        """
+        effective_max_tokens = (
+            max_tokens if max_tokens is not None else self._settings.llm_max_tokens
+        )
+        try:
+            return await self._generate_one_attempt(
+                model, prompt, system, usage, max_tokens
+            )
+        except _OpenRouterTruncated:
+            cap = max(
+                effective_max_tokens,
+                min(self._settings.llm_max_tokens_final, ADAPTIVE_MAX_TOKENS_CAP_CEILING),
+            )
+            if effective_max_tokens >= cap:
+                raise
+            bigger = min(effective_max_tokens * 2, cap)
+            logger.warning(
+                "llm.generate.retry_bigger_cap model=%s max_tokens=%s",
+                model, bigger,
+            )
+            return await self._generate_one_attempt(
+                model, prompt, system, usage, bigger
+            )
 
     async def _generate_one_attempt(
         self,

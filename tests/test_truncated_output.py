@@ -24,6 +24,12 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setenv("OPENROUTER_MODEL_FREE_CHAIN", "chain/model-1,chain/model-2")
     monkeypatch.setenv("OPENROUTER_FALLBACK_RETRY_PASSES", "0")
+    # Pin explicitly (some other test's real load_dotenv() can leak the repo's
+    # .env values — e.g. LLM_MAX_TOKENS_FINAL=8000 — into process os.environ
+    # for the rest of the session). Match llm_max_tokens's own default here so
+    # these tests exercise plain trying_next, not the Q5 bigger-cap retry —
+    # that path has its own coverage in tests/test_adaptive_max_tokens.py.
+    monkeypatch.setenv("LLM_MAX_TOKENS_FINAL", "1200")
     settings = load_settings()
     c = OpenRouterClient(settings, Database(tmp_path / "bot.db"))
     c.set_paid_mode(False)
