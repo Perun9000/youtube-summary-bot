@@ -433,6 +433,22 @@ class OpenRouterClient:
         last_error: Exception | None = None
         truncated_text: str | None = None
         for pass_idx in range(passes):
+            # Ревью-фикс 2026-08-04: если КАЖДАЯ неудача этого прохода —
+            # обрезка по max_tokens (даже после adaptive-cap удвоения), а не
+            # реальная ошибка (429/5xx/сеть/404) — следующий проход даст ТОТ
+            # ЖЕ результат: потолок между проходами не меняется, retry ничего
+            # не купит, только жжёт sleep + дневной лимит запросов. В этом
+            # случае рвём внешний цикл сразу же, не дожидаясь оставшихся
+            # проходов — last_resort ниже отдаст лучший (retried) обрезанный
+            # текст. Арифметика worst case «все модели обрезались», N моделей,
+            # passes проходов: было N * passes запросов (по 1 на модель за
+            # проход, все проходы отрабатывали); стало N * 2 запроса (adaptive
+            # cap: оригинал + удвоение) за ОДИН проход. При N=5, passes=3
+            # (прод-конфиг: 5 моделей, OPENROUTER_FALLBACK_RETRY_PASSES=2):
+            # было 15, стало 10 — вдвое дешевле инцидент-сценария, не дороже.
+            # Смешанный проход (обрезки + хоть одна настоящая ошибка) —
+            # проходы продолжаются как раньше, ошибка может не повториться.
+            pass_had_real_failure = False
             for model in chain:
                 try:
                     result = await self._generate_with_adaptive_cap(
@@ -444,12 +460,21 @@ class OpenRouterClient:
                     last_error = exc.cause
                     if isinstance(exc, _OpenRouterTruncated):
                         truncated_text = exc.text
+                    else:
+                        pass_had_real_failure = True
                     logger.warning(
                         "llm.generate.fallback provider=openrouter model=%s pass=%s/%s "
                         "trying_next reason=%s",
                         model, pass_idx + 1, passes, exc.short_reason,
                     )
                     continue
+            if not pass_had_real_failure and truncated_text is not None:
+                logger.info(
+                    "llm.generate.chain_exhausted_all_truncated pass=%s/%s "
+                    "skipping_remaining_passes=%s",
+                    pass_idx + 1, passes, passes - pass_idx - 1,
+                )
+                break
             if pass_idx + 1 < passes:
                 logger.info(
                     "llm.generate.chain_exhausted pass=%s/%s sleep_sec=%s",

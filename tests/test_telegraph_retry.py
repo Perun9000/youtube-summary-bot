@@ -6,6 +6,10 @@ from app.telegraph_service import TelegraphService
 
 
 def make_service(tmp_path, monkeypatch):
+    # Без этого реальный load_dotenv() читает repo-.env и льёт его значения в
+    # процессный os.environ на весь остаток pytest-сессии (dotenv не
+    # откатывается monkeypatch'ем) — другие тесты конфига патчат это же самое.
+    monkeypatch.setattr("app.config.load_dotenv", lambda *a, **k: None)
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "1:x")
     monkeypatch.setenv("BOT_DATA_DIR", str(tmp_path))
     from app.config import load_settings
