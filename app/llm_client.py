@@ -441,11 +441,18 @@ class OpenRouterClient:
             # случае рвём внешний цикл сразу же, не дожидаясь оставшихся
             # проходов — last_resort ниже отдаст лучший (retried) обрезанный
             # текст. Арифметика worst case «все модели обрезались», N моделей,
-            # passes проходов: было N * passes запросов (по 1 на модель за
-            # проход, все проходы отрабатывали); стало N * 2 запроса (adaptive
-            # cap: оригинал + удвоение) за ОДИН проход. При N=5, passes=3
-            # (прод-конфиг: 5 моделей, OPENROUTER_FALLBACK_RETRY_PASSES=2):
-            # было 15, стало 10 — вдвое дешевле инцидент-сценария, не дороже.
+            # passes проходов: до Q5 было N * passes запросов (по 1 на модель
+            # за проход, все проходы отрабатывали). Q5 (один повтор на
+            # удвоенном лимите) свёл это к N * 2 запроса за ОДИН проход. Q7
+            # (лестница удвоений до cap вместо одного шага — см.
+            # ``_generate_with_adaptive_cap``) поднимает это до N * (1 +
+            # log2(cap/original)) запросов за тот же ОДИН проход. При N=5,
+            # passes=3 (прод-конфиг: 5 моделей, OPENROUTER_FALLBACK_RETRY_PASSES=2),
+            # старт 2000 и cap 8000 (3 запроса/модель): до Q5 было 15 (5*3
+            # проходов), Q5 снизил до 10 (5*2), Q7 возвращает к 15 (5*3) — но
+            # это ВСЁ ЕЩЁ один проход против 15 (5*3 проходов) без short-circuit,
+            # и в отличие от до-Q5 сценария эти 15 запросов реально дотягиваются
+            # до 8000 токенов, а не жгутся вхолостую на том же потолке 3 раза.
             # Смешанный проход (обрезки + хоть одна настоящая ошибка) —
             # проходы продолжаются как раньше, ошибка может не повториться.
             pass_had_real_failure = False
@@ -672,8 +679,10 @@ class OpenRouterClient:
         usage: GenerationUsage | None,
         max_tokens: int | None,
     ) -> str:
-        """One model call with a single same-model retry at a bigger cap
-        when the first attempt gets cut off by our own ``max_tokens``.
+        """One model call with a same-model retry *ladder* that doubles
+        ``max_tokens`` while the response keeps getting cut off, and (Q7)
+        starts straight at the cap for prompts long enough that a low
+        starting point is pointless anyway.
 
         Инцидент 2026-08-04: плотный длинный ролик требовал >2000
         output-токенов на partial-стадии — КАЖДАЯ free-модель в цепочке
@@ -683,41 +692,61 @@ class OpenRouterClient:
         по моделям не лечат наш собственный лимит — прежде чем сдаваться на
         этой модели, пробуем её же с бо́льшим потолком.
 
-        Cap for the retry: ``max(original, min(llm_max_tokens_final,
-        ADAPTIVE_MAX_TOKENS_CAP_CEILING))``. If the original request was
-        already at or above that cap, there is no headroom — behave exactly
-        as before (no retry, propagate the truncation immediately so the
-        caller's trying_next / last-resort handling kicks in). Otherwise the
-        retry doubles the original request, capped — one extra HTTP call per
-        model, at most.
+        Инцидент 2026-08-12 (I5kab8HTzUI): один-единственный повтор (Q5) не
+        дотянулся — транскрипт-монстр (prompt_chars=81043) требовал финальному
+        JSON >4000 токенов, а одно удвоение 2000→4000 всё равно обрезалось;
+        плюс 102 секунды на reasoning-модели (nemotron) сожжены впустую перед
+        тем как сдаться. Q7 чинит это двумя изменениями:
+
+        1. **Лестница удвоений**, а не один шаг: пока ответ обрезан и текущий
+           лимит < cap, повторяем ТУ ЖЕ модель на ``min(current*2, cap)`` —
+           2000→4000→8000 — и уходим на следующую модель (trying_next) только
+           упёршись в cap. Cap — как в Q5: ``max(original, min(llm_max_tokens_final,
+           ADAPTIVE_MAX_TOKENS_CAP_CEILING))``. Если исходный запрос уже на
+           cap или выше — запаса нет, ведём себя как раньше (без ретрая,
+           truncation летит наверх немедленно). Worst case на одну модель за
+           проход: ``1 + log2(cap / original)`` запросов (старт 2000, cap
+           8000 → 3; старт 4000 → 2) — см. арифметику short-circuit ниже.
+        2. **Старт от размера промпта**: если ``len(prompt) >
+           llm_big_prompt_chars`` — первая попытка сразу идёт на cap, минуя
+           промежуточные ступени (низкий старт для явно длинного промпта
+           бессмысленен — только жжёт время reasoning-моделей). Лог
+           ``llm.generate.big_prompt_full_cap`` один раз на вызов.
 
         Raises ``_OpenRouterTruncated`` if still cut off at the cap (with
-        the *retry's* longer text, the better last-resort candidate), or any
-        other ``_OpenRouterRetriable`` from either attempt — callers keep
+        the *last* attempt's longer text, the better last-resort candidate),
+        or any other ``_OpenRouterRetriable`` from any attempt — callers keep
         their existing trying_next / last-resort handling unchanged.
         """
         effective_max_tokens = (
             max_tokens if max_tokens is not None else self._settings.llm_max_tokens
         )
-        try:
-            return await self._generate_one_attempt(
-                model, prompt, system, usage, max_tokens
+        cap = max(
+            effective_max_tokens,
+            min(self._settings.llm_max_tokens_final, ADAPTIVE_MAX_TOKENS_CAP_CEILING),
+        )
+
+        if len(prompt) > self._settings.llm_big_prompt_chars:
+            effective_max_tokens = cap
+            logger.info(
+                "llm.generate.big_prompt_full_cap prompt_chars=%s max_tokens=%s",
+                len(prompt), cap,
             )
-        except _OpenRouterTruncated:
-            cap = max(
-                effective_max_tokens,
-                min(self._settings.llm_max_tokens_final, ADAPTIVE_MAX_TOKENS_CAP_CEILING),
-            )
-            if effective_max_tokens >= cap:
-                raise
-            bigger = min(effective_max_tokens * 2, cap)
-            logger.warning(
-                "llm.generate.retry_bigger_cap model=%s max_tokens=%s",
-                model, bigger,
-            )
-            return await self._generate_one_attempt(
-                model, prompt, system, usage, bigger
-            )
+
+        current = effective_max_tokens
+        while True:
+            try:
+                return await self._generate_one_attempt(
+                    model, prompt, system, usage, current
+                )
+            except _OpenRouterTruncated:
+                if current >= cap:
+                    raise
+                current = min(current * 2, cap)
+                logger.warning(
+                    "llm.generate.retry_bigger_cap model=%s max_tokens=%s",
+                    model, current,
+                )
 
     async def _generate_one_attempt(
         self,

@@ -26,6 +26,7 @@ class Settings:
     llm_max_tokens: int
     llm_max_tokens_partial: int
     llm_max_tokens_final: int
+    llm_big_prompt_chars: int
     lmstudio_base_url: str
     lmstudio_model: str
     lmstudio_api_key: str | None
@@ -333,6 +334,10 @@ def load_settings() -> Settings:
     llm_max_tokens_final = env.int(
         "LLM_MAX_TOKENS_FINAL", os.getenv("LLM_MAX_TOKENS", "1200")
     )
+    # Q7 (инцидент 2026-08-12, I5kab8HTzUI): промпт длиннее этого — низкий
+    # старт adaptive-cap ступеней бессмысленен, начинаем прямо с потолка
+    # (см. OpenRouterClient._generate_with_adaptive_cap).
+    llm_big_prompt_chars = env.int("LLM_BIG_PROMPT_CHARS", "60000")
     lmstudio_num_ctx = env.int("LMSTUDIO_NUM_CTX", "32768")
     transcript_chunk_max_chars = env.int("TRANSCRIPT_CHUNK_MAX_CHARS", "3000")
     openrouter_transcript_chunk_max_chars = env.int(
@@ -362,6 +367,7 @@ def load_settings() -> Settings:
         llm_max_tokens=llm_max_tokens,
         llm_max_tokens_partial=llm_max_tokens_partial,
         llm_max_tokens_final=llm_max_tokens_final,
+        llm_big_prompt_chars=llm_big_prompt_chars,
         lmstudio_base_url=os.getenv("LMSTUDIO_BASE_URL", "http://host.docker.internal:1234").rstrip("/"),
         lmstudio_model=os.getenv("LMSTUDIO_MODEL", "auto").strip(),
         lmstudio_api_key=os.getenv("LMSTUDIO_API_KEY", "").strip() or None,
