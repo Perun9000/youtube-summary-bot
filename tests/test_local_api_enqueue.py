@@ -98,7 +98,30 @@ async def _stop_worker(services: _FakeServices) -> None:
         pass
 
 
-async def test_enqueue_local_api_job_queues_for_owner():
+async def _noop_worker(services) -> None:
+    """Stub for queue_service._summary_queue_worker.
+
+    These enqueue-time tests assert on the queue's raw contents right after
+    enqueue_local_api_job() returns — they are not testing worker/pipeline
+    behaviour. Before Q6, the real worker's first status update
+    (app/status_messages.py) awaited the fakes' zero-await send_message()
+    with no intervening event-loop tick, so the background worker task
+    (asyncio.create_task in enqueue_local_api_job) never actually got
+    scheduled before the test's synchronous get_nowait() ran. Q6 wraps that
+    same call in asyncio.wait_for() for the 5s status-timeout budget —
+    wait_for always wraps its argument in a real Task (see
+    asyncio.tasks.wait_for), which *does* yield to the loop and let the
+    worker task run. The now-running worker would dequeue the job pipeline.py
+    can't actually process with these bare-bones fakes (no .youtube, no
+    edit_text on the fake message) and fail it — an artifact of the fakes,
+    not a real behaviour change. Stubbing the worker keeps these tests
+    scoped to enqueue-time state, as originally intended.
+    """
+    return None
+
+
+async def test_enqueue_local_api_job_queues_for_owner(monkeypatch):
+    monkeypatch.setattr(queue_service, "_summary_queue_worker", _noop_worker)
     services = _FakeServices(
         user_langs=_FakeUserLangs({OWNER_ID: ("ru", "manual")}),
         summary_cache=None,  # empty cache => no cache hit
@@ -117,7 +140,8 @@ async def test_enqueue_local_api_job_queues_for_owner():
     await _stop_worker(services)
 
 
-async def test_enqueue_local_api_job_defaults_lang_ru_without_user_langs():
+async def test_enqueue_local_api_job_defaults_lang_ru_without_user_langs(monkeypatch):
+    monkeypatch.setattr(queue_service, "_summary_queue_worker", _noop_worker)
     services = _FakeServices(user_langs=None, summary_cache=None)
 
     result = await enqueue_local_api_job(VIDEO_ID, services)
@@ -125,6 +149,8 @@ async def test_enqueue_local_api_job_defaults_lang_ru_without_user_langs():
     assert result == "queued"
     job = services.summary_queue.get_nowait()
     assert job.lang == "ru"
+
+    await _stop_worker(services)
 
     await _stop_worker(services)
 

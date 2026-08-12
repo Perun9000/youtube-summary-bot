@@ -6,7 +6,7 @@ import time
 from collections.abc import Callable
 from typing import Awaitable, TypeVar
 
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.types import Message
 
 from app.i18n import t
@@ -21,6 +21,44 @@ from app.services_container import (
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
+
+# Q6: статус-сообщения ("Получаю данные...", "Генерирую...", очередь: N) —
+# косметика. Они НЕ имеют права ронять job или блокировать его обработку на
+# минуту (дефолтный таймаут aiogram — 60с). Каждый Telegram-вызов внутри этого
+# модуля получает короткий бюджет; TelegramNetworkError/таймаут по нему
+# поглощается и логируется, а не пробрасывается наружу. Существенные отправки
+# (саммари, ошибка генерации, quota-denied — app/delivery.py) этот бюджет НЕ
+# затрагивает: там сбои обрабатываются как раньше (Q4-ретрай).
+_STATUS_IO_TIMEOUT_SEC = 5
+
+
+class _StatusIOFailedSentinel:
+    """Distinguishes "call raised/timed out" from a legitimate ``None``
+    return value (``Bot.delete_message`` returns ``True``/``False``, not a
+    Message — a plain ``None`` sentinel would be ambiguous)."""
+
+    __slots__ = ()
+
+
+_STATUS_IO_FAILED = _StatusIOFailedSentinel()
+
+
+async def _guarded_status_io(coro, *, chat_id: int | None):
+    """Await a single Telegram status I/O call with a short timeout.
+
+    Absorbs ``TelegramNetworkError`` and timeouts (logs a warning, returns
+    ``_STATUS_IO_FAILED``) — callers get a uniform "this call failed" signal
+    instead of an exception, so a network storm on cosmetic status updates
+    never bubbles up into job processing. ``TelegramBadRequest`` (e.g.
+    "message is not modified") is intentionally NOT caught here — callers
+    that need that distinction (retry vs delete-and-resend) handle it
+    themselves.
+    """
+    try:
+        return await asyncio.wait_for(coro, timeout=_STATUS_IO_TIMEOUT_SEC)
+    except (TelegramNetworkError, asyncio.TimeoutError) as exc:
+        logger.warning("status.update_failed chat_id=%s error=%s", chat_id, exc)
+        return _STATUS_IO_FAILED
 
 
 async def _set_service_status(
@@ -69,16 +107,31 @@ async def _set_service_status(
 
     if old_message and not bump:
         try:
-            await old_message.edit_text(
-                rendered_text,
-                parse_mode=effective_parse_mode,
-                disable_web_page_preview=disable_web_page_preview,
+            edit_result = await _guarded_status_io(
+                old_message.edit_text(
+                    rendered_text,
+                    parse_mode=effective_parse_mode,
+                    disable_web_page_preview=disable_web_page_preview,
+                ),
+                chat_id=chat_id,
             )
-            return old_message
         except TelegramBadRequest as exc:
             if "message is not modified" in str(exc).lower():
                 return old_message
             logger.warning("status.edit.failed error=%s", exc)
+        else:
+            if edit_result is _STATUS_IO_FAILED:
+                # Network failure/timeout on a plain edit — NOT "message too
+                # old to edit" (that's TelegramBadRequest, handled above).
+                # Do not delete old_message or drop the summary_status_*
+                # dict entries: the Message object may well still be valid
+                # on Telegram's side, and the next status update (progress
+                # refresh, bump, ...) will simply retry the edit against it.
+                # Do not fall through to delete-and-resend either — that
+                # would duplicate the status message in the chat once the
+                # network recovers.
+                return None
+            return old_message
 
     if old_message:
         await _delete_message_safely(old_message)
@@ -88,19 +141,30 @@ async def _set_service_status(
     silent = use_bot_send
 
     if use_bot_send:
-        new_message = await services.bot.send_message(
+        new_message = await _guarded_status_io(
+            services.bot.send_message(
+                chat_id=chat_id,
+                text=rendered_text,
+                parse_mode=effective_parse_mode,
+                disable_web_page_preview=disable_web_page_preview,
+                disable_notification=silent,
+            ),
             chat_id=chat_id,
-            text=rendered_text,
-            parse_mode=effective_parse_mode,
-            disable_web_page_preview=disable_web_page_preview,
-            disable_notification=silent,
         )
     else:
-        new_message = await source_message.answer(
-            rendered_text,
-            parse_mode=effective_parse_mode,
-            disable_web_page_preview=disable_web_page_preview,
+        new_message = await _guarded_status_io(
+            source_message.answer(
+                rendered_text,
+                parse_mode=effective_parse_mode,
+                disable_web_page_preview=disable_web_page_preview,
+            ),
+            chat_id=chat_id,
         )
+    if new_message is _STATUS_IO_FAILED:
+        # Cosmetic send failed over the network/timed out. old_message (if
+        # any) was already deleted above — nothing left to preserve here;
+        # the next status update starts fresh with a new send attempt.
+        return None
     services.summary_status_messages[chat_id] = new_message
     return new_message
 async def _bump_service_status(
@@ -259,7 +323,11 @@ def _job_label(job: SummaryJob) -> str:
     return f"YouTube video {video_id}"
 async def _delete_message_safely(message: Message) -> None:
     try:
-        await message.delete()
+        chat_id = message.chat.id
+    except AttributeError:
+        chat_id = None
+    try:
+        await _guarded_status_io(message.delete(), chat_id=chat_id)
     except TelegramBadRequest as exc:
         logger.warning("status.delete.failed error=%s", exc)
 def _fit_telegram_message(text: str) -> str:

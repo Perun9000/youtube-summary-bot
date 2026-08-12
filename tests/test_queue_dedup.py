@@ -224,7 +224,18 @@ async def test_find_duplicate_job_ignores_candidate_with_unparseable_url():
 # ── (b) другой chat с тем же video — НЕ дубль ──────────────────────────────
 
 
-async def test_enqueue_summary_job_different_chat_same_video_is_not_duplicate():
+async def _noop_worker(services) -> None:
+    """Stub for queue_service._summary_queue_worker — see the identical
+    helper + comment in tests/test_local_api_enqueue.py for why Q6's
+    asyncio.wait_for-wrapped status calls (app/status_messages.py) let the
+    background worker task actually run before these enqueue-time
+    assertions, where it previously never got scheduled in time with the
+    zero-await fakes used here."""
+    return None
+
+
+async def test_enqueue_summary_job_different_chat_same_video_is_not_duplicate(monkeypatch):
+    monkeypatch.setattr(queue_service, "_summary_queue_worker", _noop_worker)
     quota = _FakeQuota()
     services = _FakeServices(allowed_ids=(), quota=quota)
     _seed_job(services, chat_id=CHAT_A)
@@ -256,7 +267,8 @@ async def test_enqueue_local_api_job_skips_duplicate():
     assert services.bot.sent == []  # дубль не шлёт статус повторно
 
 
-async def test_enqueue_local_api_job_different_video_is_not_duplicate():
+async def test_enqueue_local_api_job_different_video_is_not_duplicate(monkeypatch):
+    monkeypatch.setattr(queue_service, "_summary_queue_worker", _noop_worker)
     services = _FakeServices()
     _seed_job(services, url=f"https://www.youtube.com/watch?v={OTHER_VIDEO_ID}", chat_id=OWNER_ID, priority=PRIORITY_PRIVILEGED)
 
