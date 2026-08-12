@@ -421,6 +421,12 @@ class Summarizer:
                 usage=usage,
                 max_tokens=self._partial_max_tokens,
                 route=self._route,
+                # Ревью-фикс Q7: partial-стадия почанковая — большой chunk
+                # (OPENROUTER_TRANSCRIPT_CHUNK_MAX_CHARS может быть больше
+                # LLM_BIG_PROMPT_CHARS) не должен прыгать на cap 8000 при
+                # реальной потребности ~1200-2000; лестница при обрезке
+                # всё равно работает (не отключена).
+                allow_big_prompt_full_cap=False,
             )
             logger.info(
                 "summary.chunk.done index=%s total=%s duration_sec=%.1f response_chars=%s",
@@ -466,6 +472,9 @@ class Summarizer:
                     usage=usage,
                     max_tokens=self._partial_max_tokens,
                     route=self._route,
+                    # Ревью-фикс Q7: тоже partial-стадийный лимит — та же
+                    # логика, что у почанковых вызовов выше.
+                    allow_big_prompt_full_cap=False,
                 )
                 logger.info(
                     "summary.hierarchy.group.done index=%s total=%s duration_sec=%.1f response_chars=%s",

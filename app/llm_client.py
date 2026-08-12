@@ -27,6 +27,30 @@ FREE_CHAIN_EXHAUSTED_MARKER = "OPENROUTER_FREE_CHAIN_EXHAUSTED"
 # of how high LLM_MAX_TOKENS_FINAL is configured — keeps a single retry from
 # ever requesting an unbounded completion.
 ADAPTIVE_MAX_TOKENS_CAP_CEILING = 8000
+# Ревью-фикс Q7 (Important 2): HTTP 400 обычно non-retriable (bad request —
+# повторять бессмысленно), НО OpenRouter/провайдеры отдают 400 и для
+# context-length-exceeded, когда prompt+max_tokens не влезает в контекст
+# КОНКРЕТНОЙ модели — а не в наш запрос как таковой. Сегодняшняя цепочка
+# безопасна (все модели 256K-1M контекста, см. каталог), но любая будущая
+# малоконтекстная модель в фиксированной цепочке без этой классификации
+# роняла бы всю генерацию вместо перехода на следующую модель. Подстроки —
+# по известным форматам ошибок OpenAI-совместимых провайдеров (OpenRouter
+# проксирует их как есть); намеренно консервативный список, чтобы не
+# маскировать настоящие bad request (невалидный JSON тела и т.п.) как
+# retriable.
+_CONTEXT_OVERFLOW_MARKERS = (
+    "maximum context length",
+    "context_length_exceeded",
+    "context length exceeded",
+    "context window",
+    "reduce the length of the messages",
+    "too many tokens",
+)
+
+
+def _is_context_overflow_error_body(detail: str) -> bool:
+    lowered = detail.lower()
+    return any(marker in lowered for marker in _CONTEXT_OVERFLOW_MARKERS)
 
 
 class CircuitBreaker:
@@ -108,6 +132,7 @@ class LLMClient(Protocol):
         usage: GenerationUsage | None = None,
         max_tokens: int | None = None,
         route: str = "default",
+        allow_big_prompt_full_cap: bool = True,
     ) -> str:
         ...
 
@@ -393,6 +418,7 @@ class OpenRouterClient:
         usage: GenerationUsage | None = None,
         max_tokens: int | None = None,
         route: str = "default",
+        allow_big_prompt_full_cap: bool = True,
     ) -> str:
         ok, reason = self._budget.check()
         if not ok:
@@ -400,7 +426,9 @@ class OpenRouterClient:
             raise RuntimeError(f"{OPENROUTER_BUDGET_EXCEEDED_MARKER}: {reason}")
 
         if route == "paid_fallback":
-            return await self._generate_with_paid_fallback(prompt, system, usage, max_tokens)
+            return await self._generate_with_paid_fallback(
+                prompt, system, usage, max_tokens, allow_big_prompt_full_cap
+            )
 
         if self._breaker.is_open():
             raise RuntimeError(
@@ -413,11 +441,15 @@ class OpenRouterClient:
         if route != "free_only" and self.is_paid_mode():
             if not self._settings.openrouter_model_paid:
                 raise RuntimeError("OpenRouter: платная модель не задана. Проверь .env.")
-            return await self._generate_paid(prompt, system, usage, max_tokens)
+            return await self._generate_paid(
+                prompt, system, usage, max_tokens, allow_big_prompt_full_cap=allow_big_prompt_full_cap
+            )
 
         if not self._settings.openrouter_model_free_chain:
             raise RuntimeError("OpenRouter: список моделей пуст. Проверь .env.")
-        return await self._generate_free_chain(prompt, system, usage, max_tokens)
+        return await self._generate_free_chain(
+            prompt, system, usage, max_tokens, allow_big_prompt_full_cap
+        )
 
     async def _generate_free_chain(
         self,
@@ -425,6 +457,7 @@ class OpenRouterClient:
         system: str | None,
         usage: GenerationUsage | None,
         max_tokens: int | None,
+        allow_big_prompt_full_cap: bool = True,
     ) -> str:
         chain = self.current_chain()
         # Free mode — cycle through the chain, then sleep + retry full chain.
@@ -459,7 +492,8 @@ class OpenRouterClient:
             for model in chain:
                 try:
                     result = await self._generate_with_adaptive_cap(
-                        model, prompt, system, usage, max_tokens
+                        model, prompt, system, usage, max_tokens,
+                        allow_big_prompt_full_cap=allow_big_prompt_full_cap,
                     )
                     self._breaker.record_success()
                     return result
@@ -507,7 +541,8 @@ class OpenRouterClient:
                 logger.warning("llm.generate.dynamic_tail.try model=%s", model)
                 try:
                     result = await self._generate_with_adaptive_cap(
-                        model, prompt, system, usage, max_tokens
+                        model, prompt, system, usage, max_tokens,
+                        allow_big_prompt_full_cap=allow_big_prompt_full_cap,
                     )
                     logger.info("llm.generate.dynamic_tail.success model=%s", model)
                     return result
@@ -561,6 +596,7 @@ class OpenRouterClient:
         max_tokens: int | None,
         *,
         record_success: bool = True,
+        allow_big_prompt_full_cap: bool = True,
     ) -> str:
         """Одна платная модель со стандартной retry-политикой.
 
@@ -568,7 +604,8 @@ class OpenRouterClient:
         модели ничего не говорит о здоровье free-цепочки, breaker не трогаем.
         """
         result = await self._generate_with_retries(
-            self._settings.openrouter_model_paid, prompt, system, usage, max_tokens
+            self._settings.openrouter_model_paid, prompt, system, usage, max_tokens,
+            allow_big_prompt_full_cap=allow_big_prompt_full_cap,
         )
         if record_success:
             self._breaker.record_success()
@@ -580,6 +617,7 @@ class OpenRouterClient:
         system: str | None,
         usage: GenerationUsage | None,
         max_tokens: int | None,
+        allow_big_prompt_full_cap: bool = True,
     ) -> str:
         """Маршрут подписчика: free сначала, платная — когда free плоха.
 
@@ -591,12 +629,17 @@ class OpenRouterClient:
         paid_model = self._settings.openrouter_model_paid
         if not paid_model:
             # Фолбэчить не на что — ведём себя как free_only.
-            return await self._generate_free_chain(prompt, system, usage, max_tokens)
+            return await self._generate_free_chain(
+                prompt, system, usage, max_tokens, allow_big_prompt_full_cap
+            )
 
         if self.is_paid_mode():
             # Владелец включил платный режим глобально — подписчик тоже сразу
             # на платной (это его tier).
-            return await self._generate_paid(prompt, system, usage, max_tokens)
+            return await self._generate_paid(
+                prompt, system, usage, max_tokens,
+                allow_big_prompt_full_cap=allow_big_prompt_full_cap,
+            )
 
         if self._breaker.is_open():
             logger.info("llm.paid_fallback.trigger reason=breaker_open")
@@ -604,7 +647,9 @@ class OpenRouterClient:
             budget_sec = self._settings.paid_fallback_free_budget_sec
             try:
                 return await asyncio.wait_for(
-                    self._generate_free_chain(prompt, system, usage, max_tokens),
+                    self._generate_free_chain(
+                        prompt, system, usage, max_tokens, allow_big_prompt_full_cap
+                    ),
                     timeout=budget_sec,
                 )
             except asyncio.TimeoutError:
@@ -619,7 +664,8 @@ class OpenRouterClient:
                 logger.info("llm.paid_fallback.trigger reason=free_exhausted")
 
         result = await self._generate_paid(
-            prompt, system, usage, max_tokens, record_success=False
+            prompt, system, usage, max_tokens, record_success=False,
+            allow_big_prompt_full_cap=allow_big_prompt_full_cap,
         )
         logger.info("llm.paid_fallback.success model=%s", paid_model)
         return result
@@ -631,6 +677,7 @@ class OpenRouterClient:
         system: str | None,
         usage: GenerationUsage | None,
         max_tokens: int | None,
+        allow_big_prompt_full_cap: bool = True,
     ) -> str:
         """Single-model invocation with the standard timeout-retry policy.
 
@@ -640,7 +687,8 @@ class OpenRouterClient:
         for attempt in range(1, LLM_GENERATE_MAX_ATTEMPTS + 1):
             try:
                 return await self._generate_with_adaptive_cap(
-                    model, prompt, system, usage, max_tokens
+                    model, prompt, system, usage, max_tokens,
+                    allow_big_prompt_full_cap=allow_big_prompt_full_cap,
                 )
             except _OpenRouterTruncated as exc:
                 # Одиночная модель без цепочки: альтернативы нет, повтор того же
@@ -678,6 +726,7 @@ class OpenRouterClient:
         system: str | None,
         usage: GenerationUsage | None,
         max_tokens: int | None,
+        allow_big_prompt_full_cap: bool = True,
     ) -> str:
         """One model call with a same-model retry *ladder* that doubles
         ``max_tokens`` while the response keeps getting cut off, and (Q7)
@@ -713,6 +762,17 @@ class OpenRouterClient:
            бессмысленен — только жжёт время reasoning-моделей). Лог
            ``llm.generate.big_prompt_full_cap`` один раз на вызов.
 
+           Ревью-фикс: применяется только когда ``allow_big_prompt_full_cap``
+           истинно. Partial-стадийные вызовы (почанковая суммаризация)
+           передают ``False`` — иначе на длинных роликах эвристика стреляла
+           бы уже в дефолтном конфиге (``OPENROUTER_TRANSCRIPT_CHUNK_MAX_CHARS``
+           по умолчанию 80000 > ``LLM_BIG_PROMPT_CHARS`` по умолчанию 60000):
+           почанковые вызовы стартовали бы с 8000 при реальной потребности
+           ~1200-2000 — лишняя латентность reasoning-моделей, вариация той же
+           проблемы, которую Q7 должен лечить, а не воспроизводить в
+           миниатюре. См. ``Summarizer.summarize`` (partial vs
+           synthesis/final вызовы).
+
         Raises ``_OpenRouterTruncated`` if still cut off at the cap (with
         the *last* attempt's longer text, the better last-resort candidate),
         or any other ``_OpenRouterRetriable`` from any attempt — callers keep
@@ -726,7 +786,7 @@ class OpenRouterClient:
             min(self._settings.llm_max_tokens_final, ADAPTIVE_MAX_TOKENS_CAP_CEILING),
         )
 
-        if len(prompt) > self._settings.llm_big_prompt_chars:
+        if allow_big_prompt_full_cap and len(prompt) > self._settings.llm_big_prompt_chars:
             effective_max_tokens = cap
             logger.info(
                 "llm.generate.big_prompt_full_cap prompt_chars=%s max_tokens=%s",
@@ -759,9 +819,10 @@ class OpenRouterClient:
         """One HTTP call to OpenRouter for a specific model.
 
         Returns response text on success, raises ``_OpenRouterRetriable`` for
-        rate limits / upstream errors / timeouts (so callers can fall through
-        to a different model or retry), or a plain ``RuntimeError`` for
-        non-retriable problems (auth, bad request, etc.).
+        rate limits / upstream errors / timeouts / context-length-exceeded
+        (so callers can fall through to a different model or retry), or a
+        plain ``RuntimeError`` for other non-retriable problems (auth, a
+        genuinely malformed request, etc.).
         """
         started = time.monotonic()
         messages: list[dict] = []
@@ -811,10 +872,24 @@ class OpenRouterClient:
             #   free-тариф — «This model is unavailable for free»). Умершая
             #   модель не должна ронять job: следующая в цепочке живая.
             # - 5xx: серверные сбои.
+            # - 400 с context-length-exceeded телом — см. отдельную проверку
+            #   ниже (_is_context_overflow_error_body); прочие 400 остаются
+            #   non-retriable.
             if status in (429, 402, 404) or 500 <= status < 600:
                 detail = response.text.strip().replace("\n", " ")[:300]
                 exc = RuntimeError(f"OpenRouter HTTP {status}: {detail}")
                 raise _OpenRouterRetriable(f"http_{status}", exc)
+            if status == 400:
+                # Ревью-фикс Q7 (Important 2): 400 обычно значит "наш запрос
+                # плохой" (non-retriable), но context-length-exceeded — это
+                # свойство ЭТОЙ модели, не запроса; следующая модель в
+                # цепочке может иметь контекст побольше. Другие 400 (правда
+                # невалидный запрос) остаются non-retriable — падают ниже
+                # через _raise_for_status, как раньше.
+                detail = response.text.strip().replace("\n", " ")[:300]
+                if _is_context_overflow_error_body(detail):
+                    exc = RuntimeError(f"OpenRouter HTTP 400 (context overflow): {detail}")
+                    raise _OpenRouterRetriable("context_overflow", exc)
             try:
                 _raise_for_status(response, "OpenRouter")
             except RuntimeError as exc:
@@ -1045,8 +1120,14 @@ class LMStudioClient:
         usage: GenerationUsage | None = None,
         max_tokens: int | None = None,
         route: str = "default",
+        allow_big_prompt_full_cap: bool = True,
     ) -> str:
-        """route игнорируется: локальная модель бесплатна — маршрутизация не применяется."""
+        """route игнорируется: локальная модель бесплатна — маршрутизация не применяется.
+
+        allow_big_prompt_full_cap игнорируется: LM Studio не использует
+        adaptive-cap лестницу Q5/Q7 (см. OpenRouterClient) — один локальный
+        провайдер без fallback-цепочки, свой max_tokens как задан.
+        """
         started = time.monotonic()
         model = await self._resolve_model()
         messages = []

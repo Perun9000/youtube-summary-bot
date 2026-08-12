@@ -33,11 +33,13 @@ def wire(client, monkeypatch, *, free, paid):
     """Подменить free/paid этапы фейками, записывающими порядок вызовов."""
     calls: list[str] = []
 
-    async def fake_free(prompt, system, usage, max_tokens):
+    async def fake_free(prompt, system, usage, max_tokens, allow_big_prompt_full_cap=True):
         calls.append("free")
         return await free()
 
-    async def fake_paid(prompt, system, usage, max_tokens, *, record_success=True):
+    async def fake_paid(
+        prompt, system, usage, max_tokens, *, record_success=True, allow_big_prompt_full_cap=True
+    ):
         calls.append("paid")
         return await paid()
 
@@ -126,7 +128,10 @@ class _RouteRecordingLLM:
     def provider_name(self) -> str:
         return "fake"
 
-    async def generate(self, prompt, system=None, usage=None, max_tokens=None, route="default"):
+    async def generate(
+        self, prompt, system=None, usage=None, max_tokens=None, route="default",
+        allow_big_prompt_full_cap=True,
+    ):
         self.routes.append(route)
         return '{"overview": "x", "chapters": [], "tags": {}}'
 

@@ -120,7 +120,10 @@ class _ReasoningOnlyLLM:
     def provider_name(self) -> str:
         return "fake"
 
-    async def generate(self, prompt, system=None, usage=None, max_tokens=None, route="default"):
+    async def generate(
+        self, prompt, system=None, usage=None, max_tokens=None, route="default",
+        allow_big_prompt_full_cap=True,
+    ):
         return REASONING_PROSE
 
 

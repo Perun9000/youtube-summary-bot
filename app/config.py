@@ -335,8 +335,24 @@ def load_settings() -> Settings:
         "LLM_MAX_TOKENS_FINAL", os.getenv("LLM_MAX_TOKENS", "1200")
     )
     # Q7 (инцидент 2026-08-12, I5kab8HTzUI): промпт длиннее этого — низкий
-    # старт adaptive-cap ступеней бессмысленен, начинаем прямо с потолка
-    # (см. OpenRouterClient._generate_with_adaptive_cap).
+    # старт adaptive-cap ступеней бессмысленен, начинаем прямо с cap =
+    # max(original_max_tokens, min(LLM_MAX_TOKENS_FINAL, 8000)) — тот же cap,
+    # что и у лестницы удвоений (внешний max(original, ...) не отбрасываем:
+    # если вызывающий явно попросил больше cap, используем его запрос).
+    # Применяется только к synthesis/final-стадийным вызовам —
+    # partial-стадия (почанковая суммаризация) передаёт
+    # allow_big_prompt_full_cap=False, иначе почанковые вызовы длинных
+    # роликов (OPENROUTER_TRANSCRIPT_CHUNK_MAX_CHARS может быть > этого
+    # порога) стартовали бы с 8000 при реальной потребности ~1200-2000. См.
+    # OpenRouterClient._generate_with_adaptive_cap и Summarizer.summarize.
+    #
+    # Инвариант (не проверяется в рантайме): каждая модель в
+    # OPENROUTER_MODEL_FREE_CHAIN / OPENROUTER_MODEL_PAID должна иметь
+    # context_length >= largest_expected_prompt_tokens + 8000 (ADAPTIVE_MAX_
+    # TOKENS_CAP_CEILING) с запасом. Малоконтекстная модель в цепочке рискует
+    # HTTP 400 context-length-exceeded — распознаваемые по тексту ошибки
+    # варианты классифицируются как retriable (trying_next), но лучше не
+    # держать такую модель в цепочке вовсе.
     llm_big_prompt_chars = env.int("LLM_BIG_PROMPT_CHARS", "60000")
     lmstudio_num_ctx = env.int("LMSTUDIO_NUM_CTX", "32768")
     transcript_chunk_max_chars = env.int("TRANSCRIPT_CHUNK_MAX_CHARS", "3000")

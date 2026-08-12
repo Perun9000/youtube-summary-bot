@@ -307,6 +307,82 @@ async def test_big_prompt_truncated_at_cap_moves_to_next_model_without_ladder(
     assert calls == [("chain/model-1", 8000), ("chain/model-2", 8000)]
 
 
+# ── Ревью-фикс Important 1: allow_big_prompt_full_cap=False (partial-стадия
+# summarizer'а) отключает эвристику даже для промпта длиннее порога — большой
+# chunk стартует со своего обычного лимита, лестница при обрезке работает ──
+
+
+async def test_allow_big_prompt_full_cap_false_disables_heuristic_ladder_still_works(
+    client_low_big_prompt_threshold, monkeypatch
+):
+    def responder(model, max_tokens):
+        assert model == "chain/model-1"
+        if max_tokens in (2000, 4000):
+            return _completion("thinking", "length")
+        assert max_tokens == 8000
+        return _completion('{"overview": "ок"}', "stop")
+
+    calls = _wire_by_model_and_tokens(monkeypatch, responder)
+    big_prompt = "x" * 200  # длиннее LLM_BIG_PROMPT_CHARS=100 фикстуры
+    result = await client_low_big_prompt_threshold.generate(
+        big_prompt, max_tokens=2000, allow_big_prompt_full_cap=False
+    )
+
+    assert result == '{"overview": "ок"}'
+    # Лестница как обычно (2000→4000→8000) — НЕ немедленный прыжок на cap,
+    # несмотря на то, что промпт длиннее LLM_BIG_PROMPT_CHARS.
+    assert calls == [
+        ("chain/model-1", 2000),
+        ("chain/model-1", 4000),
+        ("chain/model-1", 8000),
+    ]
+
+
+async def test_summarizer_marks_partial_calls_no_big_prompt_full_cap():
+    """Ревью-фикс Important 1 (wiring): Summarizer передаёт
+    allow_big_prompt_full_cap=False для partial-стадийных вызовов
+    (почанковых и hierarchy-mid), True (по умолчанию) — для synthesis/final.
+    Без этого разделения длинные ролики стартовали бы почанковые вызовы с
+    cap=8000 при реальной потребности ~1200-2000 уже в дефолтном конфиге
+    (OPENROUTER_TRANSCRIPT_CHUNK_MAX_CHARS=80000 > LLM_BIG_PROMPT_CHARS=60000)."""
+    from app.summarizer import Summarizer
+
+    class _RecordingLLM:
+        def __init__(self):
+            self.calls: list[tuple[str, bool]] = []
+
+        @property
+        def provider_name(self) -> str:
+            return "fake"
+
+        async def generate(
+            self, prompt, system=None, usage=None, max_tokens=None, route="default",
+            allow_big_prompt_full_cap=True,
+        ):
+            stage = "partial" if max_tokens == 111 else "final"
+            self.calls.append((stage, allow_big_prompt_full_cap))
+            return '{"overview": "x", "chapters": [], "tags": {}}'
+
+    llm = _RecordingLLM()
+    summarizer = Summarizer(
+        llm, hierarchy_threshold=2, group_size=2,
+        partial_max_tokens=111, final_max_tokens=222,
+        system_prompt_provider=lambda: "sys",
+    )
+    # 4 чанка, group_size=2 → 2 группы (>1) → hierarchy-mid путь тоже задет.
+    await summarizer.summarize(
+        url="https://youtu.be/x", title="t",
+        chunks=["чанк 1", "чанк 2", "чанк 3", "чанк 4"],
+    )
+
+    partial_flags = [flag for stage, flag in llm.calls if stage == "partial"]
+    final_flags = [flag for stage, flag in llm.calls if stage == "final"]
+    assert partial_flags, "не задет ни один partial-стадийный вызов — тест не показателен"
+    assert all(flag is False for flag in partial_flags)
+    assert final_flags, "не задет ни один final-стадийный вызов — тест не показателен"
+    assert all(flag is True for flag in final_flags)
+
+
 # ── Paid-путь: та же адаптивная логика при обрезке ──
 
 
