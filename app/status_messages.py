@@ -134,7 +134,22 @@ async def _set_service_status(
             return old_message
 
     if old_message:
-        await _delete_message_safely(old_message)
+        delete_result = await _delete_message_safely(old_message)
+        if delete_result is _STATUS_IO_FAILED:
+            # Network failure/timeout on delete — old_message may well still
+            # be alive on Telegram's side (this is NOT "already gone", that
+            # comes back as a success below). Do not send a replacement
+            # (would duplicate the status once the network recovers) and do
+            # not touch summary_status_messages — same invariant as the
+            # edit-network-failure branch above: next update retries.
+            return None
+        # Deleted (or confirmed already gone) — drop the stale reference now,
+        # BEFORE attempting the send below. If that send then fails over the
+        # network, the dict is left clean (next update sends fresh) instead
+        # of dangling on a message that no longer exists — which would
+        # otherwise cost one wasted edit -> BadRequest -> delete -> BadRequest
+        # round trip on the very next status update.
+        services.summary_status_messages.pop(chat_id, None)
 
     # Scheduled jobs: do not ping the user with each interim status update.
     # Manual jobs keep their existing default-notify behaviour.
@@ -162,8 +177,10 @@ async def _set_service_status(
         )
     if new_message is _STATUS_IO_FAILED:
         # Cosmetic send failed over the network/timed out. old_message (if
-        # any) was already deleted above — nothing left to preserve here;
-        # the next status update starts fresh with a new send attempt.
+        # any) was already deleted AND its dict entry already popped above —
+        # summary_status_messages is clean; the next status update starts
+        # fresh with a new send attempt instead of dangling on a message
+        # that no longer exists.
         return None
     services.summary_status_messages[chat_id] = new_message
     return new_message
@@ -321,15 +338,31 @@ def _job_label(job: SummaryJob) -> str:
     except Exception:
         return job.url
     return f"YouTube video {video_id}"
-async def _delete_message_safely(message: Message) -> None:
+async def _delete_message_safely(message: Message) -> bool | _StatusIOFailedSentinel:
+    """Delete a status message, absorbing failures.
+
+    Returns ``True`` if the message is gone — either we deleted it, or
+    Telegram says it was already gone (``TelegramBadRequest``, e.g. "message
+    to delete not found"): same end state, no stale message left behind.
+
+    Returns ``_STATUS_IO_FAILED`` if the delete failed over the network or
+    timed out. Callers must NOT assume the message is gone in that case — it
+    may still be very much alive on Telegram's side; that's the whole reason
+    this is distinguished from the ``True`` case instead of being swallowed
+    the same way.
+    """
     try:
         chat_id = message.chat.id
     except AttributeError:
         chat_id = None
     try:
-        await _guarded_status_io(message.delete(), chat_id=chat_id)
+        result = await _guarded_status_io(message.delete(), chat_id=chat_id)
     except TelegramBadRequest as exc:
         logger.warning("status.delete.failed error=%s", exc)
+        return True
+    if result is _STATUS_IO_FAILED:
+        return _STATUS_IO_FAILED
+    return True
 def _fit_telegram_message(text: str) -> str:
     if len(text) <= MAX_TELEGRAM_MESSAGE_CHARS:
         return text

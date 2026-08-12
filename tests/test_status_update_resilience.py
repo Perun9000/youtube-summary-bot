@@ -23,6 +23,7 @@ from aiogram.exceptions import TelegramNetworkError
 import app.status_messages as status_messages
 from app.services_container import SummaryJob
 from app.status_messages import (
+    _STATUS_IO_FAILED,
     _delete_message_safely,
     _set_service_status,
 )
@@ -154,19 +155,91 @@ async def test_set_service_status_edit_network_error_keeps_old_message_and_state
     assert services.bot.sent == []
 
 
-# ── (c) delete_message_safely: сетевой сбой поглощается ────────────────────
+# ── (c) delete_message_safely: сетевой сбой поглощается, исход различим ────
 
 
-async def test_delete_message_safely_absorbs_network_error(caplog):
+async def test_delete_message_safely_absorbs_network_error_and_signals_failure(caplog):
+    """Сетевой сбой на delete отличим от «уже удалено» — caller (в частности
+    _set_service_status) должен знать, что сообщение МОЖЕТ быть всё ещё живо
+    на стороне Telegram, а не считать его гарантированно удалённым."""
     message = _FakeMessage()
     message.delete_error = _network_error()
 
     with caplog.at_level("WARNING"):
-        await _delete_message_safely(message)  # не должно бросить
+        result = await _delete_message_safely(message)  # не должно бросить
 
-    assert any("status.update_failed" in r.message for r in caplog.records) or any(
-        "status.delete.failed" in r.message for r in caplog.records
+    assert result is _STATUS_IO_FAILED
+    assert any("status.update_failed" in r.message for r in caplog.records)
+
+
+async def test_delete_message_safely_returns_true_on_success():
+    message = _FakeMessage()
+
+    result = await _delete_message_safely(message)
+
+    assert result is True
+    assert message.deleted is True
+
+
+# ── (f) Important 1: delete упал сетью → БЕЗ дубля (send НЕ вызван) ───────
+
+
+async def test_set_service_status_delete_network_error_does_not_send_duplicate():
+    """bump=True всегда идёт по delete-and-resend пути. Если delete упал по
+    сети, старое сообщение МОЖЕТ быть всё ещё в чате (мы не знаем) — слать
+    новое безусловно означало бы дубль после восстановления сети, ровно то,
+    что мандат запрещает для edit-пути. Правильно: return None без отправки,
+    ссылка на старое сообщение сохраняется — следующий апдейт (обычный edit,
+    bump=False) ретраит на ТОМ ЖЕ old_message."""
+    services = _FakeServices()
+    job = _make_job()
+    old_message = _FakeMessage(chat_id=CHAT_ID)
+    old_message.delete_error = _network_error()
+    services.summary_status_messages[CHAT_ID] = old_message
+    services.summary_status_base_texts[CHAT_ID] = "Позиция: 2"
+    services.summary_status_parse_modes[CHAT_ID] = None
+    services.summary_status_disable_previews[CHAT_ID] = False
+
+    result = await _set_service_status(
+        services=services, source_message=None, text="Генерирую summary...",
+        job=job, bump=True,
     )
+
+    assert result is None
+    # НЕ отправили запасное сообщение — иначе в чате было бы два статуса.
+    assert services.bot.sent == []
+    # Ссылка на старое сообщение сохранена (не потеряна) — следующий апдейт
+    # найдёт его и попробует снова.
+    assert services.summary_status_messages[CHAT_ID] is old_message
+
+
+# ── (g) Important 2: delete успешен + send упал → словарь чист ────────────
+
+
+async def test_set_service_status_send_failure_after_successful_delete_leaves_clean_dict():
+    """До фикса: успешный delete не убирал старую ссылку из
+    summary_status_messages ДО попытки send — упавший send оставлял словарь
+    с висячей ссылкой на уже удалённое сообщение. Следующий апдейт пытался
+    бы отредактировать несуществующее сообщение (лишний edit -> BadRequest ->
+    delete -> BadRequest раунд-трип). Правильно: после успешного delete
+    ссылка убирается из словаря СРАЗУ, до отправки — упавший send оставляет
+    чистое состояние (следующий апдейт шлёт с нуля)."""
+    bot = _FakeBot(send_error=_network_error())
+    services = _FakeServices(bot=bot)
+    job = _make_job()
+    old_message = _FakeMessage(chat_id=CHAT_ID)  # delete_error=None → succeeds
+    services.summary_status_messages[CHAT_ID] = old_message
+
+    result = await _set_service_status(
+        services=services, source_message=None, text="Генерирую summary...",
+        job=job, bump=True,
+    )
+
+    assert result is None
+    assert old_message.deleted is True
+    # Никакой висячей ссылки на удалённое сообщение — следующий апдейт не
+    # должен пытаться редактировать то, чего уже нет.
+    assert CHAT_ID not in services.summary_status_messages
 
 
 # ── (d) таймаут: вызов висит > 5с → поглощён за ~5с, не 60 ─────────────────
@@ -304,3 +377,10 @@ async def test_worker_survives_network_failure_on_initial_status_update():
     # down with it.
     assert services.bot.calls >= 2
     assert len(services.bot.sent) >= 1
+
+
+# ── (h) Minor: pin the timeout budget so it can't silently regress to 60s ──
+
+
+def test_status_io_timeout_is_five_seconds():
+    assert status_messages._STATUS_IO_TIMEOUT_SEC == 5

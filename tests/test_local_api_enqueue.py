@@ -152,8 +152,6 @@ async def test_enqueue_local_api_job_defaults_lang_ru_without_user_langs(monkeyp
 
     await _stop_worker(services)
 
-    await _stop_worker(services)
-
 
 async def test_enqueue_local_api_job_cache_hit_returns_cached(monkeypatch):
     delivered = []
