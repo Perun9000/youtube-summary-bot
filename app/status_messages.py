@@ -57,7 +57,12 @@ async def _guarded_status_io(coro, *, chat_id: int | None):
     try:
         return await asyncio.wait_for(coro, timeout=_STATUS_IO_TIMEOUT_SEC)
     except (TelegramNetworkError, asyncio.TimeoutError) as exc:
-        logger.warning("status.update_failed chat_id=%s error=%s", chat_id, exc)
+        # str(asyncio.TimeoutError()) — пустая строка, поэтому в лог всегда
+        # идёт и имя типа исключения: иначе error= в проде приходит пустым.
+        logger.warning(
+            "status.update_failed chat_id=%s error=%s: %s",
+            chat_id, type(exc).__name__, exc,
+        )
         return _STATUS_IO_FAILED
 
 

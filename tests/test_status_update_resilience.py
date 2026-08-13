@@ -25,6 +25,7 @@ from app.services_container import SummaryJob
 from app.status_messages import (
     _STATUS_IO_FAILED,
     _delete_message_safely,
+    _guarded_status_io,
     _set_service_status,
 )
 
@@ -377,6 +378,45 @@ async def test_worker_survives_network_failure_on_initial_status_update():
     # down with it.
     assert services.bot.calls >= 2
     assert len(services.bot.sent) >= 1
+
+
+# ── (i) лог warning всегда несёт непустой error= (тип + текст исключения) ──
+#
+# Инцидент 2026-08-12 23:01:58: в проде строка "status.update_failed
+# chat_id=... error=" пришла с ПУСТЫМ error= — str(asyncio.TimeoutError())
+# это "", и str(TelegramNetworkError) тоже может быть пустым. Лог без текста
+# ошибки бесполезен для диагностики: нельзя отличить таймаут от сетевого
+# сбоя. Формат должен включать имя типа исключения.
+
+
+async def test_guarded_status_io_timeout_logs_nonempty_error(monkeypatch, caplog):
+    monkeypatch.setattr(status_messages, "_STATUS_IO_TIMEOUT_SEC", 0.01)
+
+    async def _hang():
+        await asyncio.sleep(10)
+
+    with caplog.at_level("WARNING"):
+        result = await _guarded_status_io(_hang(), chat_id=CHAT_ID)
+
+    assert result is _STATUS_IO_FAILED
+    record = next(r for r in caplog.records if "status.update_failed" in r.message)
+    error_text = record.message.split("error=", 1)[1].strip()
+    assert error_text != ""
+    assert "TimeoutError" in error_text
+
+
+async def test_guarded_status_io_network_error_log_includes_type_and_text(caplog):
+    async def _boom():
+        raise TelegramNetworkError(method=None, message="Connection reset by peer")
+
+    with caplog.at_level("WARNING"):
+        result = await _guarded_status_io(_boom(), chat_id=CHAT_ID)
+
+    assert result is _STATUS_IO_FAILED
+    record = next(r for r in caplog.records if "status.update_failed" in r.message)
+    error_text = record.message.split("error=", 1)[1].strip()
+    assert "TelegramNetworkError" in error_text
+    assert "Connection reset by peer" in error_text
 
 
 # ── (h) Minor: pin the timeout budget so it can't silently regress to 60s ──
