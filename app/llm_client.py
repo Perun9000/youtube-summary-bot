@@ -499,11 +499,21 @@ class OpenRouterClient:
                     return result
                 except _OpenRouterRetriable as exc:
                     last_error = exc.cause
-                    # Q8: пустой truncated.text (finish_reason=length, но
-                    # reasoning не оставил content'а) — тоже не last-resort
-                    # кандидат, только непустой обрезанный текст годится.
-                    if isinstance(exc, _OpenRouterTruncated) and exc.text:
-                        truncated_text = exc.text
+                    # Q8 ревью-фикс (Important 1): «short-circuit — считать
+                    # проход обречённым» и «last-resort — что вернуть» — ДВА
+                    # РАЗНЫХ понятия, раньше слитых в одно условие. Обрезка
+                    # (truncated) — ВСЕГДА truncation-класс для short-circuit,
+                    # даже если text пуст (reasoning сожрал весь лимит):
+                    # следующий проход даст тот же потолок, тот же брак, retry
+                    # ничего не купит — жечь sleep + дневной лимит запросов
+                    # ради гарантированного повтора неверно независимо от
+                    # того, есть ли непустой текст на руках. last-resort
+                    # кандидатом при этом становится ТОЛЬКО непустой text —
+                    # пустой не лучше явной ошибки об исчерпании цепочки (см.
+                    # часть 1 этой задачи).
+                    if isinstance(exc, _OpenRouterTruncated):
+                        if exc.text:
+                            truncated_text = exc.text
                     else:
                         pass_had_real_failure = True
                     logger.warning(
@@ -512,11 +522,17 @@ class OpenRouterClient:
                         model, pass_idx + 1, passes, exc.short_reason,
                     )
                     continue
-            if not pass_had_real_failure and truncated_text is not None:
+            if not pass_had_real_failure:
+                # Весь проход — truncation-класс (обрезки, пустые или не).
+                # Дальше проходы дать ничего не могут — рвём немедленно,
+                # независимо от того, нашёлся ли непустой last-resort текст:
+                # если нет (truncated_text is None) — ниже пойдём в обычный
+                # FREE_CHAIN_EXHAUSTED за ОДИН проход, а не за все ``passes``.
                 logger.info(
                     "llm.generate.chain_exhausted_all_truncated pass=%s/%s "
-                    "skipping_remaining_passes=%s",
+                    "skipping_remaining_passes=%s last_resort_available=%s",
                     pass_idx + 1, passes, passes - pass_idx - 1,
+                    truncated_text is not None,
                 )
                 break
             if pass_idx + 1 < passes:

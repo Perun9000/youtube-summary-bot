@@ -168,6 +168,78 @@ async def test_catalog_error_keeps_old_behavior(client, monkeypatch):
         await client.generate("p")
 
 
+# ── Q8 ревью-фикс (Important 2): empty-truncated на хвосте — не last-resort,
+# хвост продолжает пробовать следующую модель, как и для любой другой ошибки.
+
+
+async def test_tail_model_length_empty_falls_through_to_next_tail_model(client, monkeypatch):
+    """Первая хвостовая модель отвечает finish_reason=length с ПУСТЫМ
+    content на каждой ступени лестницы (нет запаса выше cap по умолчанию —
+    LLM_MAX_TOKENS_FINAL не задан в фикстуре, cap == старт, без лестницы).
+    Пустой truncated-текст не должен стать last-resort и оборвать хвост —
+    вторая хвостовая модель должна получить свой шанс и ответить нормально."""
+    counter = [0]
+    _wire_catalog(
+        monkeypatch,
+        [
+            _entry("tail/rescue-model-1:free", 200000),
+            _entry("tail/rescue-model-2:free", 200000),
+        ],
+        counter,
+    )
+    calls: list[str] = []
+    _wire_posts(
+        monkeypatch,
+        {
+            "chain/model-1": 429,
+            "chain/model-2": 429,
+            "tail/rescue-model-1:free": _completion("", "length"),
+            "tail/rescue-model-2:free": _completion('{"overview": "ок"}'),
+        },
+        calls,
+    )
+    result = await client.generate("p")
+    assert result == '{"overview": "ок"}'
+    assert calls == [
+        "chain/model-1", "chain/model-2",
+        "tail/rescue-model-1:free", "tail/rescue-model-2:free",
+    ]
+
+
+async def test_tail_all_models_length_empty_raises_exhausted_not_empty_success(
+    client, monkeypatch
+):
+    """Обе хвостовые модели — finish_reason=length с пустым content. Ни один
+    пустой truncated-текст не годится в last resort — итог должен быть
+    FREE_CHAIN_EXHAUSTED, а не «успех» с пустой строкой."""
+    counter = [0]
+    _wire_catalog(
+        monkeypatch,
+        [
+            _entry("tail/rescue-model-1:free", 200000),
+            _entry("tail/rescue-model-2:free", 200000),
+        ],
+        counter,
+    )
+    calls: list[str] = []
+    _wire_posts(
+        monkeypatch,
+        {
+            "chain/model-1": 429,
+            "chain/model-2": 429,
+            "tail/rescue-model-1:free": _completion("", "length"),
+            "tail/rescue-model-2:free": _completion("", "length"),
+        },
+        calls,
+    )
+    with pytest.raises(RuntimeError, match=FREE_CHAIN_EXHAUSTED_MARKER):
+        await client.generate("p")
+    assert calls == [
+        "chain/model-1", "chain/model-2",
+        "tail/rescue-model-1:free", "tail/rescue-model-2:free",
+    ]
+
+
 async def test_tail_not_used_when_chain_alive(client, monkeypatch):
     counter = [0]
     _wire_catalog(monkeypatch, [_entry("tail/rescue-model:free", 200000)], counter)
