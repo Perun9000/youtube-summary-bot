@@ -218,6 +218,123 @@ async def _maybe_retry_transient_failure(
     return True
 
 
+# Q8: долгий отложенный ретрай exhaustion-класса ошибок (свободная цепочка
+# OpenRouter исчерпана / дневной бюджет исчерпан) — по образцу Q4
+# (_maybe_retry_transient_failure), та же deferred-механика и ОБЩИЙ счётчик
+# попыток job.transient_retries / MAX_TRANSIENT_RETRIES (не отдельный лимит).
+#
+# Инцидент 2026-08-17: FREE_CHAIN_EXHAUSTED с «Последняя ошибка: .» (пустой —
+# та же пустота, которую чинит часть 1 этой задачи, app/llm_client.py) — job
+# финалился в failed, хотя через час-другой free-модели у сторонних
+# провайдеров (Venice/Chutes/DeepInfra) снова отвечают сами по себе. Q4-шный
+# короткий бэкофф (5/10/15 мин) тут бессмысленен — free-модели восстанавли-
+# ваются не так быстро — поэтому отдельная, гораздо более долгая задержка.
+EXHAUSTION_RETRY_DELAY_SEC = 3600  # 1 час
+# Если исчерпание — именно ДНЕВНОЙ лимит OpenRouter (см. подстроку ниже — их
+# формулировка рейт-лимита), а не общая нестабильность цепочки, точнее ждать
+# до фактического сброса лимита (00:00 UTC + 5 мин запаса на пропагацию),
+# ЕСЛИ это раньше, чем через час.
+_EXHAUSTION_DAILY_LIMIT_MARKER = "free-models-per-day"
+_EXHAUSTION_DAILY_RESET_MAX_WAIT_SEC = 12 * 3600
+
+
+def _is_exhaustion_failure(exc: BaseException) -> bool:
+    """True, если ``exc`` — FREE_CHAIN_EXHAUSTED_MARKER или
+    OPENROUTER_BUDGET_EXCEEDED_MARKER (см. app/llm_client.py): свободная
+    цепочка/бюджет временно исчерпаны, а не сетевой сбой (Q4) и не проблема
+    с самим роликом/конфигурацией."""
+    reason = str(exc)
+    return FREE_CHAIN_EXHAUSTED_MARKER in reason or OPENROUTER_BUDGET_EXCEEDED_MARKER in reason
+
+
+def _next_daily_reset_utc(now: float) -> float:
+    """Ближайший будущий момент 00:05 UTC — сброс дневного free-tier лимита
+    OpenRouter (00:00 UTC) + 5 минут запаса на пропагацию у провайдера."""
+    import datetime as _dt
+
+    current = _dt.datetime.fromtimestamp(now, tz=_dt.timezone.utc)
+    candidate = current.replace(hour=0, minute=5, second=0, microsecond=0)
+    if candidate.timestamp() <= now:
+        candidate = candidate + _dt.timedelta(days=1)
+    return candidate.timestamp()
+
+
+def _exhaustion_run_after(exc: Exception, now: float) -> float:
+    """Когда повторить job после exhaustion-класса ошибки.
+
+    По умолчанию — час: свободные модели у сторонних провайдеров часто
+    оживают сами по себе за это время (инцидент 2026-08-17), а короткий
+    Q4-бэкофф для этого класса бессмыслен (та же цепочка тем же составом
+    ответит так же). Если текст ошибки явно сигналит именно про ДНЕВНОЙ
+    рейт-лимит OpenRouter (``free-models-per-day`` — их собственная фраза) —
+    и до следующего сброса (00:05 UTC) меньше 12 часов, точнее подождать до
+    сброса, чем гадать часовыми интервалами. Если сброс дальше 12 часов
+    (например, только-только миновала полночь) — обычный часовой бэкофф всё
+    равно попробует раньше и не хуже: ждать почти сутки было бы избыточно
+    консервативно (и увеличивало бы задержку доставки без выигрыша).
+    """
+    default_run_after = now + EXHAUSTION_RETRY_DELAY_SEC
+    if _EXHAUSTION_DAILY_LIMIT_MARKER not in str(exc).lower():
+        return default_run_after
+    reset_at = _next_daily_reset_utc(now)
+    if reset_at - now < _EXHAUSTION_DAILY_RESET_MAX_WAIT_SEC:
+        return reset_at
+    return default_run_after
+
+
+async def _maybe_retry_exhaustion_failure(
+    job: SummaryJob, services: Services, exc: Exception, job_id: str
+) -> bool:
+    """Если ``exc`` — exhaustion-класс (см. ``_is_exhaustion_failure``) и
+    попытки не исчерпаны — отложить job на долгий повтор вместо финализации
+    в failed. Делит deferred-механику, счётчик и лимит попыток с Q4
+    (``_maybe_retry_transient_failure`` / ``job.transient_retries`` /
+    ``MAX_TRANSIENT_RETRIES``) — суммарно не больше
+    ``MAX_TRANSIENT_RETRIES`` отложенных попыток любого класса (транзиент +
+    exhaustion) на один job, дальше — обычный failed-путь с дружелюбным
+    текстом (см. ``_user_facing_error_reason``).
+
+    Возвращает True, если job поставлен на повтор (как и в Q4 — вызывающий
+    код должен тихо вернуться); False — не exhaustion, лимит исчерпан, либо
+    нет персистентной строки job'а.
+
+    Owner/allowlist трогаются РОВНО как любой другой job — эта функция не
+    смотрит на ``job.chat_id`` / ``job.quota_user_id`` вовсе. Различие
+    owner vs остальные (полный технический текст vs дружелюбный) появляется
+    только в ``_user_facing_error_reason``, т.е. только ПОСЛЕ того, как
+    лимит попыток исчерпан и job идёт по обычному failed-пути — до этого
+    момента никто (включая владельца) не видит финальной ошибки, все видят
+    один и тот же retry-статус (``status.retry_scheduled_at``).
+    """
+    if not _is_exhaustion_failure(exc):
+        return False
+    if job.transient_retries >= MAX_TRANSIENT_RETRIES:
+        return False
+    if services.job_store is None or job.db_id is None:
+        return False
+
+    job.transient_retries += 1
+    now = time.time()
+    run_after = _exhaustion_run_after(exc, now)
+    job.deferred_until = run_after
+    services.job_store.set_deferred(job.db_id, run_after, attempts=job.transient_retries)
+    logger.info(
+        "job.exhaustion_retry.deferred job_id=%s db_id=%s attempts=%s run_after=%.0f error=%s",
+        job_id, job.db_id, job.transient_retries, run_after, exc,
+    )
+
+    minutes = max(1, round((run_after - now) / 60))
+    try:
+        await _set_service_status(
+            services, job.message,
+            t("status.retry_scheduled_at", job.lang, minutes=minutes),
+            job=job,
+        )
+    except Exception:  # noqa: BLE001 — статус best-effort, ретрай уже поставлен
+        logger.warning("job.exhaustion_retry.status_failed job_id=%s db_id=%s", job_id, job.db_id)
+    return True
+
+
 def _user_facing_error_reason(exc: Exception, job: SummaryJob, services) -> str:
     """Причина ошибки для сообщения пользователю.
 
@@ -780,17 +897,21 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
         raise
     except Exception as exc:
         logger.exception("job.failed job_id=%s video_id=%s duration_sec=%.1f", job_id, video_id, time.monotonic() - started)
-        # Q4: сетевой сбой (шторм, обрыв до OpenRouter/Telegram) — вместо
-        # финального failed откладываем job на повтор через ту же
-        # deferred-механику, что и премьеры. Пользователь не видит ошибку,
-        # если ретрай ещё не исчерпан. ИСКЛЮЧЕНИЕ — job с custom_prompt:
-        # deferred-requeue идёт через БД, где промпт не живёт, и тихий ретрай
-        # вернул бы обычное саммари вместо промптового. Честнее сразу отдать
-        # ошибку и «перевзвести» промпт (см. _rearm_custom_prompt ниже).
-        if job.custom_prompt is None and await _maybe_retry_transient_failure(
-            job, services, exc, job_id
-        ):
-            return
+        # Q4/Q8: сетевой сбой (шторм, обрыв до OpenRouter/Telegram) или
+        # exhaustion-класс (free-цепочка/бюджет OpenRouter временно
+        # исчерпаны) — вместо финального failed откладываем job на повтор
+        # через ту же deferred-механику, что и премьеры (короткий бэкофф для
+        # транзиента, долгий для exhaustion — см. _exhaustion_run_after).
+        # Пользователь не видит ошибку, если ретрай ещё не исчерпан.
+        # ИСКЛЮЧЕНИЕ — job с custom_prompt: deferred-requeue идёт через БД,
+        # где промпт не живёт, и тихий ретрай (любого класса) вернул бы
+        # обычное саммари вместо промптового. Честнее сразу отдать ошибку и
+        # «перевзвести» промпт (см. _rearm_custom_prompt ниже).
+        if job.custom_prompt is None:
+            if await _maybe_retry_transient_failure(job, services, exc, job_id):
+                return
+            if await _maybe_retry_exhaustion_failure(job, services, exc, job_id):
+                return
         await _set_service_status(services, message, t("status.interrupted", job.lang), job=job)
         await _send_summary_delivery(
             services=services,

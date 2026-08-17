@@ -47,6 +47,7 @@
   "status.queued_first": "أضفت الفيديو إلى قائمة انتظار التلخيص. أبدأ المعالجة.",
   "status.queued_position": "أضفت الفيديو إلى قائمة الانتظار. الموضع: {position}.",
   "status.retry_scheduled": "عطل مؤقت في الشبكة — سأعيد المحاولة خلال {minutes} دقيقة.",
+  "status.retry_scheduled_at": "النماذج المجانية مثقلة الآن — سأعيد المحاولة خلال ~{minutes} دقيقة.",
   "status.stopped": "تم إيقاف توليد الملخص.",
   "status.transcribe_done": "اكتمل التفريغ. أُعيده إلى قائمة انتظار التلخيص...",
   "status.transcribe_queue": "الترجمة النصية غير متاحة. أرسلها إلى قائمة انتظار التفريغ عبر Groq Whisper...",

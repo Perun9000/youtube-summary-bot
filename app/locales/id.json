@@ -47,6 +47,7 @@
   "status.queued_first": "Video sudah ditambahkan ke antrean ringkasan. Mulai memproses.",
   "status.queued_position": "Video sudah ditambahkan ke antrean. Posisi: {position}.",
   "status.retry_scheduled": "Gangguan jaringan sementara — saya akan coba lagi dalam {minutes} menit.",
+  "status.retry_scheduled_at": "Model gratis sedang kelebihan beban sekarang — saya akan coba lagi dalam ~{minutes} menit.",
   "status.stopped": "Pembuatan ringkasan dihentikan.",
   "status.transcribe_done": "Transkripsi selesai. Mengembalikan ke antrean ringkasan...",
   "status.transcribe_queue": "Teks tidak tersedia. Mengirim ke antrean transkripsi via Groq Whisper...",

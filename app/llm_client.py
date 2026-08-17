@@ -499,7 +499,10 @@ class OpenRouterClient:
                     return result
                 except _OpenRouterRetriable as exc:
                     last_error = exc.cause
-                    if isinstance(exc, _OpenRouterTruncated):
+                    # Q8: пустой truncated.text (finish_reason=length, но
+                    # reasoning не оставил content'а) — тоже не last-resort
+                    # кандидат, только непустой обрезанный текст годится.
+                    if isinstance(exc, _OpenRouterTruncated) and exc.text:
                         truncated_text = exc.text
                     else:
                         pass_had_real_failure = True
@@ -548,7 +551,7 @@ class OpenRouterClient:
                     return result
                 except _OpenRouterRetriable as exc:
                     last_error = exc.cause
-                    if isinstance(exc, _OpenRouterTruncated):
+                    if isinstance(exc, _OpenRouterTruncated) and exc.text:
                         truncated_text = exc.text
                     continue
             if tail:
@@ -691,28 +694,36 @@ class OpenRouterClient:
                     allow_big_prompt_full_cap=allow_big_prompt_full_cap,
                 )
             except _OpenRouterTruncated as exc:
-                # Одиночная модель без цепочки: альтернативы нет, повтор того же
-                # запроса вряд ли поможет — отдаём обрезанный текст downstream'у.
-                logger.warning(
-                    "llm.generate.truncated provider=openrouter model=%s chars=%s",
-                    model, len(exc.text),
-                )
-                return exc.text
+                if exc.text:
+                    # Одиночная модель без цепочки: альтернативы нет, повтор
+                    # того же запроса вряд ли поможет — отдаём обрезанный
+                    # текст downstream'у.
+                    logger.warning(
+                        "llm.generate.truncated provider=openrouter model=%s chars=%s",
+                        model, len(exc.text),
+                    )
+                    return exc.text
+                # Q8: пустой truncated (reasoning выжрал весь лимит, content'а
+                # нет вообще) — не last-resort кандидат, ведём себя как
+                # обычная retriable-ошибка (падаем в ветку ниже).
+                last_exc = exc.cause
+                short_reason = exc.short_reason
             except _OpenRouterRetriable as exc:
                 last_exc = exc.cause
-                if attempt >= LLM_GENERATE_MAX_ATTEMPTS:
-                    self._breaker.record_failure()
-                    raise RuntimeError(
-                        f"OpenRouter ({model}) не ответил после {attempt} попыток: "
-                        f"{exc.short_reason}"
-                    ) from exc.cause
-                logger.warning(
-                    "llm.generate.retry provider=openrouter model=%s attempt=%s/%s reason=%s "
-                    "delay_sec=%s",
-                    model, attempt, LLM_GENERATE_MAX_ATTEMPTS, exc.short_reason,
-                    LLM_GENERATE_RETRY_DELAY_SEC,
-                )
-                await asyncio.sleep(LLM_GENERATE_RETRY_DELAY_SEC)
+                short_reason = exc.short_reason
+            if attempt >= LLM_GENERATE_MAX_ATTEMPTS:
+                self._breaker.record_failure()
+                raise RuntimeError(
+                    f"OpenRouter ({model}) не ответил после {attempt} попыток: "
+                    f"{short_reason}"
+                ) from last_exc
+            logger.warning(
+                "llm.generate.retry provider=openrouter model=%s attempt=%s/%s reason=%s "
+                "delay_sec=%s",
+                model, attempt, LLM_GENERATE_MAX_ATTEMPTS, short_reason,
+                LLM_GENERATE_RETRY_DELAY_SEC,
+            )
+            await asyncio.sleep(LLM_GENERATE_RETRY_DELAY_SEC)
         if last_exc is not None:
             self._breaker.record_failure()
             raise RuntimeError(f"OpenRouter ({model}) не ответил.") from last_exc
@@ -940,9 +951,28 @@ class OpenRouterClient:
             "paid" if self.is_paid_mode() else "free",
         )
         if finish_reason == "length":
-            # Модель упёрлась в лимит completion-токенов: вывод обрезан и почти
-            # наверняка непригоден (частый случай — зацикленный reasoning).
+            # Модель упёрлась в лимит completion-токенов: вывод обрезан (или,
+            # если result пуст, reasoning выжрал весь лимит и до полезного
+            # content'а не добрался) — почти наверняка непригоден. Q8: пустой
+            # result здесь СОЗНАТЕЛЬНО классифицируем как truncated, а не как
+            # empty_response ниже — лестница Q5/Q7 (bigger cap, см.
+            # ``_generate_with_adaptive_cap``) даёт модели ещё один шанс
+            # дотянуться до реального вывода на большем потолке. last-resort-
+            # кандидатом (``_generate_free_chain``/``_generate_with_retries``)
+            # пустой truncated.text всё равно не станет — только непустой
+            # обрезанный текст годится в last resort, иначе мы воспроизведём
+            # тот же баг (успех с 0 символов), который эта задача чинит.
             raise _OpenRouterTruncated(result)
+        if not result:
+            # Инцидент 2026-08-13: nemotron вернул HTTP 200 с ПУСТЫМ телом
+            # (0 chars) после ~5 минут ожидания — цепочка сочла это успехом,
+            # downstream JSON-парсер упал с raw_chars=0. finish_reason != "length"
+            # здесь (тот случай — выше), значит модель просто ничего не
+            # вернула без явной ошибки — классифицируем как отказ модели, не
+            # как успех: caller делает trying_next на следующую модель/попытку.
+            # НЕ last-resort кандидат (в отличие от _OpenRouterTruncated) —
+            # пустой текст никогда не лучше явной ошибки об исчерпании цепочки.
+            raise _OpenRouterEmptyResponse(model)
         return result
 
     async def _catalog_models(self) -> list[dict]:
@@ -1059,6 +1089,26 @@ class _OpenRouterTruncated(_OpenRouterRetriable):
             "truncated_at_max_tokens", RuntimeError("finish_reason=length")
         )
         self.text = text
+
+
+class _OpenRouterEmptyResponse(_OpenRouterRetriable):
+    """HTTP 200, но content пустой/пробельный (finish_reason != "length").
+
+    Q8, инцидент 2026-08-13: nemotron вернул 200 с пустым телом после ~5 минут
+    ожидания — до этого фикса цепочка считала это успехом, downstream JSON-
+    парсер падал с raw_chars=0. Классифицируем как отказ модели: caller делает
+    trying_next на следующую модель/попытку, как для любой другой
+    ``_OpenRouterRetriable``. В отличие от ``_OpenRouterTruncated`` не несёт
+    текста вообще — пустой ответ никогда не годится в last-resort кандидаты
+    (см. ``OpenRouterClient._generate_free_chain``: только непустой
+    ``_OpenRouterTruncated.text`` становится ``truncated_text``).
+    """
+
+    def __init__(self, model: str) -> None:
+        super().__init__(
+            "empty_response",
+            RuntimeError(f"OpenRouter ({model}): пустой ответ (HTTP 200, content пусто)"),
+        )
 
 
 def _extract_openrouter_usage(usage_data: dict) -> _OpenRouterUsageInfo:
