@@ -22,6 +22,8 @@ services:
   # боту только внутри compose-сети по имени сервиса и порту 4416.
   bgutil-provider:
     image: brainicism/bgutil-ytdlp-pot-provider:latest
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
     mem_limit: 256m
     logging:
