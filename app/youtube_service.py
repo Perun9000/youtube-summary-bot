@@ -363,6 +363,7 @@ class YouTubeService:
                 "ignore_no_formats_error": True,
             }
             self._add_cookie_option(options, cookie_path)
+            self._add_pot_provider_option(options)
             return options
 
         def perform(options: dict) -> VideoMetadata:
@@ -423,6 +424,7 @@ class YouTubeService:
                 "playlistend": 1,
             }
             self._add_cookie_option(options, cookie_path)
+            self._add_pot_provider_option(options)
             return options
 
         def perform(options: dict) -> ChannelInfo:
@@ -497,6 +499,7 @@ class YouTubeService:
         def build_options(cookie_path: Path | None) -> dict:
             options = _base_audio_options(tmp_dir)
             self._add_cookie_option(options, cookie_path)
+            self._add_pot_provider_option(options)
             return options
 
         def perform(options: dict) -> None:
@@ -551,6 +554,7 @@ class YouTubeService:
                 },
             }
             self._add_cookie_option(options, cookie_path)
+            self._add_pot_provider_option(options)
             return options
 
         def perform(options: dict) -> object:
@@ -629,6 +633,26 @@ class YouTubeService:
             return transcript
 
         raise NoTranscriptFound("No transcript found", None, None)
+
+    def _add_pot_provider_option(self, options: dict) -> None:
+        """Point yt-dlp's ``youtubepot-bgutilhttp`` plugin at the PO-token
+        provider (bgutil-ytdlp-pot-provider compose service).
+
+        Part of YouTube's media now returns HTTP 403 without a valid
+        Proof-of-Origin token even though the web client sees the formats
+        fine (инцидент 2026-08-19, репро I1uYg8bdBqg) — the plugin mints one
+        via this HTTP provider. ``pot_provider_url`` empty (default override,
+        or tests) => no-op, exactly today's behavior without the provider.
+
+        Uses ``setdefault`` so this merges into (rather than clobbers) any
+        ``extractor_args`` a call site already set (e.g. fetch_top_comments'
+        ``youtube`` comment-extractor args) — they're different dict keys.
+        """
+        base_url = self._settings.pot_provider_url
+        if not base_url:
+            return
+        extractor_args = options.setdefault("extractor_args", {})
+        extractor_args["youtubepot-bgutilhttp"] = {"base_url": [base_url]}
 
     def _add_cookie_option(self, options: dict, cookie_path: Path | None = None) -> None:
         # cookie_path set => multi-account rotation is enabled and picked

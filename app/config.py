@@ -53,6 +53,7 @@ class Settings:
     ytdlp_cookies_dir: Path
     ytdlp_min_interval_sec: float
     ytdlp_soft_daily_limit: int
+    pot_provider_url: str
     bot_data_dir: Path
     database_path: Path
     transcript_chunk_max_chars: int
@@ -366,6 +367,12 @@ def load_settings() -> Settings:
     ytdlp_min_interval_sec = env.float("YTDLP_MIN_INTERVAL_SEC", "2")
     ytdlp_soft_daily_limit = env.int("YTDLP_SOFT_DAILY_LIMIT", "150")
 
+    # PO-token provider (bgutil-ytdlp-pot-provider, compose-сервис) для
+    # yt-dlp-плагина youtubepot-bgutilhttp — часть роликов YouTube отдаёт
+    # медиа 403 без Proof-of-Origin токена (инцидент 2026-08-19). Пустая
+    # строка => extractor_args не добавляется (тесты / запуск без сервиса).
+    pot_provider_url = os.getenv("POT_PROVIDER_URL", "http://bgutil-provider:4416").strip()
+
     # Локальный HTTP API для кнопки расширения (тихая постановка без deep-link).
     # Пустой токен → сервер не стартует, фича выключена (см. app/local_api.py).
     local_api_token = os.getenv("LOCAL_API_TOKEN", "").strip()
@@ -410,6 +417,7 @@ def load_settings() -> Settings:
         ytdlp_cookies_dir=ytdlp_cookies_dir,
         ytdlp_min_interval_sec=ytdlp_min_interval_sec,
         ytdlp_soft_daily_limit=ytdlp_soft_daily_limit,
+        pot_provider_url=pot_provider_url,
         bot_data_dir=data_dir,
         database_path=database_path,
         transcript_chunk_max_chars=transcript_chunk_max_chars,

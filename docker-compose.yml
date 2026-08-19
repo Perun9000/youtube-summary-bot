@@ -15,3 +15,17 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+
+  # PO-token provider для yt-dlp-плагина youtubepot-bgutilhttp (см.
+  # app/config.py Settings.pot_provider_url, app/youtube_service.py
+  # _add_pot_provider_option). Без публикации портов наружу — доступен
+  # боту только внутри compose-сети по имени сервиса и порту 4416.
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    restart: unless-stopped
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
