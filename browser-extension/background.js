@@ -61,12 +61,16 @@ api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       sendResponse({ ok: false });
       return;
     }
-    // Две попытки с паузой: короткие окна недоступности (рестарт/пересборка
-    // контейнера бота) не должны сразу выкидывать пользователя в deep-link
-    // с открытием Telegram. Худший случай до fallback'а: 1.5 + 3 + 1.5 = 6 сек.
-    let result = await attemptEnqueue(token, msg.videoId, 1500);
-    if (!result) {
-      await new Promise((resolve) => setTimeout(resolve, 3000));
+    // До 4 попыток с паузами: ssh-туннель мак→VPS переустанавливается после
+    // сна/смены сети за ~10-12 сек (ServerAliveInterval=5×2 + ThrottleInterval=2
+    // в launchd-агенте com.ytsummary.tunnel) — ретраи должны перекрывать это
+    // окно, чтобы первый клик после пробуждения мака не выкидывал в deep-link.
+    // Худший случай до fallback'а: 4×1.5 + 3×3 = 15 сек.
+    let result = null;
+    for (let attempt = 0; attempt < 4 && !result; attempt++) {
+      if (attempt > 0) {
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+      }
       result = await attemptEnqueue(token, msg.videoId, 1500);
     }
     sendResponse(result || { ok: false });
