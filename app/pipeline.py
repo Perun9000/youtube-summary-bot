@@ -24,6 +24,7 @@ from app.models import VideoComment, VideoMetadata
 from app.monitoring_service import filter_segments_by_spans, format_spans_for_humans
 from app.morning_digest import MorningDigestItem
 from app.summarizer import SummaryProgress
+from app.summary_verify import find_unsupported_years, fix_unsupported_years
 from app.transcript_chunker import chunk_transcript, segments_to_text
 from app.transcript_export import save_transcript_markdown
 from app.utils import escape_html, extract_video_id
@@ -412,6 +413,44 @@ def _is_upcoming(metadata: VideoMetadata) -> bool:
     return bool(ts and ts > time.time())
 
 
+def _publish_year_from_metadata(metadata: VideoMetadata) -> str | None:
+    """Q10: год публикации ролика ("ГГГГ") из upload_date ("YYYYMMDD") —
+    легитимный контекст для find_unsupported_years. release_timestamp как
+    запасной источник (премьеры без upload_date)."""
+    if metadata.upload_date and len(metadata.upload_date) >= 4 and metadata.upload_date[:4].isdigit():
+        return metadata.upload_date[:4]
+    if metadata.release_timestamp:
+        import datetime as _dt
+
+        try:
+            return str(
+                _dt.datetime.fromtimestamp(metadata.release_timestamp, tz=_dt.timezone.utc).year
+            )
+        except (ValueError, OSError, OverflowError):
+            return None
+    return None
+
+
+def _human_publish_date(metadata: VideoMetadata) -> str:
+    """Q10: дата публикации ролика "ДД.MM.ГГГГ" для фикс-промпта. Пусто, если
+    неизвестна (yt-dlp не отдал upload_date/release_timestamp)."""
+    import datetime as _dt
+
+    if metadata.upload_date:
+        try:
+            return _dt.datetime.strptime(metadata.upload_date, "%Y%m%d").date().strftime("%d.%m.%Y")
+        except ValueError:
+            pass
+    if metadata.release_timestamp:
+        try:
+            return _dt.datetime.fromtimestamp(
+                metadata.release_timestamp, tz=_dt.timezone.utc
+            ).date().strftime("%d.%m.%Y")
+        except (ValueError, OSError, OverflowError):
+            pass
+    return ""
+
+
 def _format_local_time(services: Services, ts: float) -> str:
     """Unix-время → «04.07 18:00» в таймзоне бота (scan_tz мониторинга)."""
     import datetime as _dt
@@ -710,6 +749,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                 host_hint=host_hint,
                 llm_route=llm_route,
                 output_lang=job.lang,
+                upload_date=metadata.upload_date or None,
             ),
             base_text=generating_text,
             job=job,
@@ -736,6 +776,32 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                     summary.tags,
                     channel=_normalize_channel_simple(getattr(metadata, "channel_name", "") or ""),
                 ),
+            )
+
+        # Q10 layer 3: детерминированный верификатор (слой 2) флагает годы,
+        # не подтверждённые транскриптом (и не равные году публикации/сегодняшнему);
+        # при флаге — один точечный llm-фикс, best-effort (см. fix_unsupported_years:
+        # любая проблема → отдаём ОРИГИНАЛ, job не падает). Обязательно ДО
+        # Telegraph/доставки/кэша — все они ниже читают переменную ``summary``.
+        publish_date_human = _human_publish_date(metadata)
+        unsupported_years = find_unsupported_years(
+            summary, transcript_text, publish_year=_publish_year_from_metadata(metadata)
+        )
+        if unsupported_years:
+            logger.warning(
+                "summary.verify.flagged job_id=%s years=%s", job_id, unsupported_years
+            )
+            summary = await fix_unsupported_years(
+                summary=summary,
+                transcript_text=transcript_text,
+                unsupported_years=unsupported_years,
+                publish_date=publish_date_human,
+                generate=services.llm.generate,
+                parse=services.summarizer.parse_summary,
+                max_tokens=services.summarizer.final_max_tokens,
+                route=llm_route,
+                usage=usage,
+                job_id=job_id,
             )
 
         if not comments_task.done():

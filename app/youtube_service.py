@@ -388,6 +388,9 @@ class YouTubeService:
                     release_timestamp = float(release_raw) if release_raw else None
                 except (TypeError, ValueError):
                     release_timestamp = None
+                # Q10: "YYYYMMDD" строкой — так yt-dlp отдаёт upload_date;
+                # пустая строка, если поле отсутствует (защитный дефолт).
+                upload_date = str(info.get("upload_date") or "")
                 return VideoMetadata(
                     video_id=video_id,
                     title=title,
@@ -398,6 +401,7 @@ class YouTubeService:
                     chapters=chapters,
                     live_status=live_status,
                     release_timestamp=release_timestamp,
+                    upload_date=upload_date,
                 )
 
         try:

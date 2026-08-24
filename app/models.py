@@ -29,6 +29,12 @@ class VideoMetadata:
     # ("is_upcoming" и т.п.) и release_timestamp (unix-время выхода).
     live_status: str = ""
     release_timestamp: float | None = None
+    # Q10: дата публикации ролика как отдаёт yt-dlp — "YYYYMMDD" строкой,
+    # пустая строка если yt-dlp не отдал (безопасный дефолт). Используется
+    # для грунтовки Summarizer-промпта датами (защита от временных
+    # галлюцинаций — модель путает "текущий год" транскрипта со своим
+    # застрявшим "настоящим").
+    upload_date: str = ""
 
 
 @dataclass(frozen=True)

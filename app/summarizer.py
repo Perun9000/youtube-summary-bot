@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+import datetime as _dt
 import json
 import logging
 import re
@@ -53,6 +54,46 @@ SUMMARY_SYSTEM_PROMPT = """
 - Если устоявшегося русского аналога нет или перевод искажает смысл — оставляй оригинальный английский термин латиницей и в скобках давай короткое пояснение на русском. Примеры того, как делать НУЖНО: "burnout (профессиональное выгорание)", "flow (состояние потока, полной концентрации)", "product-market fit (соответствие продукта запросу рынка)".
 - Никогда не изобретай новые русские слова по звучанию английского.
 """.strip()
+
+
+def _format_upload_date_human(upload_date: str | None) -> str | None:
+    """"YYYYMMDD" (как отдаёт yt-dlp) → "ДД.MM.ГГГГ". None/пусто/мусор → None."""
+    if not upload_date:
+        return None
+    try:
+        parsed = _dt.datetime.strptime(upload_date, "%Y%m%d").date()
+    except (ValueError, TypeError):
+        return None
+    return parsed.strftime("%d.%m.%Y")
+
+
+def build_date_grounding_block(today_human: str, upload_date_human: str | None) -> str:
+    """Q10, слой 1: грунтовка промпта датами — профилактика временных
+    галлюцинаций (модель расшифровывает "текущий год" из уст спикера как
+    застрявшее "настоящее" своих весов, а не дату публикации ролика).
+
+    НЕ owner-переопределяемая часть (как языковая директива выше) —
+    добавляется всегда, независимо от system_prompt_provider. ДИНАМИЧЕСКАЯ:
+    дата меняется ежедневно, в отличие от остального промпта.
+    """
+    if upload_date_human:
+        return (
+            f"Сегодняшняя дата: {today_human}. Ролик опубликован: {upload_date_human}.\n"
+            "Все относительные упоминания времени в транскрипте (\"в этом году\", "
+            "\"сейчас\", \"недавно\", \"на прошлой неделе\" и т.п.) относи к ДАТЕ "
+            "ПУБЛИКАЦИИ РОЛИКА, а не к своим внутренним знаниям о текущей дате. "
+            "ЗАПРЕЩЕНО указывать в саммари конкретный год, если он не прозвучал "
+            "в транскрипте явно — не выводи год из контекста и не подставляй "
+            "год по своей догадке."
+        )
+    return (
+        f"Сегодняшняя дата: {today_human}.\n"
+        "Дата публикации ролика неизвестна. Все относительные упоминания времени "
+        "в транскрипте (\"в этом году\", \"сейчас\", \"недавно\" и т.п.) переноси "
+        "в саммари такими же относительными формулировками, без замены на "
+        "конкретный год. ЗАПРЕЩЕНО указывать в саммари конкретный год, если он "
+        "не прозвучал в транскрипте явно."
+    )
 
 
 # Схема саммари: два блока — executive summary (overview) и подробный разбор
@@ -304,6 +345,10 @@ class Summarizer:
         # Язык вывода на время текущего summarize(); "ru" — поведение как раньше
         # (весь prompt-контент уже на русском, доп. директива не нужна).
         self._output_lang: str = "ru"
+        # Q10: дата публикации ролика ("YYYYMMDD" от yt-dlp или None) на время
+        # текущего summarize() — грунтует промпт против временных
+        # галлюцинаций. См. _system_prompt_with_hint/build_date_grounding_block.
+        self._upload_date: str | None = None
 
     async def summarize(
         self,
@@ -318,12 +363,14 @@ class Summarizer:
         host_hint: str = "",
         llm_route: str = "default",
         output_lang: str = "ru",
+        upload_date: str | None = None,
     ) -> Summary:
         # Маршрут LLM и язык вывода на время этой суммаризации. Инстанс-атрибуты
         # безопасны: summary-воркер строго последовательный, конкурирующих
         # summarize нет.
         self._route = llm_route
         self._output_lang = output_lang
+        self._upload_date = upload_date
         started = time.monotonic()
         logger.info(
             "summary.start title=%r chunks=%s context_hint=%s tags_hints=%s",
@@ -625,12 +672,31 @@ class Summarizer:
                 f"{base}\n\nCRITICAL: Write ALL output text — overview, chapter titles, "
                 f"notes, and tags — strictly in {lang_name}. Do not use Russian."
             )
+        # Q10, слой 1: грунтовка датами — НЕ owner-переопределяемая часть
+        # (тот же паттерн, что языковая директива выше), добавляется всегда.
+        today_human = _dt.date.today().strftime("%d.%m.%Y")
+        date_block = build_date_grounding_block(
+            today_human, _format_upload_date_human(self._upload_date)
+        )
+        base = f"{base}\n\n{date_block}"
         if not context_hint:
             return base
         hint = context_hint.strip()
         if not hint:
             return base
         return f"{base}\n\nДополнительный контекст:\n{hint}"
+
+    def parse_summary(self, raw: str) -> Summary:
+        """Публичная обёртка над ``_parse_summary`` — используется Q10 layer 3
+        (pipeline) для парсинга ответа llm-фикса тем же парсером, что и
+        обычный summarize()."""
+        return self._parse_summary(raw)
+
+    @property
+    def final_max_tokens(self) -> int | None:
+        """max_tokens финальной стадии — Q10 layer 3 использует тот же лимит
+        для фикс-вызова."""
+        return self._final_max_tokens
 
 
 def _parse_tags_from_response(raw_tags) -> SummaryTags:
