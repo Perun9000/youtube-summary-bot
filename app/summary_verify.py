@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+import dataclasses
 import datetime as _dt
 import json
 import logging
@@ -115,13 +116,24 @@ async def fix_unsupported_years(
     Best-effort и никогда не рвёт доставку: любая проблема (исключение сети/
     бюджета, непарсибельный ответ, годы остались неподдержанными после
     фикса) — возвращаем ОРИГИНАЛЬНОЕ summary. Job не падает.
+
+    Неудачный фикс-вызов всё же инкрементит общий circuit-breaker и тратит
+    бюджет free/paid-цепочки (как любой обычный ``generate``) — осознанная
+    цена за best-effort фикс, отдельно не изолируем.
+
+    Теги в возвращаемом summary — ВСЕГДА от исходного (до-фиксного) summary,
+    не от свежераспарсенного ``fixed``: ``_parse_tags_from_response`` не
+    заполняет channel (он проставляется в pipeline ДО вызова этой функции,
+    через ``_resolve_summary_tags``/``TagsCatalog``) и не канонизирует
+    остальные теги. FIX_PROMPT и так запрещает модели трогать теги — здесь
+    просто не даём случайному дрейфу модели их деградировать.
     """
-    prompt = FIX_PROMPT.format(
-        years=", ".join(unsupported_years),
-        publish_date=publish_date or "неизвестна",
-        summary_json=serialize_summary_for_fix(summary),
-    )
     try:
+        prompt = FIX_PROMPT.format(
+            years=", ".join(unsupported_years),
+            publish_date=publish_date or "неизвестна",
+            summary_json=serialize_summary_for_fix(summary),
+        )
         raw = await generate(prompt, system=None, usage=usage, max_tokens=max_tokens, route=route)
         fixed = parse(raw)
     except Exception as exc:  # noqa: BLE001 — best-effort фикс, не роняем job
@@ -138,7 +150,7 @@ async def fix_unsupported_years(
         return summary
 
     logger.info("summary.verify.fixed=true job_id=%s", job_id)
-    return fixed
+    return dataclasses.replace(fixed, tags=summary.tags)
 
 
 def _publish_year(publish_date: str) -> str | None:

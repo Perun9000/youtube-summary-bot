@@ -10,13 +10,13 @@ from app.summary_verify import (
 )
 
 
-def make_summary(overview="", chapters=None):
+def make_summary(overview="", chapters=None, tags=None):
     return Summary(
         overview=overview,
         key_points=[],
         chapters=chapters or [],
         raw_text="{}",
-        tags=SummaryTags(),
+        tags=tags if tags is not None else SummaryTags(),
     )
 
 
@@ -122,6 +122,80 @@ async def test_fix_replaces_summary_when_years_resolved():
     )
     assert fixed.overview == "На момент записи шёл текущий год."
     assert fixed is not original
+
+
+async def test_fix_preserves_original_canonical_tags():
+    # Ревью: свежераспарсенный fixed.tags идёт из _parse_tags_from_response
+    # (сырые LLM-теги, без channel и без канонизации через TagsCatalog).
+    # Успешный фикс должен вернуть теги ИСХОДНОГО (до-фиксного) summary —
+    # они уже прошли _resolve_summary_tags в pipeline до вызова этой функции.
+    original_tags = SummaryTags(
+        topic="экономика", speakers=("Иванов",), hosts=("Петров",),
+        format="интервью", channel="Канал",
+    )
+    original = make_summary(overview="Событие произошло в 2024 году.", tags=original_tags)
+
+    async def generate_with_drifted_tags(*a, **k):
+        return (
+            '{"overview": "На момент записи шёл текущий год.", "chapters": [], '
+            '"tags": {"topic": "другое", "speakers": [], "hosts": [], "format": ""}}'
+        )
+
+    def parse_full(raw: str) -> Summary:
+        import json
+
+        from app.models import SummaryTags as _Tags
+
+        data = json.loads(raw)
+        raw_tags = data.get("tags") or {}
+        return make_summary(
+            overview=data["overview"],
+            tags=_Tags(
+                topic=raw_tags.get("topic", ""),
+                speakers=tuple(raw_tags.get("speakers", [])),
+                hosts=tuple(raw_tags.get("hosts", [])),
+                format=raw_tags.get("format", ""),
+            ),
+        )
+
+    fixed = await fix_unsupported_years(
+        summary=original,
+        transcript_text="Без годов в транскрипте.",
+        unsupported_years=["2024"],
+        publish_date="01.01.2023",
+        generate=generate_with_drifted_tags,
+        parse=parse_full,
+        max_tokens=1000,
+        route="default",
+    )
+    assert fixed.tags == original_tags
+    assert fixed.tags.channel == "Канал"
+
+
+async def test_fix_falls_back_when_prompt_building_raises():
+    # Ревью: serialize_summary_for_fix/FIX_PROMPT.format должны быть внутри
+    # try — иначе исключение там пролетает мимо best-effort фоллбэка и роняет
+    # job вместо доставки оригинала.
+    class _Explodes:
+        def __getattr__(self, name):
+            raise RuntimeError("boom during serialization")
+
+    exploding_summary = _Explodes()
+
+    async def unreachable_generate(*a, **k):
+        raise AssertionError("не должен вызываться — сериализация промпта уже упала")
+
+    result = await fix_unsupported_years(
+        summary=exploding_summary,
+        transcript_text="Без годов.",
+        unsupported_years=["2024"],
+        publish_date="",
+        generate=unreachable_generate,
+        parse=_fake_parse,
+        max_tokens=1000,
+        route="default",
+    )
+    assert result is exploding_summary
 
 
 async def test_fix_falls_back_to_original_when_generate_raises():
