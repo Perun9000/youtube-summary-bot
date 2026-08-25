@@ -25,7 +25,7 @@ from app.delivery import (
     _send_cached_summary_to_chat,
     _send_quota_denied,
 )
-from app.pipeline import _process_transcription_job, _process_youtube_job
+from app.pipeline import _is_transient_failure, _process_transcription_job, _process_youtube_job
 from app.youtube_service import purge_stale_audio_files
 
 
@@ -96,6 +96,46 @@ async def _find_duplicate_job(
     return None
 
 
+# R3: инцидент — «отправил и тишина» при сетевом моргании. Сетевой сбой на
+# кэш-доставке (не полноценный job — просто message.answer/send_message с уже
+# готовым саммари) раньше либо улетал исключением в хендлер (ручной путь),
+# либо тихо терялся в логах (local API, фоновая задача). Задержка ретрая —
+# те же 5 мин, что у первой Q4-попытки (см. TRANSIENT_RETRY_BACKOFF_UNIT_SEC
+# в app/pipeline.py); повторный проход поднимет run_deferred_jobs_scheduler,
+# _process_youtube_job увидит top-of-job кэш-хит (см. его самый верх) и
+# доставит саммари ещё раз тем же путём, что и премьеры/Q4.
+CACHED_DELIVERY_RETRY_DELAY_SEC = 300
+
+
+def _defer_lost_cached_delivery(
+    *, url: str, chat_id: int, lang: str, services: Services, source: str,
+) -> None:
+    """Завести полноценный отложенный job взамен потерянной кэш-доставки.
+
+    Не переиспользует Q4's _maybe_retry_transient_failure — та функция
+    рассчитана на job, у которого уже есть db_id (полноценная строка в jobs);
+    кэш-доставка — это НЕ job (job_store.add для неё сознательно не
+    вызывается на быстром пути, см. _enqueue_summary_job), так что здесь
+    заводим строку с нуля и сразу переводим её в deferred.
+    """
+    if services.job_store is None:
+        logger.warning(
+            "cached_delivery.retry_skipped reason=no_job_store source=%s url=%s",
+            source, url,
+        )
+        return
+    db_id = services.job_store.add(
+        url, chat_id, scheduled=False, disable_notification=False,
+        title_hint=None, lang=lang,
+    )
+    run_after = time.time() + CACHED_DELIVERY_RETRY_DELAY_SEC
+    services.job_store.set_deferred(db_id, run_after)
+    logger.warning(
+        "cached_delivery.deferred source=%s chat_id=%s url=%s db_id=%s run_after=%.0f",
+        source, chat_id, url, db_id, run_after,
+    )
+
+
 async def _enqueue_summary_job(
     message: Message,
     url: str,
@@ -124,7 +164,19 @@ async def _enqueue_summary_job(
                 "queue.cache.hit chat_id=%s video_id=%s telegraph_url=%s",
                 message.chat.id, cached.video_id, cached.telegraph_url,
             )
-            await _send_cached_summary_to_chat(message, cached, services)
+            try:
+                await _send_cached_summary_to_chat(message, cached, services)
+            except Exception as exc:
+                if not _is_transient_failure(exc):
+                    raise
+                logger.warning(
+                    "queue.cache.delivery_failed_transient chat_id=%s video_id=%s error=%s",
+                    message.chat.id, cached.video_id, exc,
+                )
+                _defer_lost_cached_delivery(
+                    url=url, chat_id=message.chat.id, lang=lang,
+                    services=services, source="manual",
+                )
             enqueued = True
             return
 
@@ -475,8 +527,18 @@ _local_api_delivery_tasks: set[asyncio.Task] = set()
 async def _deliver_cached_for_local_api(job, services, cached, video_id: str) -> None:
     try:
         await _deliver_cached_summary_for_job(job, services, cached)
-    except Exception:  # noqa: BLE001
-        logger.exception("local_api.cached_delivery_failed video_id=%s", video_id)
+    except Exception as exc:  # noqa: BLE001
+        if _is_transient_failure(exc):
+            logger.warning(
+                "local_api.cached_delivery_failed_transient video_id=%s error=%s",
+                video_id, exc,
+            )
+            _defer_lost_cached_delivery(
+                url=job.url, chat_id=job.chat_id, lang=job.lang,
+                services=services, source="local_api",
+            )
+        else:
+            logger.exception("local_api.cached_delivery_failed video_id=%s", video_id)
 
 
 # Как часто deferred-scheduler проверяет, не пришло ли время отложенных
