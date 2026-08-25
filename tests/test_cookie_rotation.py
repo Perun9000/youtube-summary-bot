@@ -25,6 +25,10 @@ def base_env(monkeypatch, tmp_path):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "1:x")
     monkeypatch.setenv("BOT_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("LLM_PROVIDER", "lmstudio")
+    # Q11: cookies are opt-in and default off (инцидент 2026-08-25) — this
+    # whole file exercises the cookie/rotation machinery, so opt in here
+    # rather than in every individual test.
+    monkeypatch.setenv("YTDLP_USE_COOKIES", "true")
 
 
 def _write_accounts(cookies_dir: Path, names: list[str]) -> None:
@@ -226,3 +230,60 @@ def test_non_ban_error_does_not_rotate(base_env, monkeypatch, tmp_path):
 
     assert metadata.title == "YouTube video vid1"
     assert FakeYDL.calls == ["acc1-attempt"]  # only one attempt, no rotation
+
+
+# ---------------------------------------------------------------------------
+# Q11: cookies are opt-in (Settings.ytdlp_use_cookies, default False)
+# ---------------------------------------------------------------------------
+
+
+def test_cookies_disabled_by_default_even_when_file_exists(monkeypatch, tmp_path):
+    """Default env (no YTDLP_USE_COOKIES): an on-disk cookie file must be
+    ignored — no cookiefile option, no ban-rotation. Инцидент 2026-08-25:
+    cookies are actively harmful in the new anon+PO-token setup."""
+    monkeypatch.setattr("app.config.load_dotenv", lambda *a, **k: None)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "1:x")
+    monkeypatch.setenv("BOT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("LLM_PROVIDER", "lmstudio")
+    monkeypatch.delenv("YTDLP_USE_COOKIES", raising=False)
+
+    cookies_path = tmp_path / "youtube.cookies.txt"
+    cookies_path.write_text("# Netscape HTTP Cookie File\n")
+    monkeypatch.setenv("YTDLP_COOKIES_PATH", str(cookies_path))
+
+    settings = load_settings()
+    assert settings.ytdlp_use_cookies is False
+
+    service = YouTubeService(settings, Database(tmp_path / "bot.db"))
+    assert service.cookie_rotation_enabled() is False
+
+    monkeypatch.setattr(youtube_service_module.yt_dlp, "YoutubeDL", FakeYDL)
+    metadata = service.fetch_metadata(URL)
+
+    assert metadata.title == "Video via None"
+    assert FakeYDL.calls == [None]  # no cookiefile passed at all
+
+
+def test_cookies_disabled_by_default_ignores_rotation_dir_too(monkeypatch, tmp_path):
+    """Same default-off flag must also suppress multi-account rotation, even
+    when data/cookies/*.txt files are present — not just the legacy single
+    file."""
+    monkeypatch.setattr("app.config.load_dotenv", lambda *a, **k: None)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "1:x")
+    monkeypatch.setenv("BOT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("LLM_PROVIDER", "lmstudio")
+    monkeypatch.delenv("YTDLP_USE_COOKIES", raising=False)
+    monkeypatch.setenv("YTDLP_COOKIES_DIR", str(tmp_path / "cookies"))
+    _write_accounts(tmp_path / "cookies", ["acc1", "acc2"])
+
+    settings = load_settings()
+    service = YouTubeService(settings, Database(tmp_path / "bot.db"))
+    assert service.cookie_rotation_enabled() is False
+
+    monkeypatch.setattr(youtube_service_module.yt_dlp, "YoutubeDL", FakeYDL)
+    metadata = service.fetch_metadata(URL)
+
+    assert metadata.title == "Video via None"
+    assert FakeYDL.calls == [None]

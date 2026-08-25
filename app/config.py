@@ -51,6 +51,7 @@ class Settings:
     telegraph_author_name: str
     ytdlp_cookies_path: Path | None
     ytdlp_cookies_dir: Path
+    ytdlp_use_cookies: bool
     ytdlp_min_interval_sec: float
     ytdlp_soft_daily_limit: int
     pot_provider_url: str
@@ -188,6 +189,15 @@ def load_settings() -> Settings:
     ytdlp_cookies_dir = Path(
         os.getenv("YTDLP_COOKIES_DIR", str(data_dir / "cookies"))
     ).expanduser()
+    # Инцидент 2026-08-25: анонимный режим (без cookies) + PO-токены + EJS-
+    # решатель дают стабильные быстрые скачивания; cookies с одного IP через
+    # NL-прокси, наоборот, ловят «The page needs to be reloaded» — сессия
+    # выглядит подозрительно на фоне «залогиненного аккаунта из другой
+    # страны». Поэтому дефолт — cookies выключены; включать явно только для
+    # age-gated контента, которому без залогиненного аккаунта не обойтись.
+    ytdlp_use_cookies = os.getenv("YTDLP_USE_COOKIES", "false").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
     monitoring_config_path = Path(
         os.getenv("MONITORING_CONFIG_PATH", str(data_dir / "monitoring.yaml"))
@@ -415,6 +425,7 @@ def load_settings() -> Settings:
         telegraph_author_name=os.getenv("TELEGRAPH_AUTHOR_NAME", "YouTube Summary Bot"),
         ytdlp_cookies_path=cookies_path,
         ytdlp_cookies_dir=ytdlp_cookies_dir,
+        ytdlp_use_cookies=ytdlp_use_cookies,
         ytdlp_min_interval_sec=ytdlp_min_interval_sec,
         ytdlp_soft_daily_limit=ytdlp_soft_daily_limit,
         pot_provider_url=pot_provider_url,

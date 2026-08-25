@@ -294,7 +294,14 @@ class YouTubeService:
             min_interval_sec=settings.ytdlp_min_interval_sec,
             soft_daily_limit=settings.ytdlp_soft_daily_limit,
         )
-        self._cookie_rotator = CookieRotator(settings.ytdlp_cookies_dir)
+        # Q11 (инцидент 2026-08-25): cookies по умолчанию выключены — см.
+        # Settings.ytdlp_use_cookies. Флаг False => передаём CookieRotator
+        # None вместо реальной директории, так что пул аккаунтов пуст даже
+        # если под YTDLP_COOKIES_DIR лежат *.txt-файлы: rotation остаётся
+        # выключенным, а не просто "не находит" куки.
+        self._cookie_rotator = CookieRotator(
+            settings.ytdlp_cookies_dir if settings.ytdlp_use_cookies else None
+        )
 
     def ytdlp_today_count(self) -> int:
         return self._usage.today_count()
@@ -659,6 +666,16 @@ class YouTubeService:
         extractor_args["youtubepot-bgutilhttp"] = {"base_url": [base_url]}
 
     def _add_cookie_option(self, options: dict, cookie_path: Path | None = None) -> None:
+        # Q11: cookies are opt-in (Settings.ytdlp_use_cookies, default False —
+        # инцидент 2026-08-25 показал, что анонимный режим с PO-токенами
+        # стабильнее, а cookies с одного IP через NL-прокси ловят "The page
+        # needs to be reloaded"). Flag off => never add cookiefile, even if a
+        # cookie file exists on disk and even in the rotation code path
+        # (though with the flag off, __init__ already hands CookieRotator
+        # ``None`` so ``cookie_path`` here will always be ``None`` too — this
+        # check is defense in depth against that invariant changing later).
+        if not self._settings.ytdlp_use_cookies:
+            return
         # cookie_path set => multi-account rotation is enabled and picked
         # this account's file; it always exists (CookieRotator only lists
         # files it found on disk). None => legacy single-file mode, same

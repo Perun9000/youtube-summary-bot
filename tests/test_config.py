@@ -52,3 +52,14 @@ def test_public_mode_flag(base_env, monkeypatch):
 
 def test_paid_fallback_budget_default(base_env):
     assert load_settings().paid_fallback_free_budget_sec == 180
+
+
+def test_ytdlp_use_cookies_default_false(base_env):
+    # Q11 (инцидент 2026-08-25): cookies выключены по умолчанию — анонимный
+    # режим + PO-токены стабильнее, cookies через прокси вредят.
+    assert load_settings().ytdlp_use_cookies is False
+
+
+def test_ytdlp_use_cookies_flag_true(base_env, monkeypatch):
+    monkeypatch.setenv("YTDLP_USE_COOKIES", "true")
+    assert load_settings().ytdlp_use_cookies is True

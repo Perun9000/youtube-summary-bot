@@ -21,7 +21,11 @@ services:
   # _add_pot_provider_option). Без публикации портов наружу — доступен
   # боту только внутри compose-сети по имени сервиса и порту 4416.
   bgutil-provider:
-    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    # Пин на конкретный тег, а не :latest — детерминизм и синхронизация с
+    # requirements.txt (bgutil-ytdlp-pot-provider>=1.3.2,<1.4): плагин и
+    # сервер разъезжаются по мажор.минору → сервер логирует warning о
+    # несовместимости (инцидент 2026-08-25).
+    image: brainicism/bgutil-ytdlp-pot-provider:1.3.2
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
