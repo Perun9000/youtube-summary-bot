@@ -25,6 +25,41 @@ class TranscriptUnavailable(Exception):
     pass
 
 
+# R1: страховочная зачистка data/audio (инцидент — 262 МБ сирот, диск VPS
+# трижды в 100%). Основной фикс — cleanup в местах, где аудио скачивается
+# (см. app/pipeline.py::_download_audio_to_chat, _process_transcription_job);
+# эта функция — второй рубеж на случай, если что-то всё же просочилось
+# (краш процесса между download_audio и cleanup, будущий новый вызывающий
+# код, который забудет удалить за собой). Вызывается при старте
+# transcription-воркера (app/queue_service.py::_transcription_queue_worker).
+AUDIO_PURGE_MAX_AGE_HOURS = 24.0
+
+
+def purge_stale_audio_files(audio_dir: Path, max_age_hours: float = AUDIO_PURGE_MAX_AGE_HOURS) -> int:
+    """Удалить файлы в ``audio_dir`` старше ``max_age_hours``. Возвращает count.
+
+    Best-effort: отсутствующая директория — не ошибка (0 удалено). Отдельный
+    файл, который не удалось удалить (гонка/permission), не валит остальную
+    зачистку — просто логируется warning'ом.
+    """
+    if not audio_dir.exists():
+        return 0
+    cutoff = time.time() - max_age_hours * 3600
+    removed = 0
+    for path in audio_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink(missing_ok=True)
+                removed += 1
+        except OSError as exc:
+            logger.warning("youtube.audio.purge_failed path=%s error=%s", path, exc)
+    if removed:
+        logger.info("youtube.audio.purge_done removed=%s dir=%s", removed, audio_dir)
+    return removed
+
+
 # Подстроки yt-dlp/YouTube-ошибок, сигнализирующие о бане/невалидности cookie
 # именно этого аккаунта (а не сетевой сбой/приватное видео/и т.п.). Источники:
 #  - "sign in to confirm" — yt-dlp сам детектит это по 'sign in' in reason.lower()

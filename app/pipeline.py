@@ -1290,39 +1290,52 @@ async def _download_audio_to_chat(
         reply_to_message_id=summary_message_id,
     )
 
+    # R1: инцидент — 262 МБ сирот в data/audio, диск VPS трижды в 100%. Этот
+    # путь качал аудио и слал его в чат, но никогда не удалял файл — ни на
+    # успехе, ни на сбое отправки. audio_path — исходный (перед возможной
+    # компрессией) файл из download_audio, send_path — то, что реально ушло в
+    # send_audio (может совпадать с audio_path, если компрессия не
+    # понадобилась, либо быть отдельным .tg.mp3 файлом). Чистим оба в finally.
     audio_path: Path | None = None
+    send_path: Path | None = None
     try:
-        audio_path = await asyncio.to_thread(services.youtube.download_audio, url)
-        audio_path = await _ensure_audio_fits_telegram(audio_path)
-    except Exception as exc:
-        logger.exception("download_audio.failed video_id=%s", video_id)
         try:
-            await progress_msg.edit_text(f"Не удалось скачать аудио: {exc}")
-        except Exception:
-            pass
-        return
+            audio_path = await asyncio.to_thread(services.youtube.download_audio, url)
+            send_path = await _ensure_audio_fits_telegram(audio_path)
+        except Exception as exc:
+            logger.exception("download_audio.failed video_id=%s", video_id)
+            try:
+                await progress_msg.edit_text(f"Не удалось скачать аудио: {exc}")
+            except Exception:
+                pass
+            return
 
-    try:
-        await services.bot.send_audio(
-            chat_id=chat_id,
-            audio=FSInputFile(str(audio_path)),
-            title=title,
-            performer=performer,
-            reply_to_message_id=summary_message_id,
-            disable_notification=True,
-        )
-        # Промежуточное «скачиваю...» больше не нужно — удалим, чтобы чат
-        # не засорять.
         try:
-            await progress_msg.delete()
-        except Exception:
-            pass
-    except Exception as exc:
-        logger.exception("download_audio.send_failed video_id=%s", video_id)
-        try:
-            await progress_msg.edit_text(f"Не удалось отправить аудио: {exc}")
-        except Exception:
-            pass
+            await services.bot.send_audio(
+                chat_id=chat_id,
+                audio=FSInputFile(str(send_path)),
+                title=title,
+                performer=performer,
+                reply_to_message_id=summary_message_id,
+                disable_notification=True,
+            )
+            # Промежуточное «скачиваю...» больше не нужно — удалим, чтобы чат
+            # не засорять.
+            try:
+                await progress_msg.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.exception("download_audio.send_failed video_id=%s", video_id)
+            try:
+                await progress_msg.edit_text(f"Не удалось отправить аудио: {exc}")
+            except Exception:
+                pass
+    finally:
+        if send_path is not None and send_path != audio_path:
+            _cleanup_audio_file(send_path)
+        if audio_path is not None:
+            _cleanup_audio_file(audio_path)
 
 
 """DISABLED: Channel publishing pipeline. Сохранено как docstring чтобы Python

@@ -26,6 +26,7 @@ from app.delivery import (
     _send_quota_denied,
 )
 from app.pipeline import _process_transcription_job, _process_youtube_job
+from app.youtube_service import purge_stale_audio_files
 
 
 logger = logging.getLogger(__name__)
@@ -702,6 +703,16 @@ async def _transcription_queue_worker(services: Services) -> None:
     Failures are logged + reported to the user; job is dropped (not retried).
     """
     logger.info("transcription_queue.worker.start")
+    # R1: страховочная зачистка сирот в data/audio на старте воркера — см.
+    # app/youtube_service.py::purge_stale_audio_files. Best-effort: отсутствие
+    # settings/bot_data_dir (лёгкие фейки Services в тестах) не должно
+    # ронять сам воркер.
+    audio_dir = getattr(getattr(services, "settings", None), "bot_data_dir", None)
+    if audio_dir is not None:
+        try:
+            purge_stale_audio_files(audio_dir / "audio")
+        except Exception:
+            logger.warning("transcription_queue.audio_purge_failed", exc_info=True)
     queue = services.transcription_queue
     if queue is None or services.transcription_queue_lock is None:
         return
