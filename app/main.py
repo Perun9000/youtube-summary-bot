@@ -102,6 +102,22 @@ async def configure_bot_commands(bot: Bot, settings: Settings) -> None:
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
 
+async def _configure_bot_commands_safely(bot: Bot, settings: Settings) -> None:
+    """R2: инцидент 2026-08-25 — краш-петля при обрыве сети на старте.
+
+    ``configure_bot_commands`` — несколько вызовов Telegram Bot API между
+    запуском контейнера и ``start_polling``. Раньше был не обёрнут: сбой сети
+    здесь (TelegramNetworkError) валил main() целиком, контейнер рестартовал
+    по кругу, пока сеть лежала. Меню команд — некритичная косметика (как и
+    ``bot.get_me()`` чуть выше в main(), тот же паттерн best-effort): если не
+    настроилось, бот всё равно должен подняться и уйти в polling.
+    """
+    try:
+        await configure_bot_commands(bot, settings)
+    except Exception:
+        logger.exception("bot.configure_commands_failed — меню команд не настроено, продолжаем")
+
+
 def configure_logging(data_dir: Path) -> None:
     logs_dir = data_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -316,7 +332,7 @@ async def main() -> None:
     else:
         logger.info("monitoring.boot enabled=false")
 
-    await configure_bot_commands(bot, settings)
+    await _configure_bot_commands_safely(bot, settings)
     await restore_pending_jobs(services)
     try:
         await maybe_send_morning_digest(services)
