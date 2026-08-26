@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -41,12 +42,24 @@ def purge_stale_audio_files(audio_dir: Path, max_age_hours: float = AUDIO_PURGE_
     Best-effort: отсутствующая директория — не ошибка (0 удалено). Отдельный
     файл, который не удалось удалить (гонка/permission), не валит остальную
     зачистку — просто логируется warning'ом.
+
+    R4: помимо файлов, сносит и пустые ``yt-*`` tmp-поддиректории старше
+    ``max_age_hours`` — второй рубеж на случай, если finally в
+    ``download_audio`` (rmtree сразу после каждого скачивания) почему-то не
+    отработал (например, kill -9 процесса между .replace() и rmtree). Только
+    ПУСТЫЕ директории — непустая (ещё активная скачка / гонка) должна
+    остаться нетронутой, её файлы уберёт собственный проход выше на
+    следующем цикле purge, когда они тоже устареют.
     """
     if not audio_dir.exists():
         return 0
     cutoff = time.time() - max_age_hours * 3600
     removed = 0
+    dirs_to_check: list[Path] = []
     for path in audio_dir.rglob("*"):
+        if path.is_dir():
+            dirs_to_check.append(path)
+            continue
         if not path.is_file():
             continue
         try:
@@ -57,6 +70,22 @@ def purge_stale_audio_files(audio_dir: Path, max_age_hours: float = AUDIO_PURGE_
             logger.warning("youtube.audio.purge_failed path=%s error=%s", path, exc)
     if removed:
         logger.info("youtube.audio.purge_done removed=%s dir=%s", removed, audio_dir)
+
+    # Глубже вложенные директории первыми, чтобы рекурсивно опустевший
+    # родитель тоже мог быть удалён в этом же проходе.
+    dirs_to_check.sort(key=lambda p: len(p.parts), reverse=True)
+    dirs_removed = 0
+    for dir_path in dirs_to_check:
+        try:
+            if any(dir_path.iterdir()):
+                continue
+            if dir_path.stat().st_mtime < cutoff:
+                dir_path.rmdir()
+                dirs_removed += 1
+        except OSError as exc:
+            logger.warning("youtube.audio.purge_dir_failed path=%s error=%s", dir_path, exc)
+    if dirs_removed:
+        logger.info("youtube.audio.purge_dirs_done removed=%s dir=%s", dirs_removed, audio_dir)
     return removed
 
 
@@ -552,13 +581,23 @@ class YouTubeService:
             with yt_dlp.YoutubeDL(options) as ydl:
                 ydl.extract_info(url, download=True)
 
-        self._run_with_cookie_rotation(build_options, perform)
+        # R4: tmp_dir никогда не удалялся — mp3 переезжает наружу через
+        # .replace(), а сама директория (и любой мусор yt-dlp внутри неё:
+        # частично скачанные .part-файлы на сетевом сбое, .ytdl-файлы
+        # прогресса) оставалась на диске навсегда (см. инцидент R1 — 262 МБ
+        # сирот, диск VPS на 100%). rmtree — best-effort finally: снести
+        # директорию нужно и на успехе (после .replace() она пустая), и на
+        # исключении (сетевой сбой/бан-ротация/TranscriptUnavailable выше).
+        try:
+            self._run_with_cookie_rotation(build_options, perform)
 
-        audio_files = sorted(tmp_dir.glob("*.mp3"))
-        if not audio_files:
-            raise TranscriptUnavailable("Не удалось скачать аудио через yt-dlp")
-        audio_files[0].replace(cached_path)
-        return cached_path
+            audio_files = sorted(tmp_dir.glob("*.mp3"))
+            if not audio_files:
+                raise TranscriptUnavailable("Не удалось скачать аудио через yt-dlp")
+            audio_files[0].replace(cached_path)
+            return cached_path
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def fetch_top_comments(
         self,
