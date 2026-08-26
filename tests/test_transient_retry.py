@@ -64,6 +64,33 @@ def test_openrouter_http_503_is_transient():
     )
 
 
+# ── Q13 follow-up: literal текст боевого инцидента (googlevideo Read timeout) ─
+# Обнаружено экспериментально ПОСЛЕ первой Q13-правки: этот классификатор
+# возвращал False на реальном тексте _classify_youtube_download_error-обёртки
+# (см. app/youtube_service.py::download_audio -> "yt-dlp не смог скачать
+# аудио: {exc}") — Q13 не сработала бы на своём же инциденте.
+
+
+def test_googlevideo_read_timed_out_is_transient():
+    assert _is_transient_failure(
+        RuntimeError(
+            "yt-dlp не смог скачать аудио: ERROR: [download] Got error: "
+            "HTTPSConnectionPool(host='rr3---sn-u15hn5-5v.googlevideo.com', "
+            "port=443): Read timed out. (read timeout=30.0)"
+        )
+    )
+
+
+def test_connection_timed_out_text_is_transient():
+    assert _is_transient_failure(RuntimeError("Connection timed out after 30s"))
+
+
+def test_private_video_text_is_still_not_transient_after_timeout_markers():
+    """Негативный контроль: новые маркеры не должны задевать существующие
+    нетранзиентные тексты (гео/age-gate/private/no-formats и т.п.)."""
+    assert not _is_transient_failure(RuntimeError("Video unavailable: Private video"))
+
+
 def test_openrouter_http_502_text_variant_is_transient():
     assert _is_transient_failure(RuntimeError("OpenRouter HTTP 502: upstream error"))
 

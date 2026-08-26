@@ -123,6 +123,17 @@ _TRANSIENT_TEXT_MARKERS: tuple[str, ...] = (
     ": http_5",
     ": connect",
     ": http_error:",
+    # Q13 follow-up (найдено экспериментально после первого прохода Q13):
+    # литеральный текст боевого инцидента — googlevideo Read timeout при
+    # скачивании аудио через yt-dlp — заворачивается download_audio-путём в
+    # RuntimeError("yt-dlp не смог скачать аудио: ... Read timed out. ...")
+    # (см. app/youtube_service.py::download_audio,
+    # _classify_youtube_download_error) и НЕ матчился ни одним маркером
+    # выше — Q13 не сработала бы на своём же инциденте. Проверено против
+    # существующих нетранзиентных текстов (geo/age-gate/private/no-formats/
+    # 402/404-обёрток) — ни один не содержит "timed out".
+    "read timed out",
+    "connection timed out",
 )
 
 # Minor: yt-dlp DownloadError (сбой скачивания видео/аудио) сюда сознательно
