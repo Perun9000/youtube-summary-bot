@@ -76,7 +76,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     updated_at REAL NOT NULL,
     run_after REAL,
     lang TEXT NOT NULL DEFAULT 'ru',
-    attempts INTEGER NOT NULL DEFAULT 0
+    attempts INTEGER NOT NULL DEFAULT 0,
+    quota_user_id INTEGER
 );
 CREATE TABLE IF NOT EXISTS morning_digest_items (
     video_id TEXT PRIMARY KEY,
@@ -153,6 +154,18 @@ class Database:
             try:
                 self._conn.execute("ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
                 logger.info("db.migrate jobs.attempts added")
+            except sqlite3.OperationalError:
+                pass  # колонка уже есть
+            # Миграция для баз, созданных до появления R5 (персист квоты):
+            # без этой колонки любой восстановленный/deferred job (рестарт,
+            # премьеры, Q4/Q8/Q12/Q13-ретраи, R3-кэш-деферралы) пересоздавался
+            # с quota_user_id=None — квота внешнего пользователя переставала
+            # проверяться и списываться. NULL = квота не применяется (owner/
+            # allowlist/scheduled) — тот же смысл, что и None у SummaryJob.
+            # quota_user_id, см. app/services_container.py.
+            try:
+                self._conn.execute("ALTER TABLE jobs ADD COLUMN quota_user_id INTEGER")
+                logger.info("db.migrate jobs.quota_user_id added")
             except sqlite3.OperationalError:
                 pass  # колонка уже есть
             self._conn.commit()

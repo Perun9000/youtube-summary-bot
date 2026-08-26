@@ -52,11 +52,11 @@ class _FakeJobStore:
         self.add_calls: list[dict] = []
         self.deferred_calls: list[dict] = []
 
-    def add(self, url, chat_id, *, scheduled, disable_notification, title_hint, lang):
+    def add(self, url, chat_id, *, scheduled, disable_notification, title_hint, lang, quota_user_id=None):
         self.add_calls.append({
             "url": url, "chat_id": chat_id, "scheduled": scheduled,
             "disable_notification": disable_notification,
-            "title_hint": title_hint, "lang": lang,
+            "title_hint": title_hint, "lang": lang, "quota_user_id": quota_user_id,
         })
         return len(self.add_calls)
 
@@ -73,8 +73,11 @@ class _FakeSettings:
 
 
 class _FakeUsers:
+    def __init__(self, allowed=True):
+        self._allowed = allowed
+
     def is_allowed(self, user_id):
-        return True  # allowlisted → no quota gate in play for these tests
+        return self._allowed
 
 
 class _FakeChat:
@@ -114,9 +117,9 @@ class _FakeBot:
 
 
 class _FakeServices:
-    def __init__(self, job_store):
+    def __init__(self, job_store, *, allowed=True):
         self.settings = _FakeSettings()
-        self.users = _FakeUsers()
+        self.users = _FakeUsers(allowed=allowed)
         self.billing = None
         self.quota = None
         self.summary_cache = None  # bypassed — _lookup_cached_summary is monkeypatched
@@ -248,13 +251,38 @@ async def test_cached_delivery_non_transient_failure_behaves_as_before(monkeypat
     assert job_store.deferred_calls == []
 
 
+async def test_cached_delivery_transient_failure_preserves_quota_user_id_for_external_user(monkeypatch):
+    """R5: кэш-доставка сама бесплатна, но если к моменту подъёма deferred-
+    строки кэш протухнет, _process_youtube_job пойдёт по пути полной
+    генерации — там квота внешнего пользователя ДОЛЖНА проверяться и
+    списываться. job_store.add обязан получить его quota_user_id, а не
+    None."""
+    cached = _FakeCachedSummary()
+    monkeypatch.setattr(queue_service, "_lookup_cached_summary", lambda url, services, lang="ru": cached)
+
+    async def failing_send(message, cached_arg, services):
+        raise _network_error()
+
+    monkeypatch.setattr(queue_service, "_send_cached_summary_to_chat", failing_send)
+
+    job_store = _FakeJobStore()
+    services = _FakeServices(job_store, allowed=False)  # внешний, не allowlist
+    external_user_id = 777
+    message = _FakeMessage(chat_id=CHAT_ID, user_id=external_user_id)
+
+    await _enqueue_summary_job(message, URL, services)
+
+    assert len(job_store.add_calls) == 1
+    assert job_store.add_calls[0]["quota_user_id"] == external_user_id
+
+
 # ── (b) local_api path: same transient/non-transient split ────────────────
 
 
-def _make_probe_job() -> SummaryJob:
+def _make_probe_job(quota_user_id: int | None = None) -> SummaryJob:
     return SummaryJob(
         sequence=0, message=None, url=URL, enqueued_at=time.monotonic(),
-        chat_id=CHAT_ID, lang="ru",
+        chat_id=CHAT_ID, lang="ru", quota_user_id=quota_user_id,
     )
 
 
@@ -277,6 +305,25 @@ async def test_local_api_cached_delivery_transient_failure_defers(monkeypatch):
     assert job_store.add_calls[0]["url"] == URL
     assert job_store.add_calls[0]["chat_id"] == CHAT_ID
     assert len(job_store.deferred_calls) == 1
+
+
+async def test_local_api_cached_delivery_preserves_quota_user_id(monkeypatch):
+    """R5: same propagation as the manual path, through job.quota_user_id."""
+    cached = _FakeCachedSummary()
+
+    async def failing_deliver(job_arg, services_arg, cached_arg):
+        raise aiohttp.ClientConnectionError("network storm")
+
+    monkeypatch.setattr(queue_service, "_deliver_cached_summary_for_job", failing_deliver)
+
+    job_store = _FakeJobStore()
+    services = _FakeServices(job_store)
+    job = _make_probe_job(quota_user_id=777)
+
+    await _deliver_cached_for_local_api(job, services, cached, VIDEO_ID)
+
+    assert len(job_store.add_calls) == 1
+    assert job_store.add_calls[0]["quota_user_id"] == 777
 
 
 async def test_local_api_cached_delivery_non_transient_failure_only_logs(monkeypatch, caplog):

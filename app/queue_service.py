@@ -108,7 +108,13 @@ CACHED_DELIVERY_RETRY_DELAY_SEC = 300
 
 
 def _defer_lost_cached_delivery(
-    *, url: str, chat_id: int, lang: str, services: Services, source: str,
+    *,
+    url: str,
+    chat_id: int,
+    lang: str,
+    services: Services,
+    source: str,
+    quota_user_id: int | None,
 ) -> None:
     """Завести полноценный отложенный job взамен потерянной кэш-доставки.
 
@@ -117,6 +123,13 @@ def _defer_lost_cached_delivery(
     кэш-доставка — это НЕ job (job_store.add для неё сознательно не
     вызывается на быстром пути, см. _enqueue_summary_job), так что здесь
     заводим строку с нуля и сразу переводим её в deferred.
+
+    ``quota_user_id`` — R5: сама кэш-доставка бесплатна (иначе повторный клик
+    по уже саммаризированному ролику жёг бы квоту), но ЕСЛИ к моменту подъёма
+    deferred-строки кэш успеет протухнуть, _process_youtube_job пойдёт по
+    обычному пути полной генерации — а там квота ДОЛЖНА проверяться и
+    списываться для внешнего пользователя. Прокидываем quota_user_id того же
+    пользователя, что и у исходной (потерянной) кэш-доставки, а не None.
     """
     if services.job_store is None:
         logger.warning(
@@ -126,7 +139,7 @@ def _defer_lost_cached_delivery(
         return
     db_id = services.job_store.add(
         url, chat_id, scheduled=False, disable_notification=False,
-        title_hint=None, lang=lang,
+        title_hint=None, lang=lang, quota_user_id=quota_user_id,
     )
     run_after = time.time() + CACHED_DELIVERY_RETRY_DELAY_SEC
     services.job_store.set_deferred(db_id, run_after)
@@ -176,6 +189,7 @@ async def _enqueue_summary_job(
                 _defer_lost_cached_delivery(
                     url=url, chat_id=message.chat.id, lang=lang,
                     services=services, source="manual",
+                    quota_user_id=quota_user_id,
                 )
                 # Best-effort: сеть, скорее всего, ещё лежит — сбой самого
                 # уведомления глотаем, деферрал уже создан и не трогаем.
@@ -237,7 +251,7 @@ async def _enqueue_summary_job(
             db_id = (
                 services.job_store.add(
                     url, message.chat.id, scheduled=False, disable_notification=False,
-                    title_hint=None, lang=lang,
+                    title_hint=None, lang=lang, quota_user_id=quota_user_id,
                 )
                 if services.job_store
                 else None
@@ -339,6 +353,10 @@ async def enqueue_scheduled_candidate(
                 disable_notification=True,
                 title_hint=title_hint,
                 lang="ru",
+                # R5: scheduled-мониторинг никогда не проверяет/списывает
+                # квоту внешнего пользователя (см. SummaryJob.quota_user_id
+                # default) — явный None, а не полагаемся на дефолт параметра.
+                quota_user_id=None,
             )
             if services.job_store
             else None
@@ -416,6 +434,12 @@ async def restore_pending_jobs(services: Services) -> int:
                 # через рестарты). transient_retries, НЕ retry_count — то поле
                 # принадлежит только LLM-availability wait loop'у ниже.
                 transient_retries=row["attempts"] if "attempts" in row.keys() else 0,
+                # R5: перенос квоты — без этого любой восстановленный после
+                # рестарта job внешнего пользователя пересоздавался бы с
+                # quota_user_id=None (квота переставала бы проверяться и
+                # списываться). "in row.keys()" — на случай старой БД без
+                # миграции (см. app/db.py).
+                quota_user_id=row["quota_user_id"] if "quota_user_id" in row.keys() else None,
             )
             services.job_store.set_status(row["id"], "queued")
             await services.summary_queue.put(job)
@@ -477,6 +501,10 @@ async def enqueue_local_api_job(video_id: str, services: Services) -> str:
             services.job_store.add(
                 url, owner_id, scheduled=False, disable_notification=False,
                 title_hint=None, lang=lang,
+                # R5: local API — всегда владелец (см. owner_id выше), квота
+                # не применяется, как и у in-memory job ниже (quota_user_id
+                # не передаётся, дефолт None).
+                quota_user_id=None,
             )
             if services.job_store
             else None
@@ -553,6 +581,7 @@ async def _deliver_cached_for_local_api(job, services, cached, video_id: str) ->
             _defer_lost_cached_delivery(
                 url=job.url, chat_id=job.chat_id, lang=job.lang,
                 services=services, source="local_api",
+                quota_user_id=job.quota_user_id,
             )
         else:
             logger.exception("local_api.cached_delivery_failed video_id=%s", video_id)
@@ -611,6 +640,9 @@ async def _requeue_due_deferred(services: Services) -> None:
                 # НЕ retry_count — то поле принадлежит только LLM-availability
                 # wait loop'у ниже, Q4 его не читает и не пишет.
                 transient_retries=row["attempts"] if "attempts" in row.keys() else 0,
+                # R5: перенос квоты — деферрал (премьера/Q4/Q8/Q12/Q13/R3)
+                # не должен терять, кому проверять/списывать квоту при подъёме.
+                quota_user_id=row["quota_user_id"] if "quota_user_id" in row.keys() else None,
             )
             services.job_store.set_status(row["id"], "queued")
             await services.summary_queue.put(job)

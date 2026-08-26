@@ -23,11 +23,11 @@ class _FakeJobStore:
     def __init__(self):
         self.calls = []
 
-    def add(self, url, chat_id, *, scheduled, disable_notification, title_hint, lang):
+    def add(self, url, chat_id, *, scheduled, disable_notification, title_hint, lang, quota_user_id=None):
         self.calls.append({
             "url": url, "chat_id": chat_id, "scheduled": scheduled,
             "disable_notification": disable_notification,
-            "title_hint": title_hint, "lang": lang,
+            "title_hint": title_hint, "lang": lang, "quota_user_id": quota_user_id,
         })
         return len(self.calls)
 

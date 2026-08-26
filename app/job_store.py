@@ -26,12 +26,23 @@ class JobStore:
         disable_notification: bool,
         title_hint: str | None,
         lang: str = "ru",
+        quota_user_id: int | None = None,
     ) -> int:
+        """``quota_user_id`` — R5: персистим квоту вместе с job'ом, чтобы
+        любое восстановление строки (рестарт, премьеры, Q4/Q8/Q12/Q13-ретраи,
+        R3-кэш-деферралы) не теряло, кому проверять/списывать квоту (см.
+        app/services_container.py::SummaryJob.quota_user_id). ``None`` —
+        квота не применяется (owner/allowlist/scheduled), тот же смысл, что
+        и NULL в БД."""
         now = time.time()
         return self._db.execute_returning_rowid(
-            "INSERT INTO jobs(url, chat_id, scheduled, disable_notification, title_hint, status, created_at, updated_at, lang) "
-            "VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
-            (url, chat_id, int(scheduled), int(disable_notification), title_hint, now, now, lang),
+            "INSERT INTO jobs(url, chat_id, scheduled, disable_notification, title_hint, status, "
+            "created_at, updated_at, lang, quota_user_id) "
+            "VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)",
+            (
+                url, chat_id, int(scheduled), int(disable_notification), title_hint, now, now,
+                lang, quota_user_id,
+            ),
         )
 
     def set_status(self, job_id: int, status: str) -> None:
