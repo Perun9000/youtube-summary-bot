@@ -141,7 +141,13 @@ def _network_error() -> TelegramNetworkError:
 # ── (a) manual path: transient failure defers instead of crashing ─────────
 
 
-async def test_cached_delivery_transient_failure_defers_instead_of_raising(monkeypatch):
+async def test_cached_delivery_transient_failure_defers_and_notifies_without_deleting(monkeypatch):
+    """Review fix: deferring the delivery must NOT delete the user's link
+    message (finally only deletes when enqueued=True) — with no status
+    message on the cache fast-path, deleting it left the user watching their
+    own message vanish, then 5 minutes of total silence, then a summary "out
+    of nowhere". Instead: best-effort retry_scheduled notice, link stays as
+    a context anchor (symmetric with the quota-denied branch)."""
     cached = _FakeCachedSummary()
     monkeypatch.setattr(queue_service, "_lookup_cached_summary", lambda url, services, lang="ru": cached)
 
@@ -164,8 +170,60 @@ async def test_cached_delivery_transient_failure_defers_instead_of_raising(monke
     assert len(job_store.deferred_calls) == 1
     run_after = job_store.deferred_calls[0]["run_after"]
     assert before + 295 <= run_after <= time.time() + 305
-    # Original link message still gets cleaned up — a proper delivery is
-    # coming later via the deferred job, same as any other enqueue.
+    # Best-effort notice sent via message.answer (Q4's retry_scheduled key).
+    assert len(message.answers) == 1
+    assert "5" in message.answers[0]
+    # Link message NOT deleted — stays as a context anchor.
+    assert message.deleted is False
+
+
+async def test_cached_delivery_transient_failure_notice_itself_failing_still_defers(monkeypatch):
+    """Network is probably still down — the best-effort notice can fail too.
+    That must not swallow the deferral or raise out of the handler."""
+    cached = _FakeCachedSummary()
+    monkeypatch.setattr(queue_service, "_lookup_cached_summary", lambda url, services, lang="ru": cached)
+
+    async def failing_send(message, cached_arg, services):
+        raise _network_error()
+
+    monkeypatch.setattr(queue_service, "_send_cached_summary_to_chat", failing_send)
+
+    job_store = _FakeJobStore()
+    services = _FakeServices(job_store)
+    message = _FakeMessage(chat_id=CHAT_ID, user_id=999)
+
+    async def failing_answer(text, **kwargs):
+        raise _network_error()
+
+    message.answer = failing_answer
+
+    # Must NOT raise even though the retry notice itself blows up.
+    await _enqueue_summary_job(message, URL, services)
+
+    assert len(job_store.add_calls) == 1
+    assert len(job_store.deferred_calls) == 1
+    assert message.deleted is False
+
+
+async def test_cached_delivery_success_still_deletes_link_message(monkeypatch):
+    """Regression guard: the happy path (no failure at all) keeps deleting
+    the source link message, same as before this fix."""
+    cached = _FakeCachedSummary()
+    monkeypatch.setattr(queue_service, "_lookup_cached_summary", lambda url, services, lang="ru": cached)
+
+    async def ok_send(message, cached_arg, services):
+        return None
+
+    monkeypatch.setattr(queue_service, "_send_cached_summary_to_chat", ok_send)
+
+    job_store = _FakeJobStore()
+    services = _FakeServices(job_store)
+    message = _FakeMessage(chat_id=CHAT_ID, user_id=999)
+
+    await _enqueue_summary_job(message, URL, services)
+
+    assert job_store.add_calls == []
+    assert job_store.deferred_calls == []
     assert message.deleted is True
 
 

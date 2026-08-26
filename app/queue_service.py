@@ -177,6 +177,23 @@ async def _enqueue_summary_job(
                     url=url, chat_id=message.chat.id, lang=lang,
                     services=services, source="manual",
                 )
+                # Best-effort: сеть, скорее всего, ещё лежит — сбой самого
+                # уведомления глотаем, деферрал уже создан и не трогаем.
+                # На кэш-фастпасе нет статус-сообщения (в отличие от Q4),
+                # без этого уведомления пользователь просто не узнал бы,
+                # что что-то вообще происходит.
+                try:
+                    await message.answer(t("status.retry_scheduled", lang, minutes=5))
+                except Exception as notify_exc:  # noqa: BLE001
+                    logger.warning(
+                        "queue.cache.delivery_retry_notice_failed chat_id=%s error=%s",
+                        message.chat.id, notify_exc,
+                    )
+                # НЕ enqueued=True: ссылка остаётся в чате как якорь контекста
+                # (симметрично quota-denied-ветке ниже) — доставка придёт
+                # позже через deferred job, удалять исходное сообщение сейчас
+                # нечем оправдать, если уведомление тоже могло не доехать.
+                return
             enqueued = True
             return
 
