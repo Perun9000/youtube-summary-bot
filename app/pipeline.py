@@ -126,12 +126,15 @@ _TRANSIENT_TEXT_MARKERS: tuple[str, ...] = (
 )
 
 # Minor: yt-dlp DownloadError (сбой скачивания видео/аудио) сюда сознательно
-# не добавлен. fetch_metadata (единственный путь, реально участвующий в Q4
-# retry-обвязке через _process_youtube_job) глотает исключения yt-dlp и
+# не добавлен как ТЕКСТОВЫЙ маркер. fetch_metadata глотает исключения yt-dlp и
 # переупаковывает их в свои собственные UserFacingError/RuntimeError с уже
 # понятным текстом — DownloadError наружу не долетает. download_audio (Groq-
-# транскрипция) — отдельный путь вне Q4-скоупа транскрипционного конвейера
-# (см. бриф ревью). Если это когда-нибудь изменится — заводить маркер тут.
+# транскрипция, см. _process_transcription_job) с Q13 участвует в том же
+# деферрал-пути (переиспользует _maybe_retry_transient_failure) — но
+# по-прежнему классифицируется общими isinstance/маркерами выше: сырой текст
+# конкретно DownloadError'а (например "Read timed out" от googlevideo) сюда
+# не заведён. Если конкретный текст понадобится ловить точнее — заводить
+# маркер тут.
 
 
 def _is_transient_failure(exc: BaseException) -> bool:
@@ -1133,6 +1136,10 @@ async def _process_transcription_job(job: SummaryJob, services: Services) -> Non
     from app.queue_service import _summary_queue_worker  # local: avoid pipeline<->queue_service cycle
     """One transcription cycle: download audio → Groq → re-enqueue."""
     started = time.monotonic()
+    # Q13: id только для лог-корреляции с _maybe_retry_transient_failure (тот
+    # же формат, что и job_id в _process_youtube_job, но своя серия — эта
+    # функция работает вне transcription-очереди, не в summary_queue).
+    job_id = f"transcription-{job.sequence}"
 
     # Status reporting: чтобы Telegram-сообщение жило, обновим его на "скачиваю аудио".
     await _set_service_status(
@@ -1153,6 +1160,17 @@ async def _process_transcription_job(job: SummaryJob, services: Services) -> Non
             "transcription_queue.audio_download.failed sequence=%s url=%s duration_sec=%.1f reason=%r error=%s",
             job.sequence, job.url, download_duration, reason, exc,
         )
+        # Q13: разовый сетевой сбой при скачивании аудио (googlevideo) не
+        # должен сразу становиться финальным failed — переиспользуем ровно
+        # тот же деферрал-путь, что и Q4/Q8 в _process_youtube_job (см.
+        # _maybe_retry_transient_failure). custom_prompt-исключение — по той
+        # же причине, что и там: deferred-requeue едет через БД, где промпт
+        # не персистится, тихий ретрай вернул бы обычное саммари вместо
+        # промптового.
+        if job.custom_prompt is None and await _maybe_retry_transient_failure(
+            job, services, exc, job_id
+        ):
+            return
         await _send_transcription_failure(services, job, reason)
         return
     download_duration = time.monotonic() - download_started
@@ -1172,6 +1190,13 @@ async def _process_transcription_job(job: SummaryJob, services: Services) -> Non
             "transcription_queue.groq_unavailable sequence=%s reason=%s",
             job.sequence, exc,
         )
+        # Q13: см. комментарий у audio_download выше — тот же деферрал, то же
+        # custom_prompt-исключение.
+        if job.custom_prompt is None and await _maybe_retry_transient_failure(
+            job, services, exc, job_id
+        ):
+            _cleanup_audio_file(audio_path)
+            return
         await _send_transcription_failure(
             services, job,
             t("error.groq_unavailable", job.lang, error=exc),
@@ -1180,6 +1205,11 @@ async def _process_transcription_job(job: SummaryJob, services: Services) -> Non
         return
     except Exception as exc:
         logger.exception("transcription_queue.groq_failed sequence=%s", job.sequence)
+        if job.custom_prompt is None and await _maybe_retry_transient_failure(
+            job, services, exc, job_id
+        ):
+            _cleanup_audio_file(audio_path)
+            return
         await _send_transcription_failure(
             services, job,
             t("error.groq_failed", job.lang, error=exc),
