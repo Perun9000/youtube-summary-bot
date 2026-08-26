@@ -413,6 +413,94 @@ def _is_upcoming(metadata: VideoMetadata) -> bool:
     return bool(ts and ts > time.time())
 
 
+# Q12: идущие прямые трансляции и только что завершившиеся эфиры (VOD ещё не
+# готов) — yt-dlp либо вообще не отдаёт формат ("No video formats found!" —
+# инцидент 2026-08-26, HQEiP5W_Wgk, live_status=is_live), либо отдаёт
+# недоделанный VOD (post_live — «эфир кончился, но обработка записи ещё
+# идёт», см. app/../.venv/.../yt_dlp/extractor/common.py:392). Обрабатываем
+# как премьеры — откладываем и возвращаемся сами, а не роняем job в сырую
+# yt-dlp ошибку. is_live проверяем реже (эфир может идти часами), post_live —
+# чаще (YouTube обычно домащивает VOD за минуты, не часы).
+LIVE_STREAM_DEFER_DELAY_SEC: dict[str, int] = {
+    "is_live": 2 * 3600,
+    "post_live": 30 * 60,
+}
+
+
+def _live_stream_kind(metadata: VideoMetadata) -> str | None:
+    """'is_live' / 'post_live', если ролик — идущая или только что
+    завершившаяся прямая трансляция без готового VOD. None для обычных
+    роликов и премьер (_is_upcoming уже отсёк 'is_upcoming' до этой проверки —
+    порядок вызовов важен, см. _process_youtube_job)."""
+    if metadata.live_status in LIVE_STREAM_DEFER_DELAY_SEC:
+        return metadata.live_status
+    return None
+
+
+async def _defer_live_stream_job(
+    job: SummaryJob,
+    services: Services,
+    metadata: VideoMetadata,
+    job_id: str,
+    live_kind: str,
+) -> None:
+    """Отложить job идущей/только что завершившейся трансляции — та же
+    deferred-механика, что и премьеры (``_defer_premiere_job``): статус
+    строки в БД → 'deferred' + run_after, поднимет её deferred-scheduler.
+
+    Бюджет попыток — ``job.transient_retries`` / ``jobs.attempts`` —
+    ОБЩИЙ с Q4/Q8 (``MAX_TRANSIENT_RETRIES`` = 3 суммарно на любой класс
+    отложенных повторов, см. комментарий над ``_maybe_retry_transient_failure``
+    и решение владельца по Q12). Лимит исчерпан, а трансляция всё ещё
+    live/post_live — честный отказ без сырой yt-dlp ошибки: поднимаем
+    ``UserFacingError(t("live.gave_up", ...))``, который уходит по тому же
+    пути, что и остальные пользовательские отказы (см. error.heavy_quota
+    выше по файлу) — общий except в ``_process_youtube_job`` отправит
+    человеческое сообщение и job уйдёт в failed через queue_service.
+    """
+    if job.transient_retries >= MAX_TRANSIENT_RETRIES:
+        logger.info(
+            "job.live_stream.gave_up job_id=%s video_id=%s live_status=%s attempts=%s",
+            job_id, metadata.video_id, live_kind, job.transient_retries,
+        )
+        raise UserFacingError(t("live.gave_up", job.lang))
+
+    title_link = f'<a href="{escape_html(job.url)}">{escape_html(metadata.title)}</a>'
+    if services.job_store is None or job.db_id is None:
+        # Отложить не через что (нет персистентной строки) — как и в
+        # _defer_premiere_job, честно просим вернуться позже без ретрая.
+        await _send_summary_delivery(
+            services=services,
+            job=job,
+            text=t("live.no_store", job.lang, title_link=title_link),
+        )
+        await _delete_service_status(services, job.chat_id)
+        return
+
+    delay_sec = LIVE_STREAM_DEFER_DELAY_SEC[live_kind]
+    run_after = time.time() + delay_sec
+    job.transient_retries += 1
+    job.deferred_until = run_after
+    services.job_store.set_deferred(job.db_id, run_after, attempts=job.transient_retries)
+    logger.info(
+        "job.live_stream.deferred job_id=%s video_id=%s live_status=%s attempts=%s run_after=%.0f",
+        job_id, metadata.video_id, live_kind, job.transient_retries, run_after,
+    )
+
+    if live_kind == "is_live":
+        text = t(
+            "live.deferred", job.lang,
+            title_link=title_link, hours=delay_sec // 3600,
+        )
+    else:
+        text = t(
+            "live.post_live", job.lang,
+            title_link=title_link, minutes=delay_sec // 60,
+        )
+    await _send_summary_delivery(services=services, job=job, text=text)
+    await _delete_service_status(services, job.chat_id)
+
+
 def _publish_year_from_metadata(metadata: VideoMetadata) -> str | None:
     """Q10: год публикации ролика ("ГГГГ") из upload_date ("YYYYMMDD") —
     легитимный контекст для find_unsupported_years. release_timestamp как
@@ -586,6 +674,15 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
         # в очередь через PREMIERE_SUMMARY_DELAY_HOURS после релиза.
         if _is_upcoming(metadata):
             await _defer_premiere_job(job, services, metadata, job_id)
+            return
+
+        # Q12: идущая или только что завершившаяся прямая трансляция — та же
+        # ситуация "контента ещё нет" на практике (yt-dlp падает "No video
+        # formats found!" вместо отдачи форматов), детект ДО транскрипта и
+        # квоты — квота не жжётся за ролик, который всё равно откладывается.
+        live_kind = _live_stream_kind(metadata)
+        if live_kind is not None:
+            await _defer_live_stream_job(job, services, metadata, job_id, live_kind)
             return
 
         if job.pre_fetched_segments is not None:
