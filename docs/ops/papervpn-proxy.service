@@ -1,0 +1,13 @@
+[Unit]
+Description=PaperVPN shadowsocks HTTP proxy for bot
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+ExecStartPre=-/usr/local/bin/papervpn-refresh
+ExecStart=/usr/local/bin/sslocal -c /etc/papervpn-sslocal.json
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

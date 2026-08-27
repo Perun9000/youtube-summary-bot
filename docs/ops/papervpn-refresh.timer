@@ -1,0 +1,7 @@
+[Unit]
+Description=Refresh PaperVPN config every 10 min
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+[Install]
+WantedBy=timers.target

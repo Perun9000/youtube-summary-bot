@@ -1,0 +1,11 @@
+# Только для этого сервера: httpx (OpenRouter/Groq/Telegraph) и yt-dlp (YouTube)
+# ходят через PaperVPN-прокси на хосте (googlevideo/медиа — только через прокси,
+# youtube.com API/субтитры — НАПРЯМУЮ с 2026-08-14: прокси-апстрим деградировал
+# и ронял все yt-dlp вызовы, а прямой доступ к API из ДЦ работает); aiogram проксю не читает — Telegram
+# идёт напрямую (из РФ доступен).
+services:
+  bot:
+    environment:
+      HTTP_PROXY: "http://host.docker.internal:8118"
+      HTTPS_PROXY: "http://host.docker.internal:8118"
+      NO_PROXY: "localhost,127.0.0.1,api.telegram.org"

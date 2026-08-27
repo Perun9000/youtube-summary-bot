@@ -1,0 +1,5 @@
+[Unit]
+Description=Refresh PaperVPN dynamic key config
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/papervpn-refresh --restart
