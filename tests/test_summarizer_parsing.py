@@ -21,15 +21,18 @@ import pytest
     "prompt", [SUMMARY_JSON_PROMPT, SYNTHESIS_PROMPT, COMPACT_SUMMARY_PROMPT],
 )
 def test_overview_schema_requires_paragraph_breaks(prompt):
-    # Схема поля "overview" должна требовать 2-4 абзаца, разделённых \n\n
-    # (буквально — экранированная последовательность внутри строки промпта),
-    # с главной мыслью в первом абзаце.
+    # Схема поля "overview" должна требовать 2-4 абзаца, разделённых пустой
+    # строкой, с главной мыслью в первом абзаце. Буквальный пример эскейпа
+    # (\\n\\n) из промпта убран: модели копировали его в текст саммари
+    # литеральными символами (кейс CqiM9HUHMO8, 2026-08-28).
     assert '"overview"' in prompt
     overview_line = next(
         line for line in prompt.splitlines() if '"overview"' in line
     )
-    assert "\\n\\n" in overview_line
+    assert "разделённых пустой строкой" in overview_line
     assert "абзац" in overview_line.lower()
+    # Запрет буквального примера эскейпа в промпте (анти-регрессия):
+    assert "\\n\\n" not in overview_line
 
 
 VALID = '{"overview": "Кратко о ролике.", "chapters": [{"start": "00:01", "title": "Глава", "notes": "Текст."}], "tags": {"topic": "финансы", "speakers": ["Иванов"], "hosts": [], "format": "интервью"}}'
@@ -131,3 +134,29 @@ async def test_single_chunk_reasoning_output_fails_summarize():
     summarizer = Summarizer(_ReasoningOnlyLLM(), system_prompt_provider=lambda: "sys")
     with pytest.raises(SummaryUnusableError):
         await summarizer.summarize(url="https://youtu.be/x", title="t", chunks=["один чанк"])
+
+
+def test_parse_summary_unescapes_literal_backslash_n():
+    summarizer = Summarizer(_ReasoningOnlyLLM(), system_prompt_provider=lambda: "sys")
+    """Некоторые модели переусердствуют с экранированием: пишут в JSON
+    двойной бэкслеш (\\\\n\\\\n), который после json.loads остаётся в тексте
+    ЛИТЕРАЛЬНЫМИ символами «\\n\\n» — боевой кейс CqiM9HUHMO8, 2026-08-28.
+    Парсер обязан превращать их в настоящие переводы строк."""
+    raw = (
+        '{"overview": "Первый абзац.\\\\n\\\\nВторой абзац.",'
+        ' "chapters": [{"title": "Глава", "notes": "Тезис.\\\\n\\\\nЕщё тезис."}],'
+        ' "tags": {}}'
+    )
+    summary = summarizer._parse_summary(raw)
+    backslash = chr(92)
+    assert backslash + "n" not in summary.overview
+    assert "Первый абзац.\n\nВторой абзац." == summary.overview
+    assert backslash + "n" not in summary.chapters[0].notes
+    assert "Тезис.\n\nЕщё тезис." == summary.chapters[0].notes
+
+
+def test_parse_summary_keeps_properly_escaped_newlines():
+    summarizer = Summarizer(_ReasoningOnlyLLM(), system_prompt_provider=lambda: "sys")
+    raw = '{"overview": "Абзац один.\\n\\nАбзац два.", "chapters": [], "tags": {}}'
+    summary = summarizer._parse_summary(raw)
+    assert summary.overview == "Абзац один.\n\nАбзац два."
