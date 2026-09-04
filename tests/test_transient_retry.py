@@ -452,3 +452,17 @@ async def test_llm_wait_retry_count_does_not_block_transient_retry(tmp_path):
     row = job_store._db.query_one("SELECT * FROM jobs WHERE id = ?", (job.db_id,))
     assert row["status"] == "deferred"
     assert row["attempts"] == 1
+
+
+def test_intermittent_signin_botcheck_is_transient():
+    """«Sign in to confirm you're not a bot» на анонимном потоке — перемежающийся
+    бот-чек YouTube (боевой кейс u_CGWHntxz8, 2026-08-28: отказ, а через минуту
+    та же ссылка качается; 8 отказов на 44 успеха за сутки). Лечится повтором
+    через 5 мин — классифицируем как транзиент. Настоящий age-gate после
+    3 попыток получит прежний честный отказ."""
+    exc = RuntimeError(
+        "yt-dlp не смог скачать аудио: ERROR: [youtube] u_CGWHntxz8: Sign in to "
+        "confirm you’re not a bot. Use --cookies-from-browser or --cookies"
+    )
+    from app.pipeline import _is_transient_failure
+    assert _is_transient_failure(exc) is True

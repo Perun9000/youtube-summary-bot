@@ -133,6 +133,11 @@ _TRANSIENT_TEXT_MARKERS: tuple[str, ...] = (
     # существующих нетранзиентных текстов (geo/age-gate/private/no-formats/
     # 402/404-обёрток) — ни один не содержит "timed out".
     "read timed out",
+    # Перемежающийся анти-бот YouTube на анонимном потоке (2026-08-28,
+    # u_CGWHntxz8: отказ → та же ссылка качается через минуту; 8 отказов
+    # на 44 успеха/сутки). Настоящий age-gate исчерпает 3 ретрая и получит
+    # прежний честный отказ через _YT_DLP_ERROR_HINTS.
+    "sign in to confirm",
     "connection timed out",
 )
 
