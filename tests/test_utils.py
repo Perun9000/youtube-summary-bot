@@ -32,3 +32,33 @@ def test_extract_youtube_url_rejects_foreign():
 def test_format_ts():
     assert format_ts(65) == "01:05"
     assert format_ts(3665) == "01:01:05"
+
+
+class TestSchemelessYoutubeUrls:
+    """Telegram авто-линкует голые домены, и пользователи шлют ссылки без
+    https:// (боевой кейс 2026-09-09: «youtube.com/shorts/wFOCW9JVe60» не
+    распознался как URL вообще — бот ответил дежурной подсказкой).
+    Безсхемное распознавание — ТОЛЬКО для YouTube-хостов, чтобы не ловить
+    ложные срабатывания на произвольном тексте с точками."""
+
+    def test_bare_shorts_link(self):
+        url = extract_youtube_url("глянь youtube.com/shorts/wFOCW9JVe60 топ")
+        assert url == "https://youtube.com/shorts/wFOCW9JVe60"
+
+    def test_bare_watch_link_with_www(self):
+        url = extract_youtube_url("www.youtube.com/watch?v=dQw4w9WgXcQ")
+        assert url == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+    def test_bare_youtu_be(self):
+        url = extract_youtube_url("youtu.be/dQw4w9WgXcQ")
+        assert url == "https://youtu.be/dQw4w9WgXcQ"
+
+    def test_schemed_link_still_works(self):
+        url = extract_youtube_url("https://m.youtube.com/watch?v=dQw4w9WgXcQ")
+        assert url == "https://m.youtube.com/watch?v=dQw4w9WgXcQ"
+
+    def test_bare_non_youtube_domain_ignored(self):
+        assert extract_youtube_url("зацени vimeo.com/12345") is None
+
+    def test_plain_text_with_dots_ignored(self):
+        assert extract_youtube_url("посмотри позже. ок?") is None

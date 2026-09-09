@@ -19,15 +19,28 @@ def extract_first_url(text: str) -> str | None:
     return match.group(0).rstrip(".,;)")
 
 
+# Безсхемные YouTube-ссылки: Telegram авто-линкует голые домены, и пользователи
+# регулярно шлют «youtube.com/shorts/…» без https:// (кейс 2026-09-09) —
+# extract_first_url их не видит (требует схему). Матчим ТОЛЬКО известные
+# YouTube-хосты, чтобы произвольный текст с точками не превращался в URL.
+_BARE_YOUTUBE_URL_RE = re.compile(
+    r"(?<![\w/.])((?:www\.|m\.)?(?:youtube\.com|youtu\.be)/[^\s<>]+)",
+    re.IGNORECASE,
+)
+
+
 def extract_youtube_url(text: str) -> str | None:
     url = extract_first_url(text)
-    if not url:
+    if url:
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        if host in YOUTUBE_HOSTS or host.endswith(".youtube.com"):
+            return url
         return None
 
-    parsed = urlparse(url)
-    host = parsed.netloc.lower()
-    if host in YOUTUBE_HOSTS or host.endswith(".youtube.com"):
-        return url
+    bare = _BARE_YOUTUBE_URL_RE.search(text)
+    if bare:
+        return "https://" + bare.group(1).rstrip(".,;)")
     return None
 
 
