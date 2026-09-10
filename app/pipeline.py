@@ -24,7 +24,12 @@ from app.models import VideoComment, VideoMetadata
 from app.monitoring_service import filter_segments_by_spans, format_spans_for_humans
 from app.morning_digest import MorningDigestItem
 from app.summarizer import SummaryProgress
-from app.summary_verify import find_unsupported_years, fix_unsupported_years
+from app.summary_verify import (
+    find_unsupported_years,
+    find_untranslated_anglicisms,
+    fix_unsupported_years,
+    fix_untranslated_anglicisms,
+)
 from app.transcript_chunker import chunk_transcript, segments_to_text
 from app.transcript_export import save_transcript_markdown
 from app.utils import escape_html, extract_video_id
@@ -919,6 +924,27 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                 usage=usage,
                 job_id=job_id,
             )
+
+        # Англицизмы в русском саммари («leadership», «erosion» — кейс
+        # 2026-09-10): детектор + один best-effort llm-фикс, той же схемой,
+        # что Q10 выше. Только для ru — для остальных языков латиница в
+        # тексте норма. После года-фикса, чтобы проверять итоговый текст.
+        if job.lang == "ru":
+            anglicisms = find_untranslated_anglicisms(summary)
+            if anglicisms:
+                logger.warning(
+                    "summary.anglicisms.flagged job_id=%s words=%s", job_id, anglicisms
+                )
+                summary = await fix_untranslated_anglicisms(
+                    summary=summary,
+                    anglicisms=anglicisms,
+                    generate=services.llm.generate,
+                    parse=services.summarizer.parse_summary,
+                    max_tokens=services.summarizer.final_max_tokens,
+                    route=llm_route,
+                    usage=usage,
+                    job_id=job_id,
+                )
 
         if not comments_task.done():
             await _set_service_status(

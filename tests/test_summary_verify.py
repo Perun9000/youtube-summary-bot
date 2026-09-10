@@ -262,3 +262,190 @@ async def test_fix_falls_back_when_years_still_unsupported_after_fix():
         route="default",
     )
     assert result is original
+
+
+# --- Англицизмы: find_untranslated_anglicisms (детектор, слой 2) ---
+
+from app.summary_verify import find_untranslated_anglicisms, fix_untranslated_anglicisms  # noqa: E402
+
+
+def test_lowercase_anglicisms_are_flagged_sorted():
+    summary = make_summary(
+        overview="Сомнения в компетентности leadership растут, идёт erosion аксиом."
+    )
+    assert find_untranslated_anglicisms(summary) == ["erosion", "leadership"]
+
+
+def test_capitalized_brands_and_names_are_not_flagged():
+    summary = make_summary(
+        overview="Обзор iPhone 16 Pro и Samsung Galaxy: сравнение с Google Pixel на YouTube."
+    )
+    assert find_untranslated_anglicisms(summary) == []
+
+
+def test_sanctioned_term_with_russian_gloss_is_not_flagged():
+    # Формат «term (пояснение)» разрешён системным промптом — не флагаем.
+    summary = make_summary(
+        overview="Автор описывает burnout (профессиональное выгорание) у фаундеров."
+    )
+    assert find_untranslated_anglicisms(summary) == []
+
+
+def test_sanctioned_multiword_term_with_gloss_is_not_flagged():
+    summary = make_summary(
+        overview="Ключ — product-market fit (соответствие продукта запросу рынка)."
+    )
+    assert find_untranslated_anglicisms(summary) == []
+
+
+def test_run_with_capitalized_token_is_treated_as_name():
+    # «beta» в связке с «macOS Tahoe» — часть названия, не англицизм.
+    summary = make_summary(overview="Вышло обновление macOS Tahoe beta для всех.")
+    assert find_untranslated_anglicisms(summary) == []
+
+
+def test_short_latin_tokens_are_ignored():
+    summary = make_summary(overview="Файл лежит в git и в zip, всё ок.")
+    assert find_untranslated_anglicisms(summary) == []
+
+
+def test_domain_like_tokens_are_ignored():
+    summary = make_summary(overview="Сайт youtube.com упомянут вскользь.")
+    assert find_untranslated_anglicisms(summary) == []
+
+
+def test_anglicisms_in_chapters_are_caught_and_deduped():
+    summary = make_summary(
+        overview="Про leadership.",
+        chapters=[
+            Chapter(start="", title="Кризис leadership", notes="Наступает erosion доверия."),
+        ],
+    )
+    assert find_untranslated_anglicisms(summary) == ["erosion", "leadership"]
+
+
+def test_clean_russian_text_returns_empty():
+    summary = make_summary(overview="Полностью русский текст без вкраплений.")
+    assert find_untranslated_anglicisms(summary) == []
+
+
+# --- Англицизмы: fix_untranslated_anglicisms (llm-фикс, слой 3) ---
+
+
+async def test_anglicism_fix_replaces_summary_and_keeps_original_tags():
+    original_tags = SummaryTags(
+        topic="политика", speakers=("Иванов",), hosts=(), format="анализ", channel="Канал",
+    )
+    original = make_summary(
+        overview="Сомнения в компетентности leadership растут.", tags=original_tags,
+    )
+
+    async def generate_fixed(*a, **k):
+        return (
+            '{"overview": "Сомнения в компетентности руководства растут.", "chapters": [], '
+            '"tags": {"topic": "другое", "speakers": [], "hosts": [], "format": ""}}'
+        )
+
+    fixed = await fix_untranslated_anglicisms(
+        summary=original,
+        anglicisms=["leadership"],
+        generate=generate_fixed,
+        parse=_fake_parse,
+        max_tokens=1000,
+        route="default",
+    )
+    assert fixed.overview == "Сомнения в компетентности руководства растут."
+    assert fixed.tags == original_tags
+
+
+async def test_anglicism_fix_accepts_partial_improvement():
+    original = make_summary(overview="Тут erosion и leadership одновременно.")
+
+    async def generate_partial(*a, **k):
+        return '{"overview": "Тут размывание и leadership одновременно.", "chapters": [], "tags": {}}'
+
+    fixed = await fix_untranslated_anglicisms(
+        summary=original,
+        anglicisms=["erosion", "leadership"],
+        generate=generate_partial,
+        parse=_fake_parse,
+        max_tokens=1000,
+        route="default",
+    )
+    assert fixed.overview == "Тут размывание и leadership одновременно."
+
+
+async def test_anglicism_fix_falls_back_when_nothing_improved():
+    original = make_summary(overview="Опять erosion доверия.")
+
+    async def generate_same(*a, **k):
+        return '{"overview": "Опять erosion доверия!", "chapters": [], "tags": {}}'
+
+    result = await fix_untranslated_anglicisms(
+        summary=original,
+        anglicisms=["erosion"],
+        generate=generate_same,
+        parse=_fake_parse,
+        max_tokens=1000,
+        route="default",
+    )
+    assert result is original
+
+
+async def test_anglicism_fix_falls_back_when_generate_raises():
+    original = make_summary(overview="Опять erosion доверия.")
+
+    async def boom(*a, **k):
+        raise RuntimeError("OPENROUTER_BUDGET_EXCEEDED")
+
+    result = await fix_untranslated_anglicisms(
+        summary=original,
+        anglicisms=["erosion"],
+        generate=boom,
+        parse=_fake_parse,
+        max_tokens=1000,
+        route="default",
+    )
+    assert result is original
+
+
+async def test_anglicism_fix_falls_back_when_response_unparsable():
+    original = make_summary(overview="Опять erosion доверия.")
+
+    async def bad_generate(*a, **k):
+        return "не json"
+
+    def raising_parse(raw: str) -> Summary:
+        raise ValueError("bad json")
+
+    result = await fix_untranslated_anglicisms(
+        summary=original,
+        anglicisms=["erosion"],
+        generate=bad_generate,
+        parse=raising_parse,
+        max_tokens=1000,
+        route="default",
+    )
+    assert result is original
+
+
+async def test_anglicism_fix_gloss_format_counts_as_resolved():
+    # Модель оставила термин, но добавила пояснение в скобках — санкционированный
+    # формат, детектор его больше не флагает → фикс принимается.
+    original = make_summary(overview="Главное — качественный flow работы.")
+
+    async def generate_glossed(*a, **k):
+        return (
+            '{"overview": "Главное — качественный flow (состояние потока) работы.", '
+            '"chapters": [], "tags": {}}'
+        )
+
+    fixed = await fix_untranslated_anglicisms(
+        summary=original,
+        anglicisms=["flow"],
+        generate=generate_glossed,
+        parse=_fake_parse,
+        max_tokens=1000,
+        route="default",
+    )
+    assert "flow (состояние потока)" in fixed.overview
