@@ -895,6 +895,13 @@ class OpenRouterClient:
             #   Chutes, DeepInfra) упёрся в свой суточный USD-cap для free-trafic.
             #   У разных моделей в цепочке — разные провайдеры, поэтому
             #   следующая в chain'е может ответить нормально.
+            # - 403: у OpenRouter это МОДЕЛЬ-специфичный отказ, не «плохой
+            #   ключ» (тот — 401): гейт free-модели (боевой инцидент
+            #   2026-09-11 — «only available on agentic harnesses» у
+            #   thinkingmachines/inkling-small:free) или модерация входа
+            #   конкретной модели. Следующая модель в цепочке может ответить
+            #   нормально; если 403 вернут все — уйдём в FREE_CHAIN_EXHAUSTED,
+            #   который pipeline (Q8) перезапускает сам.
             # - 404: модель убрана из каталога (OpenRouter периодически снимает
             #   free-тариф — «This model is unavailable for free»). Умершая
             #   модель не должна ронять job: следующая в цепочке живая.
@@ -902,7 +909,7 @@ class OpenRouterClient:
             # - 400 с context-length-exceeded телом — см. отдельную проверку
             #   ниже (_is_context_overflow_error_body); прочие 400 остаются
             #   non-retriable.
-            if status in (429, 402, 404) or 500 <= status < 600:
+            if status in (429, 402, 403, 404) or 500 <= status < 600:
                 detail = response.text.strip().replace("\n", " ")[:300]
                 exc = RuntimeError(f"OpenRouter HTTP {status}: {detail}")
                 raise _OpenRouterRetriable(f"http_{status}", exc)
@@ -920,7 +927,8 @@ class OpenRouterClient:
             try:
                 _raise_for_status(response, "OpenRouter")
             except RuntimeError as exc:
-                # Non-retriable: 401, 403, 404, 4xx (кроме 429/402), etc.
+                # Non-retriable: 401 (плохой ключ), прочие 4xx
+                # (кроме 429/402/403/404 и 400-context-overflow выше).
                 raise
 
             data = response.json()

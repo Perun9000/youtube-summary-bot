@@ -123,7 +123,8 @@ _TRANSIENT_TEXT_MARKERS: tuple[str, ...] = (
     "connect_error",
     # short_reason-суффиксы обёртки "не ответил после N попыток: {reason}"
     # (см. комментарий выше) — намеренно не включают ": http_429"/": http_402"/
-    # ": http_404".
+    # ": http_403"/": http_404": эти статусы обрабатывает сама free-цепочка
+    # (trying_next), а полное исчерпание — Q8-механика (exhaustion retry).
     ": timeout",
     ": http_5",
     ": connect",
