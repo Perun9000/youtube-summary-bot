@@ -449,3 +449,146 @@ async def test_anglicism_fix_gloss_format_counts_as_resolved():
         route="default",
     )
     assert "flow (состояние потока)" in fixed.overview
+
+
+# --- Корректорский проход: proofread_summary (опечатки/грамматика, слой 3) ---
+
+from app.summary_verify import proofread_summary  # noqa: E402
+
+
+async def test_proofread_fixes_typos_and_keeps_original_tags():
+    original_tags = SummaryTags(
+        topic="социология", speakers=("Гость",), hosts=("Гордеева",),
+        format="интервью", channel="Канал",
+    )
+    original = make_summary(
+        overview="Опросы фиктируют поддержку, маскируя депотизацию и решение об войне.",
+        tags=original_tags,
+    )
+
+    async def generate_fixed(*a, **k):
+        return (
+            '{"overview": "Опросы фиксируют поддержку, маскируя деполитизацию и решение о войне.", '
+            '"chapters": [], "tags": {"topic": "другое", "speakers": [], "hosts": [], "format": ""}}'
+        )
+
+    result = await proofread_summary(
+        summary=original,
+        generate=generate_fixed,
+        parse=_fake_parse,
+        max_tokens=1000,
+        route="default",
+    )
+    assert "фиксируют" in result.overview
+    assert "деполитизацию" in result.overview
+    assert "о войне" in result.overview
+    assert result.tags == original_tags
+
+
+async def test_proofread_reverts_on_heavy_rewrite():
+    original = make_summary(
+        overview="Опросы фиктируют поддержку войны, которой на деле нет: у большинства "
+        "россиян нет сформулированного политического мнения, а декларативное согласие "
+        "маскирует глубокую депотизацию и недоверие к власти."
+    )
+
+    async def generate_rewrite(*a, **k):
+        return (
+            '{"overview": "Совсем другой краткий текст ни о чём.", "chapters": [], "tags": {}}'
+        )
+
+    result = await proofread_summary(
+        summary=original,
+        generate=generate_rewrite,
+        parse=_fake_parse,
+        max_tokens=1000,
+        route="default",
+    )
+    assert result is original
+
+
+async def test_proofread_reverts_when_chapter_count_changes():
+    original = make_summary(
+        overview="Текст без ошибок.",
+        chapters=[
+            Chapter(start="00:00", title="Глава один", notes="Заметки один."),
+            Chapter(start="10:00", title="Глава два", notes="Заметки два."),
+        ],
+    )
+
+    async def generate_dropped_chapter(*a, **k):
+        return (
+            '{"overview": "Текст без ошибок.", '
+            '"chapters": [{"title": "Глава один", "notes": "Заметки один."}], "tags": {}}'
+        )
+
+    def parse_with_chapters(raw: str) -> Summary:
+        import json
+
+        data = json.loads(raw)
+        return make_summary(
+            overview=data["overview"],
+            chapters=[Chapter(start="", title=c["title"], notes=c["notes"]) for c in data["chapters"]],
+        )
+
+    result = await proofread_summary(
+        summary=original,
+        generate=generate_dropped_chapter,
+        parse=parse_with_chapters,
+        max_tokens=1000,
+        route="default",
+    )
+    assert result is original
+
+
+async def test_proofread_accepts_unchanged_text():
+    original = make_summary(overview="Текст полностью без ошибок и без правок.")
+
+    async def generate_same(*a, **k):
+        return (
+            '{"overview": "Текст полностью без ошибок и без правок.", "chapters": [], "tags": {}}'
+        )
+
+    result = await proofread_summary(
+        summary=original,
+        generate=generate_same,
+        parse=_fake_parse,
+        max_tokens=1000,
+        route="default",
+    )
+    assert result.overview == original.overview
+
+
+async def test_proofread_falls_back_when_generate_raises():
+    original = make_summary(overview="Опросы фиктируют поддержку.")
+
+    async def boom(*a, **k):
+        raise RuntimeError("OPENROUTER_FREE_CHAIN_EXHAUSTED")
+
+    result = await proofread_summary(
+        summary=original,
+        generate=boom,
+        parse=_fake_parse,
+        max_tokens=1000,
+        route="default",
+    )
+    assert result is original
+
+
+async def test_proofread_falls_back_when_response_unparsable():
+    original = make_summary(overview="Опросы фиктируют поддержку.")
+
+    async def bad_generate(*a, **k):
+        return "не json"
+
+    def raising_parse(raw: str) -> Summary:
+        raise ValueError("bad json")
+
+    result = await proofread_summary(
+        summary=original,
+        generate=bad_generate,
+        parse=raising_parse,
+        max_tokens=1000,
+        route="default",
+    )
+    assert result is original

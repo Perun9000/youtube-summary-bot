@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 import dataclasses
 import datetime as _dt
+import difflib
 import json
 import logging
 import re
@@ -268,6 +269,102 @@ async def fix_untranslated_anglicisms(
         return summary
 
     logger.info("summary.anglicisms.fixed=true job_id=%s remaining=%s", job_id, remaining)
+    return dataclasses.replace(fixed, tags=summary.tags)
+
+
+# --- Корректорский проход (кейс 2026-09-17: «фиктируют», «депотизация»,
+# «об войне» от nemotron в ролике BUUQZTTnMyM) ---
+#
+# Стохастический брак генерации на русском: «съеденные» буквы/слоги и кривые
+# предлоги. Детерминированный словарный гейт не работает: pymorphy3/OpenCorpora
+# не знает современную лексику — замер по боевому кэшу (2072 саммари) дал
+# 86-90% ложных срабатываний. Поэтому проход БЕЗУСЛОВНЫЙ (для ru — гейт в
+# pipeline): один дополнительный llm-вызов на саммари, а от переписывания
+# текста моделью защищают структурные гейты ниже (число глав + сходство
+# текста по difflib).
+
+PROOFREAD_PROMPT = """
+Ты — корректор русского текста. В саммари ниже (JSON) могут быть опечатки,
+сделанные генератором.
+
+Исправь ТОЛЬКО:
+- орфографические опечатки и «съеденные» буквы или слоги (примеры реальных
+  ошибок: «фиктируют» → «фиксируют», «депотизация» → «деполитизация»);
+- грубые грамматические ошибки: неверные предлоги («об войне» → «о войне»),
+  рассогласование падежей и чисел.
+
+НЕ переформулируй предложения, НЕ сокращай и НЕ дополняй текст, НЕ меняй
+структуру, порядок глав и теги. Иностранные названия и термины латиницей
+оставь как есть. Если ошибок нет — верни текст без изменений.
+
+Верни ТОЛЬКО JSON той же схемы, без markdown-обёртки и без комментариев:
+{{"overview": "...", "chapters": [{{"title": "...", "notes": "..."}}], "tags": {{"topic": "...", "speakers": [...], "hosts": [...], "format": "..."}}}}
+
+Саммари для исправления:
+{summary_json}
+""".strip()
+
+# Порог сходства оригинал↔результат: правка опечаток меняет единичные буквы
+# (ratio ≈ 0.99), переписывание текста роняет ratio намного ниже. 0.9 —
+# с запасом на несколько исправлений в коротком overview.
+_PROOFREAD_MIN_SIMILARITY = 0.9
+
+
+def _summary_plain_text(summary: Summary) -> str:
+    parts = [summary.overview]
+    for chapter in summary.chapters:
+        parts.append(chapter.title)
+        parts.append(chapter.notes)
+    return "\n".join(parts)
+
+
+async def proofread_summary(
+    *,
+    summary: Summary,
+    generate: Callable[..., Awaitable[str]],
+    parse: Callable[[str], Summary],
+    max_tokens: int | None,
+    route: str,
+    usage=None,
+    job_id: str = "",
+) -> Summary:
+    """Один корректорский llm-проход, best-effort: правка опечаток и грубой
+    грамматики. Любая проблема (ошибка вызова/парсинга, изменившаяся
+    структура, слишком сильно переписанный текст) → возвращаем ОРИГИНАЛ,
+    job не падает. Теги всегда от исходного summary (см. fix_unsupported_years).
+    """
+    try:
+        prompt = PROOFREAD_PROMPT.format(summary_json=serialize_summary_for_fix(summary))
+        raw = await generate(prompt, system=None, usage=usage, max_tokens=max_tokens, route=route)
+        fixed = parse(raw)
+    except Exception as exc:  # noqa: BLE001 — best-effort, не роняем job
+        logger.warning(
+            "summary.proofread.applied=false job_id=%s reason=call_failed error=%s", job_id, exc
+        )
+        return summary
+
+    if len(fixed.chapters) != len(summary.chapters):
+        logger.warning(
+            "summary.proofread.applied=false job_id=%s reason=structure_changed "
+            "chapters=%s->%s",
+            job_id,
+            len(summary.chapters),
+            len(fixed.chapters),
+        )
+        return summary
+
+    ratio = difflib.SequenceMatcher(
+        None, _summary_plain_text(summary), _summary_plain_text(fixed)
+    ).ratio()
+    if ratio < _PROOFREAD_MIN_SIMILARITY:
+        logger.warning(
+            "summary.proofread.applied=false job_id=%s reason=rewrite ratio=%.3f",
+            job_id,
+            ratio,
+        )
+        return summary
+
+    logger.info("summary.proofread.applied=true job_id=%s ratio=%.3f", job_id, ratio)
     return dataclasses.replace(fixed, tags=summary.tags)
 
 

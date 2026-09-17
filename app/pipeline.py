@@ -29,6 +29,7 @@ from app.summary_verify import (
     find_untranslated_anglicisms,
     fix_unsupported_years,
     fix_untranslated_anglicisms,
+    proofread_summary,
 )
 from app.transcript_chunker import chunk_transcript, segments_to_text
 from app.transcript_export import save_transcript_markdown
@@ -946,6 +947,23 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                     usage=usage,
                     job_id=job_id,
                 )
+
+            # Корректорский проход (кейс 2026-09-17, BUUQZTTnMyM): опечатки
+            # «фиктируют»/«депотизация»/«об войне» — стохастический брак
+            # free-моделей на русском. Словарный гейт не работает (86-90%
+            # false-positives по замеру на кэше), поэтому проход безусловный:
+            # +1 llm-вызов на ru-саммари, best-effort, от переписывания
+            # защищают гейты внутри (главы + difflib-сходство >= 0.9).
+            # Последним из фиксов — вычитывает итоговый текст.
+            summary = await proofread_summary(
+                summary=summary,
+                generate=services.llm.generate,
+                parse=services.summarizer.parse_summary,
+                max_tokens=services.summarizer.final_max_tokens,
+                route=llm_route,
+                usage=usage,
+                job_id=job_id,
+            )
 
         if not comments_task.done():
             await _set_service_status(
