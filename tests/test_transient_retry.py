@@ -466,3 +466,26 @@ def test_intermittent_signin_botcheck_is_transient():
     )
     from app.pipeline import _is_transient_failure
     assert _is_transient_failure(exc) is True
+
+
+# ── SSL-обрыв скачивания (боевой инцидент 2026-09-18, 6AgOfiZOWiY) ──────────
+# Дословный текст, каким download_audio завернул ошибку yt-dlp: TLS-сессия с
+# googlevideo оборвана посреди передачи (мигнувшая сеть / DPI-обрыв длинной
+# сессии). Классическая транзиентная сетевая ошибка — до фикса не матчилась
+# ни одним маркером и финализировала job в failed без повтора.
+
+
+def test_ssl_unexpected_eof_download_error_is_transient():
+    assert _is_transient_failure(
+        RuntimeError(
+            "yt-dlp не смог скачать аудио: ERROR: \r[download] Got error: "
+            "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation "
+            "of protocol (_ssl.c:1016)"
+        )
+    )
+
+
+def test_geo_block_error_still_not_transient():
+    assert not _is_transient_failure(
+        RuntimeError("Video unavailable. This video is not available in your country")
+    )

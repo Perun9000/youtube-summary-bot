@@ -145,6 +145,12 @@ _TRANSIENT_TEXT_MARKERS: tuple[str, ...] = (
     # на 44 успеха/сутки). Настоящий age-gate исчерпает 3 ретрая и получит
     # прежний честный отказ через _YT_DLP_ERROR_HINTS.
     "sign in to confirm",
+    # Инцидент 2026-09-18 (6AgOfiZOWiY): TLS-сессия с googlevideo оборвана
+    # посреди скачивания аудио — «[SSL: UNEXPECTED_EOF_WHILE_READING] EOF
+    # occurred in violation of protocol». Сеть мигнула или DPI срубил длинную
+    # сессию; повтор через несколько минут обычно проходит. Проверено против
+    # нетранзиентных текстов (geo/age-gate/private/no-formats) — не матчится.
+    "unexpected_eof_while_reading",
     "connection timed out",
 )
 
