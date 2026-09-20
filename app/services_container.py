@@ -65,6 +65,13 @@ class SummaryJob:
     # would otherwise pre-exhaust the transient-retry budget before real
     # processing even starts (see transient_retries below).
     retry_count: int = 0
+    # Transient, не персистится: момент, когда воркер ВПЕРВЫЕ взял job в
+    # работу (monotonic). Таймер «Прошло:» и прогресс-бар статус-сообщения
+    # считают от него, а не от enqueued_at (репорт 2026-09-20: 1ч48м ожидания
+    # в очереди показывались как «Прошло»). Возврат из transcription-очереди
+    # и второй проход summary-воркера точку отсчёта НЕ сбрасывают (guard по
+    # None); до первого взятия — None, статус падает обратно на enqueued_at.
+    started_at: float | None = None
     db_id: int | None = None
     # Transient, не персистится: main worker выставляет "done"/"failed" по
     # результату _process_youtube_job, но маршрут «нет субтитров →

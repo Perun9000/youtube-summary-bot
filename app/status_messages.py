@@ -385,7 +385,7 @@ async def _run_with_telegram_status(
     task = asyncio.create_task(operation)
     try:
         while not task.done():
-            elapsed = int(time.monotonic() - job.enqueued_at)
+            elapsed = _job_elapsed_sec(job)
             status_text = status_getter() if status_getter else ""
             lines = [
                 base_text,
@@ -408,6 +408,15 @@ async def _run_with_telegram_status(
         except asyncio.CancelledError:
             pass
         raise
+def _job_elapsed_sec(job: SummaryJob) -> int:
+    """Секунды «Прошло:» для статус-сообщения: от НАЧАЛА обработки
+    (job.started_at, ставится воркером при первом взятии из очереди), а не от
+    постановки в очередь — ожидание в очереди пользователю показывается
+    отдельной строкой позиции, а не таймером. До первого взятия (started_at
+    is None) — от enqueued_at."""
+    return int(time.monotonic() - (job.started_at or job.enqueued_at))
+
+
 def _format_elapsed(seconds: int) -> str:
     total_seconds = max(0, seconds)
     hours, remainder = divmod(total_seconds, 3600)
@@ -498,8 +507,9 @@ def _estimate_job_total_seconds(
 
     if transcript_source == "groq":
         # By the time we can count chunks, Groq transcription has already run,
-        # but elapsed is measured from the original link. Add a small cushion so
-        # those jobs do not jump too aggressively after re-entering summary.
+        # but elapsed is measured from the first worker pickup (job.started_at),
+        # which predates the Groq leg. Add a small cushion so those jobs do not
+        # jump too aggressively after re-entering summary.
         estimate += 60.0
 
     return max(90.0, estimate)

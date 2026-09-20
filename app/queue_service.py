@@ -708,6 +708,8 @@ async def _summary_queue_worker(services: Services) -> None:
             if services.job_store and job.db_id:
                 services.job_store.set_status(job.db_id, "active")
 
+            if job.started_at is None:
+                job.started_at = time.monotonic()
             wait_sec = time.monotonic() - job.enqueued_at
             logger.info(
                 "queue.job.start sequence=%s chat_id=%s wait_sec=%.1f pending=%s url=%s scheduled=%s",
