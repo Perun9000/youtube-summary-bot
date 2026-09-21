@@ -13,6 +13,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.types import CallbackQuery, FSInputFile
 
 from app.custom_prompt import PendingCustomPrompt, wrap_custom_prompt
+from app.description_hint import build_description_block
 from app.groq_whisper_service import GroqWhisperUnavailable
 from app.i18n import UserFacingError, t
 from app.llm_client import (
@@ -879,6 +880,7 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                 llm_route=llm_route,
                 output_lang=job.lang,
                 upload_date=metadata.upload_date or None,
+                description_block=build_description_block(metadata),
             ),
             base_text=generating_text,
             job=job,

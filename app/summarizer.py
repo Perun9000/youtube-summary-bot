@@ -127,6 +127,7 @@ SUMMARY_JSON_PROMPT = """
 
 URL: {url}
 Название: {title}
+{description_block}
 
 Транскрипция с таймкодами:
 {transcript}
@@ -184,6 +185,7 @@ SYNTHESIS_PROMPT = """
 
 URL: {url}
 Название: {title}
+{description_block}
 
 Частичные конспекты:
 {partials}
@@ -364,6 +366,7 @@ class Summarizer:
         llm_route: str = "default",
         output_lang: str = "ru",
         upload_date: str | None = None,
+        description_block: str = "",
     ) -> Summary:
         # Маршрут LLM и язык вывода на время этой суммаризации. Инстанс-атрибуты
         # безопасны: summary-воркер строго последовательный, конкурирующих
@@ -386,6 +389,9 @@ class Summarizer:
             "topic_hint": topic_hint,
             "speaker_hint": speaker_hint,
             "host_hint": host_hint,
+            # Справочный блок из описания ролика (см. app/description_hint.py);
+            # пустая строка — блока в промпте просто нет.
+            "description_block": f"\n{description_block}" if description_block else "",
         }
         if len(chunks) == 1:
             if progress:
