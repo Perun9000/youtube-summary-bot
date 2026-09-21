@@ -291,7 +291,12 @@ PROOFREAD_PROMPT = """
 - орфографические опечатки и «съеденные» буквы или слоги (примеры реальных
   ошибок: «фиктируют» → «фиксируют», «депотизация» → «деполитизация»);
 - грубые грамматические ошибки: неверные предлоги («об войне» → «о войне»),
-  рассогласование падежей и чисел.
+  рассогласование падежей и чисел;
+- неверно написанные имена и фамилии людей — если дано название ролика,
+  написание в нём каноническое (пример реальной ошибки: в названии «с
+  Константином Гаазе», в тексте «Гааз» → исправить на «Гаазе»; несклоняемые
+  фамилии не склонять).
+{title_block}
 
 НЕ переформулируй предложения, НЕ сокращай и НЕ дополняй текст, НЕ меняй
 структуру, порядок глав и теги. Иностранные названия и термины латиницей
@@ -327,6 +332,7 @@ async def proofread_summary(
     route: str,
     usage=None,
     job_id: str = "",
+    video_title: str = "",
 ) -> Summary:
     """Один корректорский llm-проход, best-effort: правка опечаток и грубой
     грамматики. Любая проблема (ошибка вызова/парсинга, изменившаяся
@@ -334,7 +340,14 @@ async def proofread_summary(
     job не падает. Теги всегда от исходного summary (см. fix_unsupported_years).
     """
     try:
-        prompt = PROOFREAD_PROMPT.format(summary_json=serialize_summary_for_fix(summary))
+        title_block = (
+            f"\nНазвание ролика (каноническое написание имён и фамилий): «{video_title}»."
+            if video_title
+            else ""
+        )
+        prompt = PROOFREAD_PROMPT.format(
+            summary_json=serialize_summary_for_fix(summary), title_block=title_block
+        )
         raw = await generate(prompt, system=None, usage=usage, max_tokens=max_tokens, route=route)
         fixed = parse(raw)
     except Exception as exc:  # noqa: BLE001 — best-effort, не роняем job

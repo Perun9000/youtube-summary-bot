@@ -108,3 +108,13 @@ async def test_parse_summary_public_wrapper_matches_internal():
 def test_final_max_tokens_property_exposes_private_attr():
     summarizer = Summarizer(_CapturingLLM(), final_max_tokens=1234)
     assert summarizer.final_max_tokens == 1234
+
+
+def test_system_prompt_has_canonical_name_rule():
+    """Кейс 2026-09-21 («Гаазе» → «Гааз»): системный промпт обязан требовать
+    написание имён как в названии ролика и запрещать «восстановление»
+    именительного падежа несклоняемых фамилий."""
+    from app.summarizer import SUMMARY_SYSTEM_PROMPT
+
+    assert "названии ролика" in SUMMARY_SYSTEM_PROMPT
+    assert "несклоняем" in SUMMARY_SYSTEM_PROMPT.lower()

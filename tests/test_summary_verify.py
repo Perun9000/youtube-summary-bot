@@ -592,3 +592,46 @@ async def test_proofread_falls_back_when_response_unparsable():
         route="default",
     )
     assert result is original
+
+
+# --- Корректор: канонизация имён по названию ролика (кейс 2026-09-21: LLM
+# «восстановил» именительный падеж несклоняемой фамилии — «Гаазе» → «Гааз»,
+# хотя название с верным написанием было в каждом промпте) ---
+
+
+async def test_proofread_prompt_includes_video_title_as_name_reference():
+    original = make_summary(overview="Социолог Гааз утверждает, что выборы нерациональны.")
+    captured = {}
+
+    async def capture_generate(prompt, **k):
+        captured["prompt"] = prompt
+        return '{"overview": "Социолог Гаазе утверждает, что выборы нерациональны.", "chapters": [], "tags": {}}'
+
+    result = await proofread_summary(
+        summary=original,
+        generate=capture_generate,
+        parse=_fake_parse,
+        max_tokens=1000,
+        route="default",
+        video_title="Разговор о «выборах» с социологом Константином Гаазе",
+    )
+    assert "Константином Гаазе" in captured["prompt"]
+    assert "Гаазе" in result.overview
+
+
+async def test_proofread_without_title_omits_reference_block():
+    original = make_summary(overview="Текст без имён.")
+    captured = {}
+
+    async def capture_generate(prompt, **k):
+        captured["prompt"] = prompt
+        return '{"overview": "Текст без имён.", "chapters": [], "tags": {}}'
+
+    await proofread_summary(
+        summary=original,
+        generate=capture_generate,
+        parse=_fake_parse,
+        max_tokens=1000,
+        route="default",
+    )
+    assert "Название ролика" not in captured["prompt"]

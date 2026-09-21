@@ -971,6 +971,8 @@ async def _process_youtube_job(job: SummaryJob, services: Services) -> None:
                 route=llm_route,
                 usage=usage,
                 job_id=job_id,
+                # Канон написания имён (кейс «Гаазе»→«Гааз» 2026-09-21).
+                video_title=title,
             )
 
         if not comments_task.done():
