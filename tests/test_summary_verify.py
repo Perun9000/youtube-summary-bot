@@ -635,3 +635,95 @@ async def test_proofread_without_title_omits_reference_block():
         route="default",
     )
     assert "Название ролика" not in captured["prompt"]
+
+
+# --- Структурный гейт фикс-проходов (боевой инцидент 2026-09-26, D6AiU9OfAX8:
+# фикс англицизмов на мёртвой цепочке получил обрезанный last-resort мусор,
+# парсер «спас» из него overview="..." и 1 главу из 12, а приёмка «число
+# англицизмов строго уменьшилось» это проглотила — уничтожение текста
+# формально улучшение). Фиксы обязаны проверять структуру, как корректор. ---
+
+
+def _twelve_chapters():
+    return [
+        Chapter(start="", title=f"Глава {i} про leadership", notes=f"Заметки {i}.")
+        for i in range(12)
+    ]
+
+
+async def test_anglicism_fix_rejects_degenerate_recovered_summary():
+    original = make_summary(
+        overview="Большой обзор про leadership и erosion доверия в индустрии.",
+        chapters=_twelve_chapters(),
+    )
+
+    async def generate_garbage(*a, **k):
+        return '{"overview": "...", "chapters": [{"title": "х", "notes": "у"}], "tags": {}}'
+
+    def parse_recovered(raw: str) -> Summary:
+        import json
+
+        data = json.loads(raw)
+        return make_summary(
+            overview=data["overview"],
+            chapters=[Chapter(start="", title=c["title"], notes=c["notes"]) for c in data["chapters"]],
+        )
+
+    result = await fix_untranslated_anglicisms(
+        summary=original,
+        anglicisms=["erosion", "leadership"],
+        generate=generate_garbage,
+        parse=parse_recovered,
+        max_tokens=1000,
+        route="default",
+    )
+    assert result is original
+
+
+async def test_year_fix_rejects_degenerate_recovered_summary():
+    original = make_summary(
+        overview="Событие произошло в 2024 году, и это подробно обсуждается.",
+        chapters=_twelve_chapters(),
+    )
+
+    async def generate_garbage(*a, **k):
+        return '{"overview": "...", "chapters": [], "tags": {}}'
+
+    def parse_recovered(raw: str) -> Summary:
+        import json
+
+        data = json.loads(raw)
+        return make_summary(overview=data["overview"])
+
+    result = await fix_unsupported_years(
+        summary=original,
+        transcript_text="Без годов в транскрипте.",
+        unsupported_years=["2024"],
+        publish_date="",
+        generate=generate_garbage,
+        parse=parse_recovered,
+        max_tokens=1000,
+        route="default",
+    )
+    assert result is original
+
+
+async def test_anglicism_fix_rejects_heavily_shrunk_text_same_chapters():
+    # Число глав совпало, но текст усох в разы — тоже брак, не фикс.
+    original = make_summary(
+        overview="Очень развёрнутый обзор про leadership, erosion и прочие "
+        "аспекты индустрии, с деталями, примерами и выводами автора ролика."
+    )
+
+    async def generate_tiny(*a, **k):
+        return '{"overview": "Кратко.", "chapters": [], "tags": {}}'
+
+    result = await fix_untranslated_anglicisms(
+        summary=original,
+        anglicisms=["erosion", "leadership"],
+        generate=generate_tiny,
+        parse=_fake_parse,
+        max_tokens=1000,
+        route="default",
+    )
+    assert result is original

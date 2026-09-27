@@ -99,6 +99,37 @@ def serialize_summary_for_fix(summary: Summary) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _fix_structure_intact(original: Summary, fixed: Summary, *, job_id: str, kind: str) -> bool:
+    """Структурный гейт фикс-проходов (инцидент 2026-09-26, D6AiU9OfAX8):
+    фикс-вызов на мёртвой цепочке может получить обрезанный last-resort мусор,
+    из которого парсер «спасает» вырожденное саммари (overview="...", 1 глава
+    из 12) — и узкий критерий приёмки конкретного фикса (годы исчезли,
+    англицизмов стало меньше) такое проглатывает. Точечная правка не меняет
+    число глав и не может радикально усушить текст — иначе это не фикс.
+    """
+    if len(fixed.chapters) != len(original.chapters):
+        logger.warning(
+            "summary.%s.fixed=false job_id=%s reason=structure_changed chapters=%s->%s",
+            kind,
+            job_id,
+            len(original.chapters),
+            len(fixed.chapters),
+        )
+        return False
+    original_len = len(_summary_plain_text(original))
+    fixed_len = len(_summary_plain_text(fixed))
+    if fixed_len < 0.7 * original_len:
+        logger.warning(
+            "summary.%s.fixed=false job_id=%s reason=text_shrunk chars=%s->%s",
+            kind,
+            job_id,
+            original_len,
+            fixed_len,
+        )
+        return False
+    return True
+
+
 async def fix_unsupported_years(
     *,
     summary: Summary,
@@ -139,6 +170,9 @@ async def fix_unsupported_years(
         fixed = parse(raw)
     except Exception as exc:  # noqa: BLE001 — best-effort фикс, не роняем job
         logger.warning("summary.verify.fixed=false job_id=%s reason=call_failed error=%s", job_id, exc)
+        return summary
+
+    if not _fix_structure_intact(summary, fixed, job_id=job_id, kind="verify"):
         return summary
 
     remaining = find_unsupported_years(fixed, transcript_text, publish_year=_publish_year(publish_date))
@@ -258,6 +292,9 @@ async def fix_untranslated_anglicisms(
         logger.warning(
             "summary.anglicisms.fixed=false job_id=%s reason=call_failed error=%s", job_id, exc
         )
+        return summary
+
+    if not _fix_structure_intact(summary, fixed, job_id=job_id, kind="anglicisms"):
         return summary
 
     if len(remaining) >= len(anglicisms):
