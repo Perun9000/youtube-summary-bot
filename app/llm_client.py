@@ -1494,7 +1494,16 @@ def _raise_for_status(response: httpx.Response, provider: str) -> None:
 # docs/superpowers/specs/2026-07-14-dynamic-free-chain-tail-design.md).
 DYNAMIC_TAIL_MAX_MODELS = 3
 DYNAMIC_TAIL_MIN_CONTEXT = 131072
-DYNAMIC_TAIL_EXCLUDE_SUBSTRINGS = ("coder", "code", "safety", "vl", "vision", "guard")
+DYNAMIC_TAIL_EXCLUDE_SUBSTRINGS = (
+    "coder", "code", "safety", "vl", "vision", "guard",
+    # Негодные для хвоста по живым инцидентам (сортировка по контексту иначе
+    # ставит их в топ — инцидент 2026-09-30, 22-минутная генерация):
+    # - inkling*: закрыты гейтом «only available on agentic harnesses» —
+    #   HTTP 403 всем не из каталога приложений OpenRouter (инцидент 2026-09-11);
+    # - nemotron-3.5-lightning: игнорирует reasoning.exclude и отдаёт
+    #   цепочку размышлений вместо JSON (живая проба 2026-09-30: 261с, брак).
+    "inkling", "lightning",
+)
 MODELS_CATALOG_TTL_SEC = 3600
 
 

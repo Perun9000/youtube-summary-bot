@@ -249,3 +249,22 @@ async def test_tail_not_used_when_chain_alive(client, monkeypatch):
     assert result == '{"a": 1}'
     assert calls == ["chain/model-1"]
     assert counter[0] == 0  # каталог даже не запрашивали
+
+
+def test_selector_excludes_gated_and_reasoning_leaky_models():
+    """Инцидент 2026-09-30: хвост (сортировка по контексту) выбирал ровно три
+    негодные модели каталога — inkling/inkling-small закрыты гейтом «agentic
+    harnesses» (HTTP 403, инцидент 2026-09-11), а nemotron-3.5-lightning
+    игнорирует reasoning.exclude и льёт цепочку размышлений вместо JSON
+    (живая проба 2026-09-30: 261с и JSON_FAIL)."""
+    catalog = [
+        {"id": "thinkingmachines/inkling-small:free", "context_length": 1048576},
+        {"id": "thinkingmachines/inkling:free", "context_length": 1048576},
+        {"id": "nvidia/nemotron-3.5-lightning:free", "context_length": 1000000},
+        {"id": "inclusionai/ling-3.0-flash-sante:free", "context_length": 262144},
+    ]
+    from app.llm_client import _select_dynamic_tail
+
+    assert _select_dynamic_tail(catalog, exclude_ids=set()) == [
+        "inclusionai/ling-3.0-flash-sante:free"
+    ]
