@@ -460,36 +460,18 @@ class OpenRouterClient:
         allow_big_prompt_full_cap: bool = True,
     ) -> str:
         chain = self.current_chain()
-        # Free mode — cycle through the chain, then sleep + retry full chain.
+        # Free mode — cycle through the chain, then retry eligible models.
         passes = self._settings.openrouter_fallback_retry_passes + 1
         delay = self._settings.openrouter_fallback_retry_delay_sec
         last_error: Exception | None = None
         truncated_text: str | None = None
+        skip_on_retry: set[str] = set()
         for pass_idx in range(passes):
-            # Ревью-фикс 2026-08-04: если КАЖДАЯ неудача этого прохода —
-            # обрезка по max_tokens (даже после adaptive-cap удвоения), а не
-            # реальная ошибка (429/5xx/сеть/404) — следующий проход даст ТОТ
-            # ЖЕ результат: потолок между проходами не меняется, retry ничего
-            # не купит, только жжёт sleep + дневной лимит запросов. В этом
-            # случае рвём внешний цикл сразу же, не дожидаясь оставшихся
-            # проходов — last_resort ниже отдаст лучший (retried) обрезанный
-            # текст. Арифметика worst case «все модели обрезались», N моделей,
-            # passes проходов: до Q5 было N * passes запросов (по 1 на модель
-            # за проход, все проходы отрабатывали). Q5 (один повтор на
-            # удвоенном лимите) свёл это к N * 2 запроса за ОДИН проход. Q7
-            # (лестница удвоений до cap вместо одного шага — см.
-            # ``_generate_with_adaptive_cap``) поднимает это до N * (1 +
-            # log2(cap/original)) запросов за тот же ОДИН проход. При N=5,
-            # passes=3 (прод-конфиг: 5 моделей, OPENROUTER_FALLBACK_RETRY_PASSES=2),
-            # старт 2000 и cap 8000 (3 запроса/модель): до Q5 было 15 (5*3
-            # проходов), Q5 снизил до 10 (5*2), Q7 возвращает к 15 (5*3) — но
-            # это ВСЁ ЕЩЁ один проход против 15 (5*3 проходов) без short-circuit,
-            # и в отличие от до-Q5 сценария эти 15 запросов реально дотягиваются
-            # до 8000 токенов, а не жгутся вхолостую на том же потолке 3 раза.
-            # Смешанный проход (обрезки + хоть одна настоящая ошибка) —
-            # проходы продолжаются как раньше, ошибка может не повториться.
-            pass_had_real_failure = False
+            # Повторяем проход, только если была временная ошибка, например 429.
+            pass_has_retryable_failure = False
             for model in chain:
+                if model in skip_on_retry:
+                    continue
                 try:
                     result = await self._generate_with_adaptive_cap(
                         model, prompt, system, usage, max_tokens,
@@ -499,37 +481,25 @@ class OpenRouterClient:
                     return result
                 except _OpenRouterRetriable as exc:
                     last_error = exc.cause
-                    # Q8 ревью-фикс (Important 1): «short-circuit — считать
-                    # проход обречённым» и «last-resort — что вернуть» — ДВА
-                    # РАЗНЫХ понятия, раньше слитых в одно условие. Обрезка
-                    # (truncated) — ВСЕГДА truncation-класс для short-circuit,
-                    # даже если text пуст (reasoning сожрал весь лимит):
-                    # следующий проход даст тот же потолок, тот же брак, retry
-                    # ничего не купит — жечь sleep + дневной лимит запросов
-                    # ради гарантированного повтора неверно независимо от
-                    # того, есть ли непустой текст на руках. last-resort
-                    # кандидатом при этом становится ТОЛЬКО непустой text —
-                    # пустой не лучше явной ошибки об исчерпании цепочки (см.
-                    # часть 1 этой задачи).
                     if isinstance(exc, _OpenRouterTruncated):
                         if exc.text:
                             truncated_text = exc.text
+                        else:
+                            # Модель исчерпала лестницу лимитов и так и не дала текста.
+                            skip_on_retry.add(model)
+                    elif exc.short_reason == "http_404":
+                        skip_on_retry.add(model)
                     else:
-                        pass_had_real_failure = True
+                        pass_has_retryable_failure = True
                     logger.warning(
                         "llm.generate.fallback provider=openrouter model=%s pass=%s/%s "
                         "trying_next reason=%s",
                         model, pass_idx + 1, passes, exc.short_reason,
                     )
                     continue
-            if not pass_had_real_failure:
-                # Весь проход — truncation-класс (обрезки, пустые или не).
-                # Дальше проходы дать ничего не могут — рвём немедленно,
-                # независимо от того, нашёлся ли непустой last-resort текст:
-                # если нет (truncated_text is None) — ниже пойдём в обычный
-                # FREE_CHAIN_EXHAUSTED за ОДИН проход, а не за все ``passes``.
+            if not pass_has_retryable_failure:
                 logger.info(
-                    "llm.generate.chain_exhausted_all_truncated pass=%s/%s "
+                    "llm.generate.chain_no_retryable_failures pass=%s/%s "
                     "skipping_remaining_passes=%s last_resort_available=%s",
                     pass_idx + 1, passes, passes - pass_idx - 1,
                     truncated_text is not None,
@@ -940,7 +910,10 @@ class OpenRouterClient:
             finish_reason = ""
         else:
             message = choices[0].get("message", {})
-            result = _strip_thinking(str(message.get("content", ""))).strip()
+            content = message.get("content")
+            result = _strip_thinking(content).strip() if isinstance(content, str) else ""
+            if result.casefold() in {"null", "none"}:
+                result = ""
             finish_reason = str(choices[0].get("finish_reason") or "")
 
         usage_info = _extract_openrouter_usage(data.get("usage") or {})

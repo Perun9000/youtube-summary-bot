@@ -15,6 +15,8 @@ Edge-case (finish_reason=length И content пуст — reasoning выжрал �
 test_all_models_length_truncated_but_empty_is_not_last_resort).
 """
 
+from __future__ import annotations
+
 import httpx
 import pytest
 
@@ -82,7 +84,7 @@ def _empty_catalog(monkeypatch):
     monkeypatch.setattr(httpx.AsyncClient, "get", empty_catalog)
 
 
-def _completion(content: str, finish_reason: str) -> dict:
+def _completion(content: str | None, finish_reason: str) -> dict:
     return {
         "choices": [{"message": {"content": content}, "finish_reason": finish_reason}],
         "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
@@ -124,6 +126,50 @@ async def test_whitespace_only_response_is_treated_as_empty(client, monkeypatch)
     result = await client.generate("p")
     assert result == '{"overview": "ок"}'
     assert calls == ["chain/model-1", "chain/model-2"]
+
+
+@pytest.mark.parametrize("content", [None, "null", "None"])
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+async def test_null_content_never_returns_as_generated_text(
+    client, monkeypatch, content, finish_reason
+):
+    _empty_catalog(monkeypatch)
+    _wire_responses(
+        monkeypatch,
+        {
+            "chain/model-1": _completion(content, finish_reason),
+            "chain/model-2": _completion(content, finish_reason),
+        },
+    )
+    with pytest.raises(RuntimeError, match="OPENROUTER_FREE_CHAIN_EXHAUSTED"):
+        await client.generate("p", max_tokens=1200)
+
+
+async def test_mixed_pass_retries_temporary_errors_without_repeating_empty_truncation(
+    client_prod_passes, monkeypatch
+):
+    calls = []
+    _empty_catalog(monkeypatch)
+    monkeypatch.setattr("app.llm_client.asyncio.sleep", lambda _: _noop())
+
+    async def fake_post(self, url, headers=None, json=None):
+        model = json["model"]
+        calls.append(model)
+        request = httpx.Request("POST", url)
+        if model == "chain/model-1":
+            return httpx.Response(200, json=_completion(None, "length"), request=request)
+        if model == "chain/model-2":
+            return httpx.Response(404, json={"error": {"code": 404}}, request=request)
+        if model == "chain/model-3" and calls.count(model) > 1:
+            return httpx.Response(200, json=_completion("Полезный текст", "stop"), request=request)
+        return httpx.Response(429, json={"error": {"code": 429}}, request=request)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    assert await client_prod_passes.generate("p", max_tokens=8000) == "Полезный текст"
+    assert calls == [
+        "chain/model-1", "chain/model-2", "chain/model-3", "chain/model-4", "chain/model-5",
+        "chain/model-3",
+    ]
 
 
 # ── (b) ВСЕ модели пустые → chain exhausted, а не «успех с пустотой» ──────

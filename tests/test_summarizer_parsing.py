@@ -1,3 +1,8 @@
+from __future__ import annotations
+
+import asyncio
+from unittest.mock import AsyncMock
+
 from app.models import Summary
 from app.summarizer import (
     COMPACT_SUMMARY_PROMPT,
@@ -134,6 +139,39 @@ async def test_single_chunk_reasoning_output_fails_summarize():
     summarizer = Summarizer(_ReasoningOnlyLLM(), system_prompt_provider=lambda: "sys")
     with pytest.raises(SummaryUnusableError):
         await summarizer.summarize(url="https://youtu.be/x", title="t", chunks=["один чанк"])
+
+
+@pytest.mark.parametrize("empty_partial", ["", "null", "None", "..."])
+async def test_empty_partial_stops_before_final_synthesis(empty_partial):
+    llm = _ReasoningOnlyLLM()
+    llm.generate = AsyncMock(side_effect=[empty_partial, "Тезисы второго фрагмента", "{}"])
+    summarizer = Summarizer(llm)
+
+    with pytest.raises(SummaryUnusableError, match="фрагмент 1/2"):
+        await summarizer.summarize(url="https://youtu.be/x", title="t", chunks=["А", "Б"])
+    llm.generate.assert_awaited_once()
+
+
+async def test_partial_deadline_cancels_model_chain(monkeypatch):
+    cancelled = asyncio.Event()
+
+    async def slow_generation(*args, **kwargs):
+        try:
+            await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return "Тезисы фрагмента"
+
+    monkeypatch.setattr("app.summarizer.PARTIAL_TIMEOUT_SEC", 0.01, raising=False)
+    llm = _ReasoningOnlyLLM()
+    llm.generate = AsyncMock(side_effect=slow_generation)
+    summarizer = Summarizer(llm)
+
+    with pytest.raises(asyncio.TimeoutError, match="фрагмент 1/2"):
+        await summarizer.summarize(url="https://youtu.be/x", title="t", chunks=["А", "Б"])
+    assert cancelled.is_set()
+    llm.generate.assert_awaited_once()
 
 
 def test_parse_summary_unescapes_literal_backslash_n():

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
 import datetime as _dt
@@ -19,6 +20,7 @@ SYNTHESIS_RETRY_PARTIALS_MAX_CHARS = 4500
 MID_SYNTHESIS_MAX_CHARS = 10000
 DEFAULT_HIERARCHY_THRESHOLD = 6
 DEFAULT_GROUP_SIZE = 5
+PARTIAL_TIMEOUT_SEC = 300
 
 
 SUMMARY_SYSTEM_PROMPT = """
@@ -477,18 +479,11 @@ class Summarizer:
                 progress.start_step(f"фрагмент {index}/{num_chunks}")
             chunk_started = time.monotonic()
             logger.info("summary.chunk.start index=%s total=%s chars=%s", index, num_chunks, len(chunk))
-            partial = await self._llm.generate(
+            partial = await self._generate_partial(
                 CHUNK_PROMPT.format(url=url, title=title, index=index, total=num_chunks, chunk=chunk),
+                stage=f"фрагмент {index}/{num_chunks}",
                 system=system_prompt,
                 usage=usage,
-                max_tokens=self._partial_max_tokens,
-                route=self._route,
-                # Ревью-фикс Q7: partial-стадия почанковая — большой chunk
-                # (OPENROUTER_TRANSCRIPT_CHUNK_MAX_CHARS может быть больше
-                # LLM_BIG_PROMPT_CHARS) не должен прыгать на cap 8000 при
-                # реальной потребности ~1200-2000; лестница при обрезке
-                # всё равно работает (не отключена).
-                allow_big_prompt_full_cap=False,
             )
             logger.info(
                 "summary.chunk.done index=%s total=%s duration_sec=%.1f response_chars=%s",
@@ -522,7 +517,7 @@ class Summarizer:
                     len(group),
                     len(group_text),
                 )
-                mid = await self._llm.generate(
+                mid = await self._generate_partial(
                     MID_SYNTHESIS_PROMPT.format(
                         url=url,
                         title=title,
@@ -530,13 +525,9 @@ class Summarizer:
                         group_total=len(groups),
                         partials=group_text,
                     ),
+                    stage=f"группа {group_index}/{len(groups)}",
                     system=system_prompt,
                     usage=usage,
-                    max_tokens=self._partial_max_tokens,
-                    route=self._route,
-                    # Ревью-фикс Q7: тоже partial-стадийный лимит — та же
-                    # логика, что у почанковых вызовов выше.
-                    allow_big_prompt_full_cap=False,
                 )
                 logger.info(
                     "summary.hierarchy.group.done index=%s total=%s duration_sec=%.1f response_chars=%s",
@@ -643,6 +634,36 @@ class Summarizer:
             len(raw),
         )
         return summary
+
+    async def _generate_partial(
+        self,
+        prompt: str,
+        *,
+        stage: str,
+        system: str,
+        usage: GenerationUsage | None,
+    ) -> str:
+        try:
+            raw = await asyncio.wait_for(
+                self._llm.generate(
+                    prompt,
+                    system=system,
+                    usage=usage,
+                    max_tokens=self._partial_max_tokens,
+                    route=self._route,
+                    allow_big_prompt_full_cap=False,
+                ),
+                timeout=PARTIAL_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError as exc:
+            raise asyncio.TimeoutError(
+                f"Превышено время генерации ({PARTIAL_TIMEOUT_SEC:g} с): {stage}"
+            ) from exc
+
+        text = raw.strip()
+        if text.casefold() in {"null", "none"} or not any(c.isalnum() for c in text):
+            raise SummaryUnusableError(f"LLM вернул пустой конспект: {stage}")
+        return text
 
     @staticmethod
     def _fix_literal_newlines(text: str) -> str:
