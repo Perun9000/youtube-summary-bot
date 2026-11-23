@@ -95,8 +95,14 @@ async def configure_bot_commands(bot: Bot, settings: Settings) -> None:
     await bot.set_my_commands(PUBLIC_BOT_COMMANDS, scope=BotCommandScopeDefault())
     await bot.set_my_commands(PUBLIC_BOT_COMMANDS, scope=BotCommandScopeAllPrivateChats())
     if settings.owner_user_id is not None:
+        owner_commands = OWNER_BOT_COMMANDS
+        if not settings.monitoring_enabled:
+            owner_commands = [
+                command for command in owner_commands
+                if command.command not in {"scan_now", "scan_stop"}
+            ]
         await bot.set_my_commands(
-            OWNER_BOT_COMMANDS,
+            owner_commands,
             scope=BotCommandScopeChat(chat_id=settings.owner_user_id),
         )
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())

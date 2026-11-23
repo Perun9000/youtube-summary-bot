@@ -19,6 +19,13 @@ def test_valid_env_loads(base_env):
     assert settings.database_path.name == "bot.db"
 
 
+def test_monitoring_is_opt_in(base_env, monkeypatch):
+    monkeypatch.delenv("MONITORING_ENABLED", raising=False)
+    assert load_settings().monitoring_enabled is False
+    monkeypatch.setenv("MONITORING_ENABLED", "true")
+    assert load_settings().monitoring_enabled is True
+
+
 def test_invalid_int_collects_all_errors(base_env, monkeypatch):
     monkeypatch.setenv("TRANSCRIPT_CHUNK_MAX_CHARS", "abc")
     monkeypatch.setenv("LLM_MAX_TOKENS", "не число")

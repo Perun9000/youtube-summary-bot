@@ -1,7 +1,11 @@
 # YouTube Summary — browser extension
 
-Расширение под Firefox и Chromium (Chrome / Edge / Brave / Opera) на
-Manifest V3. На страницах YouTube `/watch?...` добавляет кнопку
+Расширение для Chromium (Chrome / Edge / Brave / Opera) на Manifest V3.
+Версия 0.2.8 устанавливается вручную; публикация в магазинах не выполнена.
+Firefox пока не считается поддержанным: текущий manifest использует
+`background.service_worker`, отдельный Firefox-пакет не подготовлен и не проверен.
+
+На страницах YouTube `/watch?...` добавляет кнопку
 **🔮 Summary** рядом с Like / Share / Save. По клику открывает Telegram
 с deep-link'ом `telegram.me/YouTube_Sum_mary_bot?start=<video_id>` — бот видит
 `/start <video_id>`, валидирует, ставит ролик в очередь саммари и потом
@@ -22,7 +26,6 @@ worker (нужен только для «тихой» генерации, см. 
 По умолчанию расширение использует бота `@YouTube_Sum_mary_bot`. Чтобы поменять:
 
 1. **Chrome / Edge / Brave / Opera:** правый клик на иконку расширения → **Options**
-2. **Firefox:** `about:addons` → иконка расширения → **Preferences**
 
 В поле ввода укажи хэндл бота (с `@` или без — нормализуется автоматически).
 Нажми **Сохранить** — настройка запишется в `chrome.storage.sync` и будет
@@ -47,7 +50,7 @@ Telegram.
 3. Открой **Options** расширения (см. «Настройка Telegram-хэндла» выше) и
    вставь тот же токен в поле **Local API token** → **Сохранить**.
 4. Перезагрузи расширение (`chrome://extensions` → кнопка обновить, или
-   Firefox — заново Load Temporary Add-on), чтобы подхватился обновлённый
+   затем обнови вкладку YouTube), чтобы подхватился обновлённый
    `manifest.json`/`background.js`.
 
 Поведение по клику:
@@ -80,18 +83,11 @@ Chrome блокирует обращения публичных страниц �
 Если в момент клика URL уже не `/watch?v=<id>` (SPA-переход или сломанный
 URL) — внизу страницы появится тост «Открой ролик YouTube и нажми снова».
 
-## Установка в Firefox (временно)
+## Firefox
 
-1. Открой `about:debugging#/runtime/this-firefox`.
-2. **Load Temporary Add-on** → выбери файл `manifest.json` в этой папке.
-3. Открой любой ролик на youtube.com — кнопка появится рядом с
-   Like / Dislike / Share / Download / Save.
-
-⚠️ Временные расширения в Firefox **сбрасываются после перезапуска
-браузера**. Чтобы установить навсегда — нужно подписать XPI через
-[AMO Self-Distribution](https://addons.mozilla.org/developers/addon/new)
-или Firefox Developer Edition с отключённой проверкой подписи
-(`xpinstall.signatures.required = false` в `about:config`).
+Выпуск для Firefox отложен. Наличие `browser_specific_settings.gecko` в
+manifest само по себе не подтверждает совместимость фонового скрипта.
+Инструкции временной установки появятся после подготовки и проверки пакета.
 
 ## Установка в Chrome / Edge / Brave / Opera
 
@@ -106,8 +102,7 @@ URL) — внизу страницы появится тост «Открой р
 ```sh
 cd browser-extension
 zip -r ../youtube-summary-bot-extension.zip .
-# Firefox: about:debugging → Load Temporary Add-on → ZIP
-# Chrome:  chrome://extensions → drag-and-drop ZIP
+# ZIP — архив для передачи; для установки распакуйте и используйте Load unpacked.
 ```
 
 ## Структура

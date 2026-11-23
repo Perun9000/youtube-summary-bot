@@ -206,7 +206,7 @@ def load_settings() -> Settings:
         os.getenv("MONITORING_STATE_PATH", str(data_dir / "monitoring_state.json"))
     ).expanduser()
     monitoring_target_chat_id = _parse_optional_int(os.getenv("MONITORING_TARGET_CHAT_ID", ""))
-    monitoring_enabled = os.getenv("MONITORING_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+    monitoring_enabled = os.getenv("MONITORING_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
     monitoring_llm_retry_interval_sec = env.int("MONITORING_LLM_RETRY_INTERVAL_SEC", "300")
     # Премьеры: через сколько часов после запланированного выхода ролика
     # возвращаться за саммари (чтобы успели появиться субтитры).

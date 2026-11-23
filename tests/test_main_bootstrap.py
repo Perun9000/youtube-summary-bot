@@ -20,8 +20,9 @@ from app.main import _configure_bot_commands_safely
 
 
 class _FakeSettings:
-    def __init__(self, owner_user_id=None):
+    def __init__(self, owner_user_id=None, monitoring_enabled=False):
         self.owner_user_id = owner_user_id
+        self.monitoring_enabled = monitoring_enabled
 
 
 class _FakeBot:
@@ -66,3 +67,22 @@ async def test_configure_bot_commands_safely_succeeds_when_network_is_fine():
 
     # PUBLIC_BOT_COMMANDS x2 scopes + OWNER_BOT_COMMANDS (owner set) + menu button.
     assert len(calls) == 4
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_monitoring_commands_follow_feature_flag(enabled):
+    from app.main import configure_bot_commands
+
+    menus = []
+
+    class Bot:
+        async def set_my_commands(self, commands, **kwargs):
+            menus.append({command.command for command in commands})
+
+        async def set_chat_menu_button(self, **kwargs):
+            pass
+
+    await configure_bot_commands(Bot(), _FakeSettings(555, enabled))
+    assert ("scan_now" in menus[-1]) is enabled
+    assert ("scan_stop" in menus[-1]) is enabled
+    assert "myprompt" in menus[-1]
